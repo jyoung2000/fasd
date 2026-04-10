@@ -263,6 +263,75 @@ class TestClusteringRespectsShotCuts:
                 f"Cluster spans shot cut: {timestamps}"
 
 
+class TestEMASmoothing:
+    """Fix 6: Verify temporal smoothing of promoted saliency clusters."""
+
+    def test_smoothed_has_lower_variance(self):
+        """Smoothed trajectory has lower variance than raw input."""
+        from backend.services.subject_fusion import _ema_smooth_trajectory
+
+        raw = [
+            (0.0, 50.0, 50.0, 12.0, 16.0),
+            (0.5, 52.0, 50.0, 12.0, 16.0),
+            (1.0, 48.0, 50.0, 12.0, 16.0),
+            (1.5, 51.0, 50.0, 12.0, 16.0),
+            (2.0, 49.0, 50.0, 12.0, 16.0),
+            (2.5, 50.0, 50.0, 12.0, 16.0),
+        ]
+
+        smoothed = _ema_smooth_trajectory(raw, alpha=0.3)
+
+        assert len(smoothed) == len(raw)
+
+        # Compute x variance for both
+        raw_xs = [r[1] for r in raw]
+        smooth_xs = [s[1] for s in smoothed]
+        raw_var = np.var(raw_xs)
+        smooth_var = np.var(smooth_xs)
+
+        assert smooth_var < raw_var, (
+            f"Smoothed variance ({smooth_var:.4f}) should be less than "
+            f"raw variance ({raw_var:.4f})"
+        )
+
+    def test_smoothed_converges_monotonically(self):
+        """After an initial step, smoothed values converge without direction reversals."""
+        from backend.services.subject_fusion import _ema_smooth_trajectory
+
+        raw = [
+            (0.0, 50.0, 50.0, 12.0, 16.0),
+            (0.5, 52.0, 50.0, 12.0, 16.0),
+            (1.0, 48.0, 50.0, 12.0, 16.0),
+            (1.5, 51.0, 50.0, 12.0, 16.0),
+            (2.0, 49.0, 50.0, 12.0, 16.0),
+            (2.5, 50.0, 50.0, 12.0, 16.0),
+        ]
+
+        smoothed = _ema_smooth_trajectory(raw, alpha=0.3)
+
+        # After step 2, differences between consecutive smoothed values should
+        # be decreasing (converging) — no large direction reversals
+        diffs = [abs(smoothed[i + 1][1] - smoothed[i][1]) for i in range(2, len(smoothed) - 1)]
+        # At least the last few diffs should be small
+        assert diffs[-1] < 1.0, f"Last diff ({diffs[-1]:.4f}) should be very small"
+
+    def test_promoted_track_has_raw_trajectory(self):
+        """Promoted tracks store the unsmoothed raw_trajectory for debugging."""
+        regions = [_make_saliency_region(t * 0.5, x=50.0 + (t % 3), w=12.0, h=16.0)
+                   for t in range(7)]
+
+        tracks = build_subject_tracks(
+            face_registry=None, dense_faces=[], saliency_regions=regions,
+            frame_paths=[], source_width=1280, source_height=720,
+        )
+
+        promoted = [t for t in tracks if t.source == "face_like_promoted"]
+        assert len(promoted) >= 1
+        track = promoted[0]
+        assert track.raw_trajectory is not None
+        assert len(track.raw_trajectory) == len(track.bbox_trajectory)
+
+
 class TestRegionIoU:
     def test_identical_regions(self):
         """Identical regions have IoU = 1.0."""

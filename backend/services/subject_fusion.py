@@ -199,6 +199,40 @@ def _region_iou(r1, r2) -> float:
     return inter_area / union if union > 0 else 0.0
 
 
+def _ema_smooth_trajectory(
+    trajectory: list,
+    alpha: float = 0.3,
+) -> list:
+    """Apply EMA smoothing to a bbox trajectory.
+
+    Smooths (x, y, w, h) independently with exponential moving average.
+    Timestamp values are preserved unchanged.
+
+    Args:
+        trajectory: list[(t, x, y, w, h)]
+        alpha: EMA smoothing factor. Lower = smoother. 0.3 gives good
+            jitter suppression without excessive lag.
+
+    Returns:
+        Smoothed trajectory in the same format.
+    """
+    if len(trajectory) <= 1:
+        return list(trajectory)
+
+    smoothed = [trajectory[0]]
+    sx, sy, sw, sh = trajectory[0][1], trajectory[0][2], trajectory[0][3], trajectory[0][4]
+
+    for i in range(1, len(trajectory)):
+        t, x, y, w, h = trajectory[i]
+        sx = alpha * x + (1 - alpha) * sx
+        sy = alpha * y + (1 - alpha) * sy
+        sw = alpha * w + (1 - alpha) * sw
+        sh = alpha * h + (1 - alpha) * sh
+        smoothed.append((t, float(sx), float(sy), float(sw), float(sh)))
+
+    return smoothed
+
+
 def _promote_cluster(
     cluster: list,
     frame_lookup: dict,
@@ -250,8 +284,9 @@ def _promote_cluster(
     except Exception as e:
         logger.debug("[%s] mesh validation failed (non-fatal): %s", job_id, e)
 
-    # Build trajectory from all cluster regions
-    trajectory = [(r.timestamp, r.x, r.y, r.w, r.h) for r in cluster]
+    # Build trajectory from all cluster regions — apply EMA smoothing
+    raw_trajectory = [(r.timestamp, r.x, r.y, r.w, r.h) for r in cluster]
+    trajectory = _ema_smooth_trajectory(raw_trajectory, alpha=0.3)
 
     track = SubjectTrack(
         track_id=track_id,
@@ -259,6 +294,7 @@ def _promote_cluster(
         confidence=min(confidence, 1.0),
         face_slot_id=None,
         bbox_trajectory=trajectory,
+        raw_trajectory=raw_trajectory,
         gate_persistence_frames=persistence,
         gate_aspect_ratio=median_aspect,
         gate_area_ratio=median_area,

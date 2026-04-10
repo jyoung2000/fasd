@@ -87,7 +87,10 @@ class SubjectTrack:
 
     # Bounding box trajectory, in % of source frame
     # list[(t, x, y, w, h)] where x,y are center coordinates
+    # When source="face_like_promoted", this is EMA-smoothed. Raw values
+    # are in raw_trajectory for debugging.
     bbox_trajectory: list = field(default_factory=list)
+    raw_trajectory: Optional[list] = None  # unsmoothed, for debugging
 
     # HSV histogram appearance signature for cross-shot identity
     # Flattened numpy array, None if not yet computed
