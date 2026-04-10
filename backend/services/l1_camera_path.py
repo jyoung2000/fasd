@@ -30,6 +30,13 @@ _DUMP_L1 = os.environ.get("CLIPAI_DUMP_L1", "0") in ("1", "true", "yes")
 _DUMP_DIR = Path("/tmp/clipai_l1")
 _dump_counter = 0
 
+# Feature flag: set CLIPAI_L1_LP=1 to use the LP-based AutoFlip solver
+# with acceleration (λ₃) and jerk (λ₄) penalties instead of Condat TV.
+USE_LP_SOLVER = os.environ.get("CLIPAI_L1_LP", "0") in ("1", "true", "yes")
+# Performance guardrail: LP is O(n³) worst case. Fall back to Condat for
+# shots longer than this many frames (20s at 30fps = 600).
+LP_MAX_FRAMES = 600
+
 # TV denoise regularization: fraction of source_width for resolution independence.
 # Actual lambda = TV_LAMBDA_FRAC * source_width. 0.015 * 1920 = 28.8
 TV_LAMBDA_FRAC = 0.015
@@ -653,8 +660,34 @@ def solve_camera_path_for_shot(
                 "infeasible_frames": [(t, []) for t in infeasible_times],
             } for _ in segments_in_shot]
 
-    # ── Solve TV denoise on the padded signal ──
-    padded_solved = _tv_denoise_1d(padded_targets, lam, 0, lo_bounds, hi_bounds)
+    # ── Solve: LP (with accel+jerk) or Condat TV ──
+    use_lp = USE_LP_SOLVER and len(padded_targets) <= LP_MAX_FRAMES
+    if USE_LP_SOLVER and len(padded_targets) > LP_MAX_FRAMES:
+        logger.warning(
+            "L1 shot solver: LP fallback to Condat for %d-frame shot (> %d max)",
+            len(padded_targets), LP_MAX_FRAMES,
+        )
+
+    if use_lp:
+        from backend.services._autoflip_lp import solve_autoflip_lp
+        # Build bounds for LP solver (None → unconstrained as source_width bounds)
+        lp_lo = []
+        lp_hi = []
+        for i in range(len(padded_targets)):
+            lo_val = lo_bounds[i] if lo_bounds and lo_bounds[i] is not None else 0.0
+            hi_val = hi_bounds[i] if hi_bounds and hi_bounds[i] is not None else float(source_width)
+            lp_lo.append(lo_val)
+            lp_hi.append(hi_val)
+        # AutoFlip LP weights (Grundmann et al. 2011 relative scaling)
+        padded_solved = solve_autoflip_lp(
+            padded_targets, lp_lo, lp_hi,
+            lam1=1.0,
+            lam2=10.0,
+            lam3=100.0,
+            lam4=1000.0,
+        )
+    else:
+        padded_solved = _tv_denoise_1d(padded_targets, lam, 0, lo_bounds, hi_bounds)
 
     # ── Discard padding ──
     solved = padded_solved[pad_left:pad_left + n_orig]

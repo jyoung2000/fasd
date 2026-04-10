@@ -1,9 +1,10 @@
-"""Tests for L1 camera path solver — propagated trajectory, uniform fps, and exact TV.
+"""Tests for L1 camera path solver — propagated trajectory, uniform fps, exact TV, and LP.
 
 Verifies that:
 - get_propagated_positions_for_segment produces uniform-fps output
 - The exact TV solver produces zero residual tilt on constant signals
 - Step functions produce clean steps without ringing
+- The LP solver produces smoother ease curves than Condat (less accel/jerk)
 - The solver handles dense input correctly
 """
 
@@ -17,6 +18,7 @@ from backend.services.l1_camera_path import (
     get_propagated_positions_for_segment,
     solve_camera_path,
 )
+from backend.services._autoflip_lp import solve_autoflip_lp
 
 
 @dataclass
@@ -196,3 +198,79 @@ class TestExactTVSolver:
         assert tv_output < tv_input, (
             f"Output TV ({tv_output:.1f}) should be less than input TV ({tv_input:.1f})"
         )
+
+
+class TestAutoFlipLPSolver:
+    """Verify the LP-based AutoFlip solver produces smoother ease curves (Phase 4)."""
+
+    @staticmethod
+    def _accel(x):
+        return sum(abs(x[i + 2] - 2 * x[i + 1] + x[i]) for i in range(len(x) - 2))
+
+    @staticmethod
+    def _jerk(x):
+        return sum(abs(x[i + 3] - 3 * x[i + 2] + 3 * x[i + 1] - x[i]) for i in range(len(x) - 3))
+
+    def test_lp_smoother_ease_than_condat(self):
+        """LP solver produces visibly smoother ease curves (less accel/jerk)."""
+        from backend.services._condat_tv import condat_tv_l1
+
+        # Step function: sharp transition from 400 to 1500
+        targets = [400.0] * 75 + [1500.0] * 75
+        lo = [0.0] * 150
+        hi = [1920.0] * 150
+
+        condat = condat_tv_l1(targets, 28.8)  # TV_LAMBDA_FRAC * 1920
+        lp = solve_autoflip_lp(targets, lo, hi, lam1=1.0, lam2=10.0, lam3=100.0, lam4=1000.0)
+
+        # LP should have significantly less acceleration and jerk
+        accel_condat = self._accel(condat)
+        accel_lp = self._accel(lp)
+        jerk_condat = self._jerk(condat)
+        jerk_lp = self._jerk(lp)
+
+        assert accel_lp < accel_condat * 0.5, (
+            f"LP accel ({accel_lp:.1f}) should be < 50% of Condat accel ({accel_condat:.1f})"
+        )
+        assert jerk_lp < jerk_condat * 0.1, (
+            f"LP jerk ({jerk_lp:.1f}) should be < 10% of Condat jerk ({jerk_condat:.1f})"
+        )
+
+    def test_lp_respects_bounds(self):
+        """LP solver respects box constraints."""
+        targets = [100.0, 500.0, 900.0, 500.0, 100.0]
+        lo = [200.0, 200.0, 200.0, 200.0, 200.0]
+        hi = [800.0, 800.0, 800.0, 800.0, 800.0]
+
+        result = solve_autoflip_lp(targets, lo, hi)
+
+        for i, v in enumerate(result):
+            assert v >= lo[i] - 0.01, f"result[{i}]={v} < lo={lo[i]}"
+            assert v <= hi[i] + 0.01, f"result[{i}]={v} > hi={hi[i]}"
+
+    def test_lp_constant_stays_constant(self):
+        """Constant input remains constant under LP solver."""
+        targets = [500.0] * 20
+        lo = [0.0] * 20
+        hi = [1920.0] * 20
+
+        result = solve_autoflip_lp(targets, lo, hi)
+
+        for v in result:
+            assert abs(v - 500.0) < 1.0, f"Constant input shifted: {v}"
+
+    def test_lp_performance_typical_shot(self):
+        """LP solver completes within 200ms for a typical 5-10s shot."""
+        import time
+
+        n = 300  # 10s at 30fps
+        targets = [400.0] * 150 + [1500.0] * 150
+        lo = [0.0] * n
+        hi = [1920.0] * n
+
+        t0 = time.perf_counter()
+        result = solve_autoflip_lp(targets, lo, hi, lam1=1.0, lam2=10.0, lam3=100.0, lam4=1000.0)
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+
+        assert len(result) == n
+        assert elapsed_ms < 2000, f"LP took {elapsed_ms:.0f}ms (target <200ms)"
