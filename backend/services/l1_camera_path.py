@@ -17,10 +17,18 @@ Per-segment mode selection from the solved path:
   PANNING:    near-linear path (R^2 > 0.95) and |slope| > threshold -> sweep
 """
 
+import csv
 import logging
+import os
+from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+# Debug telemetry: set CLIPAI_DUMP_L1=1 to write per-call CSVs to /tmp/clipai_l1/
+_DUMP_L1 = os.environ.get("CLIPAI_DUMP_L1", "0") in ("1", "true", "yes")
+_DUMP_DIR = Path("/tmp/clipai_l1")
+_dump_counter = 0
 
 # TV denoise regularization weight: higher = smoother path (more "hold still")
 TV_LAMBDA = 10.0
@@ -258,6 +266,31 @@ def assert_required_in_frame(
     return violations
 
 
+def _dump_solve_csv(
+    job_id: str, seg_idx: int,
+    times: list[float], targets: list[float], solved: list[float],
+    lo_bounds: Optional[list[float]], hi_bounds: Optional[list[float]],
+) -> None:
+    """Write a per-call CSV for telemetry analysis (behind CLIPAI_DUMP_L1=1)."""
+    global _dump_counter
+    try:
+        _DUMP_DIR.mkdir(parents=True, exist_ok=True)
+        jid = job_id or "unknown"
+        fname = f"{jid}_{seg_idx:04d}.csv"
+        path = _DUMP_DIR / fname
+        with open(path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["t", "target_x", "solved_x", "lo_bound", "hi_bound"])
+            for i, t in enumerate(times):
+                lo = lo_bounds[i] if lo_bounds and lo_bounds[i] is not None else ""
+                hi = hi_bounds[i] if hi_bounds and hi_bounds[i] is not None else ""
+                writer.writerow([f"{t:.4f}", f"{targets[i]:.2f}", f"{solved[i]:.2f}", lo, hi])
+        _dump_counter += 1
+        logger.debug("L1 telemetry: wrote %s (%d rows)", path, len(times))
+    except Exception as e:
+        logger.warning("L1 telemetry dump failed: %s", e)
+
+
 def solve_camera_path(
     face_positions: list[tuple[float, float]],
     source_width: int = 1920,
@@ -265,6 +298,8 @@ def solve_camera_path(
     hard_features: Optional[list] = None,
     source_height: int = 1080,
     crop_aspect: float = 9 / 16,
+    job_id: str = "",
+    seg_idx: int = 0,
 ) -> dict:
     """Solve L1-optimal camera path for a segment.
 
@@ -342,6 +377,10 @@ def solve_camera_path(
 
     # Solve TV denoise with constraint projection
     solved = _tv_denoise_1d(targets, lam, TV_ITERATIONS, lo_bounds, hi_bounds)
+
+    # ── Debug telemetry dump ──
+    if _DUMP_L1:
+        _dump_solve_csv(job_id, seg_idx, times, targets, solved, lo_bounds, hi_bounds)
 
     # Post-solve verification: check that all hard features are in frame
     if hard_features:
