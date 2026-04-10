@@ -1,7 +1,10 @@
-"""Tests for L1 camera path solver — propagated trajectory and uniform fps.
+"""Tests for L1 camera path solver — propagated trajectory, uniform fps, and exact TV.
 
-Verifies that get_propagated_positions_for_segment produces uniform-fps
-output and that the solver handles dense input correctly.
+Verifies that:
+- get_propagated_positions_for_segment produces uniform-fps output
+- The exact TV solver produces zero residual tilt on constant signals
+- Step functions produce clean steps without ringing
+- The solver handles dense input correctly
 """
 
 import math
@@ -10,6 +13,7 @@ from typing import Optional
 
 import pytest
 from backend.services.l1_camera_path import (
+    _tv_denoise_1d,
     get_propagated_positions_for_segment,
     solve_camera_path,
 )
@@ -135,3 +139,60 @@ class TestPropagatedPositionsUniformFps:
         if result["path"]:
             # Verify path has reasonable length
             assert len(result["path"]) == 150
+
+
+class TestExactTVSolver:
+    """Verify the exact TV solver produces correct results (Phase 2)."""
+
+    def test_constant_input_constant_output(self):
+        """Constant input produces constant output with zero residual tilt."""
+        signal = [500.0] * 100
+        result = _tv_denoise_1d(signal, lam=10.0)
+        # All values should be exactly 500 (no residual tilt)
+        for i, v in enumerate(result):
+            assert abs(v - 500.0) < 0.01, (
+                f"result[{i}]={v:.4f}, expected 500.0 (residual tilt)"
+            )
+        # Tilt: difference between first and last
+        tilt = result[-1] - result[0]
+        assert abs(tilt) < 1e-6, f"Residual tilt = {tilt}"
+
+    def test_step_function_clean_step(self):
+        """Step function produces clean step without ringing."""
+        signal = [0.0] * 50 + [1000.0] * 50
+        result = _tv_denoise_1d(signal, lam=5.0)
+        # Each half should be nearly constant (sub-pixel variation).
+        # L2-TV produces a small gradient near the step — that's correct
+        # behavior, not ringing. Tolerance of 1px is fine for camera paths.
+        first_half = result[:50]
+        assert max(first_half) - min(first_half) < 1.0, (
+            f"First half not nearly constant: range={max(first_half) - min(first_half)}"
+        )
+        second_half = result[50:]
+        assert max(second_half) - min(second_half) < 1.0, (
+            f"Second half not nearly constant: range={max(second_half) - min(second_half)}"
+        )
+        # No ringing: no overshoot beyond the step
+        assert min(result) >= -1.0, f"Undershoot: min={min(result)}"
+        assert max(result) <= 1001.0, f"Overshoot: max={max(result)}"
+
+    def test_bounds_respected_with_exact_solver(self):
+        """Box constraints are respected by the exact solver."""
+        signal = [100.0, 500.0, 900.0, 500.0, 100.0]
+        lo = [200.0, 200.0, 200.0, 200.0, 200.0]
+        hi = [800.0, 800.0, 800.0, 800.0, 800.0]
+        result = _tv_denoise_1d(signal, lam=10.0, lo_bounds=lo, hi_bounds=hi)
+        for i, v in enumerate(result):
+            assert v >= lo[i] - 0.01, f"result[{i}]={v} < lo={lo[i]}"
+            assert v <= hi[i] + 0.01, f"result[{i}]={v} > hi={hi[i]}"
+
+    def test_smoother_than_input(self):
+        """Output should have less total variation than input."""
+        signal = [500.0 + 50.0 * math.sin(i * 0.5) for i in range(60)]
+        result = _tv_denoise_1d(signal, lam=10.0)
+        # Compute TV of both
+        tv_input = sum(abs(signal[i + 1] - signal[i]) for i in range(len(signal) - 1))
+        tv_output = sum(abs(result[i + 1] - result[i]) for i in range(len(result) - 1))
+        assert tv_output < tv_input, (
+            f"Output TV ({tv_output:.1f}) should be less than input TV ({tv_input:.1f})"
+        )

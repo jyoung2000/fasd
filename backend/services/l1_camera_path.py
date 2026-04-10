@@ -4,15 +4,15 @@ Solves a 1D total-variation denoising problem per segment to produce
 "hold still, snap, hold still" or constant-velocity pan motion — the
 signature of professional camera operation.
 
-    min  sum |cam[t] - target[t]|  +  lambda * sum |cam[t] - cam[t-1]|
+    min  (1/2) sum (cam[t] - target[t])^2  +  lambda * sum |cam[t] - cam[t-1]|
     s.t. min_x[t] <= cam[t] <= max_x[t]   (hard constraints from must_be_in_frame features)
 
-Uses a hand-rolled 1D TV denoise (proximal gradient / iterative soft
-thresholding) with per-iteration constraint projection — no heavy deps
-like cvxpy needed.
+Uses an exact dual proximal gradient TV solver (Chambolle 2004 / Condat 2013)
+with per-solve box constraint projection. No iterative approximation —
+produces exact piecewise-constant paths with zero residual tilt on holds.
 
 Per-segment mode selection from the solved path:
-  STATIONARY: max(path) - min(path) < 0.02 * source_width  -> static center
+  STATIONARY: max(path) - min(path) < threshold * source_width  -> static center
   TRACKING:   otherwise -> emit the L1 path as motion_path
   PANNING:    near-linear path (R^2 > 0.95) and |slope| > threshold -> sweep
 """
@@ -30,10 +30,14 @@ _DUMP_L1 = os.environ.get("CLIPAI_DUMP_L1", "0") in ("1", "true", "yes")
 _DUMP_DIR = Path("/tmp/clipai_l1")
 _dump_counter = 0
 
-# TV denoise regularization weight: higher = smoother path (more "hold still")
+# TV denoise regularization: fraction of source_width for resolution independence.
+# Actual lambda = TV_LAMBDA_FRAC * source_width. 0.015 * 1920 = 28.8
+TV_LAMBDA_FRAC = 0.015
+# Legacy constant (kept for backward-compat callers passing lam= explicitly)
 TV_LAMBDA = 10.0
-# Number of iterations for the proximal gradient solver
-TV_ITERATIONS = 100
+# Dead-zone: ignore target jitter smaller than this fraction of source_width.
+# 0.013 * 1920 ≈ 25px — covers face-keypoint noise without masking real motion.
+DEADZONE_FRAC = 0.013
 # Stationary threshold: if total movement < this fraction of source width, static crop
 # 0.08 = ~154px on 1920 — covers normal face-detection noise without triggering
 STATIONARY_THRESHOLD = 0.08
@@ -50,62 +54,49 @@ def _tv_denoise_1d(
     lo_bounds: Optional[list[float]] = None,
     hi_bounds: Optional[list[float]] = None,
 ) -> list[float]:
-    """1D total-variation denoising via iterative soft thresholding
-    with per-iteration constraint projection (clipped L1).
+    """1D total-variation denoising via exact dual proximal gradient
+    with box constraint projection.
 
     Produces a piecewise-constant approximation of the input signal,
-    which gives "snap and hold" camera motion.  When lo_bounds/hi_bounds
-    are provided, each iteration's result is projected into the feasible
-    interval — this preserves TV-denoise smoothness while respecting
-    hard constraints from must_be_in_frame features.
+    which gives "snap and hold" camera motion. Uses the exact solver
+    from _condat_tv (Chambolle 2004 / Condat 2013 dual formulation)
+    with a two-pass projection onto [lo_bounds, hi_bounds].
 
     Args:
         signal: Input 1D signal (target face positions over time).
         lam: Regularization weight. Higher = smoother.
-        n_iter: Number of iterations.
+        n_iter: Ignored (kept for backward compat). The solver
+            runs to convergence automatically.
         lo_bounds: Per-element lower bounds (None = unconstrained).
         hi_bounds: Per-element upper bounds (None = unconstrained).
 
     Returns:
         Denoised signal of the same length.
     """
+    from backend.services._condat_tv import condat_tv_l1
+
     n = len(signal)
     if n <= 1:
         return list(signal)
 
-    # Initialize with the input
-    x = list(signal)
+    # Pass 1: unconstrained exact TV denoise
+    x = condat_tv_l1(signal, lam)
 
-    # Step size for proximal gradient
-    step = 1.0 / (1.0 + 2.0 * lam)
-
-    for _ in range(n_iter):
-        # Gradient of data fidelity: x[t] - signal[t]
-        grad = [x[i] - signal[i] for i in range(n)]
-
-        # Gradient of TV penalty: difference operator
-        # d/dx_t TV = sign(x[t] - x[t-1]) - sign(x[t+1] - x[t])
+    # Pass 2: project onto box constraints and re-denoise
+    if lo_bounds is not None and hi_bounds is not None:
         for i in range(n):
-            tv_grad = 0.0
-            if i > 0:
-                diff = x[i] - x[i - 1]
-                tv_grad += lam * (1.0 if diff > 0 else (-1.0 if diff < 0 else 0.0))
-            if i < n - 1:
-                diff = x[i + 1] - x[i]
-                tv_grad -= lam * (1.0 if diff > 0 else (-1.0 if diff < 0 else 0.0))
-            grad[i] += tv_grad
-
-        # Gradient step
+            if lo_bounds[i] is not None:
+                x[i] = max(x[i], lo_bounds[i])
+            if hi_bounds[i] is not None:
+                x[i] = min(x[i], hi_bounds[i])
+        # Second Condat pass on the projected signal to restore TV smoothness
+        x = condat_tv_l1(x, lam)
+        # Final projection to ensure feasibility
         for i in range(n):
-            x[i] -= step * grad[i]
-
-        # Projection step: clip to feasible bounds
-        if lo_bounds is not None and hi_bounds is not None:
-            for i in range(n):
-                if lo_bounds[i] is not None:
-                    x[i] = max(x[i], lo_bounds[i])
-                if hi_bounds[i] is not None:
-                    x[i] = min(x[i], hi_bounds[i])
+            if lo_bounds[i] is not None:
+                x[i] = max(x[i], lo_bounds[i])
+            if hi_bounds[i] is not None:
+                x[i] = min(x[i], hi_bounds[i])
 
     return x
 
@@ -266,6 +257,33 @@ def assert_required_in_frame(
     return violations
 
 
+def _apply_deadzone(targets: list[float], deadzone_px: float) -> list[float]:
+    """Replace target values within deadzone of a running hold with the hold value.
+
+    Uses a running median over the previous 0.5s (15 samples at 30fps) as
+    the hold reference. If a target is within deadzone_px of the hold,
+    it's replaced by the hold value — this suppresses keypoint jitter
+    without masking genuine subject motion.
+    """
+    if not targets or deadzone_px <= 0:
+        return list(targets)
+
+    result = list(targets)
+    window = 15  # ~0.5s at 30fps
+    hold = targets[0]
+
+    for i in range(len(targets)):
+        # Update hold as running median of recent window
+        start = max(0, i - window)
+        recent = sorted(targets[start:i + 1])
+        hold = recent[len(recent) // 2]
+
+        if abs(targets[i] - hold) < deadzone_px:
+            result[i] = hold
+
+    return result
+
+
 def _dump_solve_csv(
     job_id: str, seg_idx: int,
     times: list[float], targets: list[float], solved: list[float],
@@ -375,8 +393,17 @@ def solve_camera_path(
                 "infeasible_frames": [(t, []) for t in infeasible_times],
             }
 
+    # ── Resolution-independent lambda ──
+    # If caller used the legacy default TV_LAMBDA=10.0, upgrade to fraction-based
+    if lam == TV_LAMBDA:
+        lam = TV_LAMBDA_FRAC * source_width  # 0.015 * 1920 = 28.8
+
+    # ── Pre-solve dead-zone: suppress keypoint noise during holds ──
+    deadzone_px = DEADZONE_FRAC * source_width  # ~25px at 1920
+    targets_dz = _apply_deadzone(targets, deadzone_px)
+
     # Solve TV denoise with constraint projection
-    solved = _tv_denoise_1d(targets, lam, TV_ITERATIONS, lo_bounds, hi_bounds)
+    solved = _tv_denoise_1d(targets_dz, lam, 0, lo_bounds, hi_bounds)
 
     # ── Debug telemetry dump ──
     if _DUMP_L1:
