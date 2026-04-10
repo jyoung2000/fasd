@@ -77,23 +77,36 @@ def compute_spatiotemporal_saliency(
 
 def extract_saliency_bboxes(
     saliency_map: np.ndarray,
-    threshold: float = 0.5,
+    threshold: float = None,
     min_area_ratio: float = 0.01,
     max_area_ratio: float = 0.5,
     dilate_kernel_size: int = 5,
+    percentile: int = 85,
 ) -> list:
     """Extract bounding boxes from a saliency map.
 
     Returns a list of (x, y, w, h, mean_saliency) tuples in pixel coordinates.
     Rejects regions smaller than min_area_ratio or larger than max_area_ratio
     of the total frame area.
+
+    Uses adaptive (percentile-based) thresholding by default. The top
+    (100-percentile)% of pixels become candidate regions. Pass an explicit
+    threshold (0.0-1.0) to use fixed thresholding instead.
     """
     h, w = saliency_map.shape[:2]
     frame_area = h * w
 
-    # Threshold
     sal_uint8 = (saliency_map * 255).astype(np.uint8)
-    _, binary = cv2.threshold(sal_uint8, int(threshold * 255), 255, cv2.THRESH_BINARY)
+
+    # Threshold: adaptive (percentile) or fixed
+    if threshold is not None:
+        # Legacy fixed threshold
+        thresh_value = int(threshold * 255)
+    else:
+        # Adaptive: percentile-based, clamped to minimum of 30
+        thresh_value = max(30, int(np.percentile(sal_uint8, percentile)))
+
+    _, binary = cv2.threshold(sal_uint8, thresh_value, 255, cv2.THRESH_BINARY)
 
     # Dilate to merge nearby hot spots
     kernel = np.ones((dilate_kernel_size, dilate_kernel_size), np.uint8)

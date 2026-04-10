@@ -109,6 +109,38 @@ class TestExtractSaliencyBboxes:
             assert area_ratio >= 0.01  # all surviving bboxes pass the filter
 
 
+class TestAdaptiveThreshold:
+    """Fix 3: Verify adaptive (percentile-based) thresholding."""
+
+    def test_low_contrast_detected_with_adaptive(self):
+        """Low-contrast frame with very faint blob produces bbox with
+        adaptive threshold but zero with high fixed threshold."""
+        # Low-contrast frame: background ~100, faint blob at ~115
+        # The Sobel edges from a 15-step contrast are very weak
+        frame = np.full((480, 640), 100, dtype=np.uint8)
+        # Use a gradient blob instead of hard edges to make edges fainter
+        for dy in range(50):
+            for dx in range(50):
+                val = 100 + int(15 * min(1.0, (25 - abs(dy - 25)) / 25.0) *
+                               min(1.0, (25 - abs(dx - 25)) / 25.0))
+                frame[215 + dy, 295 + dx] = val
+
+        sal_map = compute_spatiotemporal_saliency(frame, prev_gray=None,
+                                                   spatial_weight=1.0, temporal_weight=0.0)
+
+        # Adaptive (default percentile=85) should detect the blob
+        bboxes_adaptive = extract_saliency_bboxes(sal_map, threshold=None)
+        assert len(bboxes_adaptive) >= 1, (
+            f"Adaptive threshold should detect faint blob, got {len(bboxes_adaptive)} bboxes"
+        )
+
+        # High fixed threshold should miss the blob
+        bboxes_fixed = extract_saliency_bboxes(sal_map, threshold=0.8)
+        assert len(bboxes_fixed) == 0, (
+            f"Fixed threshold=0.8 should miss faint blob, got {len(bboxes_fixed)} bboxes"
+        )
+
+
 class TestTrackSaliencyInFrames:
     def test_moving_rectangle_returns_regions(self, tmp_path):
         """5-frame sequence with a moving rectangle returns at least 3 regions."""
