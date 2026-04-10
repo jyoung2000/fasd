@@ -2278,7 +2278,8 @@ async def _run_analysis_inner(job_id: str):
         try:
             from backend.services.saliency_tracker import track_saliency_in_frames
             frame_list_sal = [(f.timestamp, f.path) for f in frames]
-            _saliency_regions = track_saliency_in_frames(frame_list_sal, face_results)
+            _saliency_regions = track_saliency_in_frames(frame_list_sal, face_results,
+                                                             persistent_regions=_persistent_regions)
             logger.info("[%s] SaliencyTracker: %d regions", job_id, len(_saliency_regions))
         except Exception as e:
             logger.warning("[%s] Saliency tracker failed (non-fatal): %s", job_id, e)
@@ -3167,7 +3168,10 @@ async def _run_analysis_inner(job_id: str):
                                 try:
                                     from backend.services.saliency_tracker import track_saliency_in_frames
                                     _frame_list_sal = [(f.timestamp, f.path) for f in frames]
-                                    _solver_saliency = track_saliency_in_frames(_frame_list_sal, face_results)
+                                    _solver_saliency = track_saliency_in_frames(
+                                        _frame_list_sal, face_results,
+                                        persistent_regions=_persistent_regions,
+                                    )
                                     logger.info("[%s] Content-routed saliency detection: %d regions",
                                                 job_id, len(_solver_saliency))
                                 except Exception as _se:

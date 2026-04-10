@@ -47,12 +47,28 @@ def compute_spatiotemporal_saliency(
     prev_gray: Optional[np.ndarray] = None,
     spatial_weight: float = 0.4,
     temporal_weight: float = 0.6,
+    center_bias_sigma: float = 0.35,
+    hud_mask: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """Compute a spatiotemporal saliency map by fusing spatial contrast
     and temporal motion.
 
+    Args:
+        curr_gray: Current grayscale frame.
+        prev_gray: Previous grayscale frame (None = spatial-only).
+        spatial_weight: Weight for spatial (gradient) component.
+        temporal_weight: Weight for temporal (motion) component.
+        center_bias_sigma: Sigma for center-bias Gaussian as fraction of
+            max(width, height). 0 = no center bias. Default 0.35 suppresses
+            off-center background motion (scrolling killfeeds, minimap
+            animations, crowd movement).
+        hud_mask: Binary mask (0/1) of known HUD regions. When provided,
+            HUD pixels contribute zero saliency.
+
     Returns a float32 array in [0, 1] matching the input shape.
     """
+    h, w = curr_gray.shape[:2]
+
     # Spatial component -- Sobel gradient magnitude
     gx = cv2.Sobel(curr_gray, cv2.CV_64F, 1, 0, ksize=3)
     gy = cv2.Sobel(curr_gray, cv2.CV_64F, 0, 1, ksize=3)
@@ -70,6 +86,20 @@ def compute_spatiotemporal_saliency(
 
     # Weighted fusion
     combined = spatial_weight * spatial + temporal_weight * temporal
+
+    # Center bias: multiply by 2D Gaussian centered at frame center
+    if center_bias_sigma > 0:
+        sigma_px = center_bias_sigma * max(w, h)
+        y_coords = np.arange(h, dtype=np.float32) - h / 2.0
+        x_coords = np.arange(w, dtype=np.float32) - w / 2.0
+        xx, yy = np.meshgrid(x_coords, y_coords)
+        gaussian = np.exp(-(xx * xx + yy * yy) / (2 * sigma_px * sigma_px))
+        combined = combined * gaussian
+
+    # HUD masking: zero out known HUD pixels
+    if hud_mask is not None:
+        combined = combined * (1.0 - hud_mask.astype(np.float32))
+
     if combined.max() > 1e-6:
         combined = combined / combined.max()
     return combined
@@ -132,6 +162,7 @@ def track_saliency_in_frames(
     frame_paths: list,
     face_results: list = None,
     stride: int = 1,
+    persistent_regions=None,
 ) -> list:
     """Run spatiotemporal saliency across a list of frames.
 
@@ -144,6 +175,8 @@ def track_saliency_in_frames(
         face_results: Unused. Kept for backward compat with existing callers.
         stride: Process every Nth frame (default 1 = all frames). Use
             stride > 1 to reduce compute cost on long videos.
+        persistent_regions: Optional persistent region detector output. If
+            it has hud_regions, builds a binary mask to suppress HUD pixels.
 
     Returns: list[SaliencyRegion]
     """
@@ -151,6 +184,25 @@ def track_saliency_in_frames(
     prev_gray = None
 
     _pre_count = len(frame_paths)
+
+    # Build HUD mask from persistent regions (reused for every frame)
+    _hud_mask = None
+    if persistent_regions and getattr(persistent_regions, 'has_hud', False):
+        _hud_regions = getattr(persistent_regions, 'hud_regions', [])
+        if _hud_regions and frame_paths:
+            # Need frame dimensions — read first frame to get shape
+            _first_img = cv2.imread(str(frame_paths[0][1]))
+            if _first_img is not None:
+                fh, fw = _first_img.shape[:2]
+                _hud_mask = np.zeros((fh, fw), dtype=np.float32)
+                for hr in _hud_regions:
+                    x1 = int(hr.x * fw)
+                    y1 = int(hr.y * fh)
+                    x2 = int((hr.x + hr.w) * fw)
+                    y2 = int((hr.y + hr.h) * fh)
+                    _hud_mask[y1:y2, x1:x2] = 1.0
+                logger.info("[SaliencyParity] HUD mask built from %d regions (%dx%d)",
+                            len(_hud_regions), fw, fh)
 
     for i, (timestamp, path) in enumerate(frame_paths):
         # Stride: skip frames not on the stride boundary
@@ -165,7 +217,7 @@ def track_saliency_in_frames(
         h, w = gray.shape[:2]
 
         try:
-            sal_map = compute_spatiotemporal_saliency(gray, prev_gray)
+            sal_map = compute_spatiotemporal_saliency(gray, prev_gray, hud_mask=_hud_mask)
             bboxes = extract_saliency_bboxes(sal_map)
         except Exception as e:
             logger.warning("[SaliencyTracker] t=%.2f: compute failed: %s", timestamp, e)

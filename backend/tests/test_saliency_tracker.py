@@ -109,6 +109,72 @@ class TestExtractSaliencyBboxes:
             assert area_ratio >= 0.01  # all surviving bboxes pass the filter
 
 
+class TestCenterBiasAndHudMasking:
+    """Fix 4: Verify center bias and HUD masking."""
+
+    def test_center_blob_higher_score_than_corner(self):
+        """With center bias, center blob has higher score than corner blob."""
+        # Two equal-intensity blobs: one at center, one at (90%, 90%)
+        frame = np.full((480, 640), 30, dtype=np.uint8)
+        # Center blob
+        frame[215:265, 295:345] = 220
+        # Corner blob (same size, same intensity)
+        frame[400:450, 540:590] = 220
+
+        # Without center bias
+        sal_no_bias = compute_spatiotemporal_saliency(
+            frame, prev_gray=None, spatial_weight=1.0, temporal_weight=0.0,
+            center_bias_sigma=0,
+        )
+        bboxes_no_bias = extract_saliency_bboxes(sal_no_bias, threshold=0.3)
+
+        # With center bias
+        sal_biased = compute_spatiotemporal_saliency(
+            frame, prev_gray=None, spatial_weight=1.0, temporal_weight=0.0,
+            center_bias_sigma=0.35,
+        )
+        bboxes_biased = extract_saliency_bboxes(sal_biased, threshold=0.3)
+
+        # Without bias, both should be detected with similar scores
+        assert len(bboxes_no_bias) >= 2
+
+        # With bias, if both are detected, center one should have higher score
+        if len(bboxes_biased) >= 2:
+            # Sort by y position: center blob is higher (y~240), corner is lower (y~425)
+            bboxes_biased.sort(key=lambda b: b[1])
+            center_score = bboxes_biased[0][4]  # mean_saliency of center
+            corner_score = bboxes_biased[-1][4]  # mean_saliency of corner
+            assert center_score > corner_score, (
+                f"Center blob ({center_score:.3f}) should score higher than "
+                f"corner blob ({corner_score:.3f}) with center bias"
+            )
+
+    def test_hud_mask_suppresses_blob(self):
+        """HUD mask covering one blob causes only the unmasked blob to survive."""
+        # Two blobs: one at top-left, one at center
+        frame = np.full((480, 640), 30, dtype=np.uint8)
+        frame[50:100, 50:100] = 220   # top-left blob
+        frame[215:265, 295:345] = 220  # center blob
+
+        # HUD mask covers the top-left blob
+        hud_mask = np.zeros((480, 640), dtype=np.float32)
+        hud_mask[0:120, 0:120] = 1.0
+
+        sal_masked = compute_spatiotemporal_saliency(
+            frame, prev_gray=None, spatial_weight=1.0, temporal_weight=0.0,
+            center_bias_sigma=0, hud_mask=hud_mask,
+        )
+        bboxes = extract_saliency_bboxes(sal_masked, threshold=0.3)
+
+        # Only center blob should survive (top-left is masked)
+        for bx, by, bw, bh, _ in bboxes:
+            cx = bx + bw / 2
+            cy = by + bh / 2
+            assert cx > 120 or cy > 120, (
+                f"HUD-masked blob at ({cx:.0f}, {cy:.0f}) should be suppressed"
+            )
+
+
 class TestAdaptiveThreshold:
     """Fix 3: Verify adaptive (percentile-based) thresholding."""
 
