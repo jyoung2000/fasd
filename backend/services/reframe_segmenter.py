@@ -89,6 +89,7 @@ def build_reframe_segments(
     content_profile=None,
     persistent_regions=None,
     pacing_estimator=None,
+    interpolated_timeline=None,
 ) -> list[ReframeSegment]:
     """Build a segment-based reframe timeline.
 
@@ -609,23 +610,30 @@ def build_reframe_segments(
         from backend.services.l1_camera_path import (
             solve_camera_path,
             get_dense_face_positions_for_segment,
+            get_propagated_positions_for_segment,
         )
         for seg in raw_segments:
             if seg.layout not in ("single",) or seg.active_slot is None:
                 continue
-            if not dense_faces:
+            if not dense_faces and not interpolated_timeline:
                 continue
 
-            # Convert dense face positions to pixel space for the solver
-            positions = get_dense_face_positions_for_segment(
-                dense_faces, seg.active_slot, seg.start, seg.end,
+            # Prefer propagated timeline (uniform fps) over sparse dense_faces
+            if interpolated_timeline is not None or dense_faces:
+                source = interpolated_timeline if interpolated_timeline is not None else dense_faces
+                positions_px = get_propagated_positions_for_segment(
+                    source, seg.active_slot, seg.start, seg.end,
+                    source_width=source_width, target_fps=30.0,
+                )
+            else:
+                positions_px = []
+
+            if len(positions_px) < 2:
+                continue
+
+            result = solve_camera_path(
+                positions_px, source_width, job_id=job_id, seg_idx=l1_count,
             )
-            if len(positions) < 2:
-                continue
-
-            # Convert nose_x from 0-100 to pixel space for the solver
-            positions_px = [(t, x / 100.0 * source_width) for t, x in positions]
-            result = solve_camera_path(positions_px, source_width)
             seg.strategy = result["mode"]
 
             if result["mode"] == "stationary":

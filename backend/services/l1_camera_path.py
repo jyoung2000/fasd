@@ -460,6 +460,9 @@ def get_dense_face_positions_for_segment(
     """Extract (timestamp, x_pixel) pairs for a face slot in a time range.
 
     Uses nose_x from dense face data. Falls back to any face if slot is None.
+
+    DEPRECATED: Prefer get_propagated_positions_for_segment which produces
+    uniform-fps output suitable for the TV solver.
     """
     positions = []
     for df in dense_faces:
@@ -474,3 +477,113 @@ def get_dense_face_positions_for_segment(
                 positions.append((df.timestamp, x))
                 break  # one face per frame
     return positions
+
+
+def get_propagated_positions_for_segment(
+    propagated_path,
+    active_slot: Optional[int],
+    start: float,
+    end: float,
+    source_width: int = 1920,
+    target_fps: float = 30.0,
+) -> list[tuple[float, float]]:
+    """Extract uniform-fps (timestamp, x_pixel) pairs from a propagated timeline.
+
+    Produces a uniformly-spaced trajectory at target_fps by resampling
+    the propagated path via linear interpolation. Gaps (occlusion, identity
+    drop) are filled by holding the last known x-position.
+
+    Works with either an InterpolatedFaceTimeline (from dense_propagator)
+    or a raw list of dense_faces (sparse detections). When given sparse
+    input, resamples onto a uniform grid so the TV solver's finite-difference
+    operator sees uniform dt.
+
+    Args:
+        propagated_path: InterpolatedFaceTimeline or list of FrameFaces/dense_faces.
+        active_slot: Face registry slot ID to track (None = any face).
+        start: Segment start time (seconds).
+        end: Segment end time (seconds, exclusive).
+        source_width: Source video width (for percentage-to-pixel conversion).
+        target_fps: Output sample rate (default 30.0).
+
+    Returns:
+        list[(timestamp, x_pixel)] at uniform target_fps spacing.
+        Returns the same signature as get_dense_face_positions_for_segment.
+    """
+    # ── Step 1: Extract raw (t, x_pct) pairs from the source ──
+    raw_samples = []  # [(t, x_pct)]
+
+    if hasattr(propagated_path, 'slot_positions_in_range'):
+        # InterpolatedFaceTimeline path — per-source-frame data
+        if active_slot is not None:
+            positions = propagated_path.slot_positions_in_range(active_slot, start, end)
+            for t, cx, _cy, _w, _h, _conf in positions:
+                if start <= t < end:
+                    raw_samples.append((t, cx))
+        else:
+            # No specific slot — use first available slot per frame
+            for s in propagated_path.samples:
+                if s.timestamp < start or s.timestamp >= end:
+                    continue
+                if s.bboxes:
+                    first_slot = next(iter(s.bboxes))
+                    cx, _cy, _w, _h = s.bboxes[first_slot]
+                    raw_samples.append((s.timestamp, cx))
+    else:
+        # Sparse dense_faces list — extract like get_dense_face_positions_for_segment
+        for df in propagated_path:
+            if df.timestamp < start or df.timestamp >= end:
+                continue
+            for f in df.faces:
+                sid = getattr(f, 'identity_id', -1)
+                if active_slot is not None and sid != active_slot:
+                    continue
+                x = getattr(f, 'nose_x', None)
+                if x is not None:
+                    raw_samples.append((df.timestamp, x))
+                    break
+
+    if not raw_samples:
+        return []
+
+    raw_samples.sort(key=lambda p: p[0])
+
+    # ── Step 2: Resample onto uniform grid at target_fps ──
+    dt = 1.0 / target_fps
+    n_frames = max(1, int((end - start) * target_fps))
+    uniform = []
+    last_x = raw_samples[0][1]  # hold for gaps
+    raw_idx = 0
+
+    for i in range(n_frames):
+        t = start + i * dt
+        if t >= end:
+            break
+
+        # Find the two raw samples bracketing t for linear interpolation
+        while raw_idx < len(raw_samples) - 1 and raw_samples[raw_idx + 1][0] <= t:
+            raw_idx += 1
+
+        if raw_idx >= len(raw_samples) - 1:
+            # Past the last raw sample — hold last known
+            x_pct = raw_samples[-1][1]
+        elif raw_samples[raw_idx][0] >= t:
+            # Before or at the first relevant sample
+            x_pct = raw_samples[raw_idx][1]
+        else:
+            # Linear interpolation between raw_samples[raw_idx] and [raw_idx + 1]
+            t0, x0 = raw_samples[raw_idx]
+            t1, x1 = raw_samples[raw_idx + 1]
+            span = t1 - t0
+            if span > 0:
+                alpha = (t - t0) / span
+                x_pct = x0 + alpha * (x1 - x0)
+            else:
+                x_pct = x0
+
+        last_x = x_pct
+        # Convert from percentage to pixel space
+        x_px = x_pct / 100.0 * source_width
+        uniform.append((round(t, 6), x_px))
+
+    return uniform

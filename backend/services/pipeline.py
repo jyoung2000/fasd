@@ -2740,6 +2740,7 @@ async def _run_analysis_inner(job_id: str):
                     content_profile=_content_profile,
                     persistent_regions=_persistent_regions,
                     pacing_estimator=_pacing_estimator,
+                    interpolated_timeline=_interpolated_timeline,
                 )
                 if reframe_segments:
                     # Replace scenes with one scene per reframe segment
