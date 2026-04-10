@@ -598,56 +598,76 @@ def build_reframe_segments(
             for seg in raw_segments:
                 seg.hard_constraints = rects
 
-    # ── Stage 10: L1 camera path per segment ──
-    # For each single-layout segment, solve a TV-denoised camera path from
-    # dense face centroids. This gives "hold still, snap, hold still" motion.
-    # The solver only overrides subject_x for tracking/panning modes where
-    # motion is significant. Stationary segments keep their registry-based position.
-    # The solver never overrides ease_in_ms — that's set by Stage 6 based on
-    # editorial context (shot cut vs speaker turn vs subject walk).
+    # ── Stage 10: L1 camera path — shot-level solving with lookahead ──
+    # Group segments by shot (using shot_cuts), then solve the TV-denoised
+    # camera path ONCE per shot instead of per segment. This eliminates
+    # pops at segment boundaries and provides non-causal lookahead so the
+    # camera begins easing BEFORE the subject moves.
     l1_count = 0
     try:
         from backend.services.l1_camera_path import (
             solve_camera_path,
+            solve_camera_path_for_shot,
             get_dense_face_positions_for_segment,
             get_propagated_positions_for_segment,
         )
-        for seg in raw_segments:
+
+        source = interpolated_timeline if interpolated_timeline is not None else dense_faces
+        if not source:
+            raise ValueError("No face data for L1 solver")
+
+        # Group single-layout segments by shot boundaries
+        sorted_cuts = sorted(shot_cuts) if shot_cuts else []
+
+        def _shot_for_time(t):
+            """Return the shot index for a given timestamp."""
+            for i, cut in enumerate(sorted_cuts):
+                if t < cut:
+                    return i
+            return len(sorted_cuts)
+
+        # Build shot groups: {shot_idx: [segment_indices]}
+        shot_groups = {}
+        eligible_indices = []
+        for i, seg in enumerate(raw_segments):
             if seg.layout not in ("single",) or seg.active_slot is None:
                 continue
-            if not dense_faces and not interpolated_timeline:
+            eligible_indices.append(i)
+            shot_idx = _shot_for_time(seg.start)
+            shot_groups.setdefault(shot_idx, []).append(i)
+
+        # Solve per shot group
+        for shot_idx, seg_indices in shot_groups.items():
+            shot_segs = [raw_segments[i] for i in seg_indices]
+            if not shot_segs:
                 continue
 
-            # Prefer propagated timeline (uniform fps) over sparse dense_faces
-            if interpolated_timeline is not None or dense_faces:
-                source = interpolated_timeline if interpolated_timeline is not None else dense_faces
-                positions_px = get_propagated_positions_for_segment(
-                    source, seg.active_slot, seg.start, seg.end,
-                    source_width=source_width, target_fps=30.0,
-                )
-            else:
-                positions_px = []
+            shot_start = shot_segs[0].start
+            shot_end = shot_segs[-1].end
 
-            if len(positions_px) < 2:
-                continue
-
-            result = solve_camera_path(
-                positions_px, source_width, job_id=job_id, seg_idx=l1_count,
+            results = solve_camera_path_for_shot(
+                shot_start=shot_start,
+                shot_end=shot_end,
+                segments_in_shot=shot_segs,
+                propagated_path=source,
+                source_width=source_width,
+                source_height=source_height,
+                job_id=job_id,
             )
-            seg.strategy = result["mode"]
 
-            if result["mode"] == "stationary":
-                # Keep the face-registry-based subject_x (more stable than
-                # the average of noisy dense positions)
-                pass
-            elif result["mode"] == "tracking":
-                seg.subject_x = result["path"][0][1] if result["path"] else seg.subject_x
-                seg.motion_path = result["path"]
-            elif result["mode"] == "panning":
-                seg.subject_x = result["path"][0][1] if result["path"] else seg.subject_x
-                seg.motion_path = result["path"]
+            for seg_i, result in zip(seg_indices, results):
+                seg = raw_segments[seg_i]
+                seg.strategy = result["mode"]
 
-            l1_count += 1
+                if result["mode"] == "stationary":
+                    # Keep face-registry-based subject_x (more stable)
+                    pass
+                elif result["mode"] in ("tracking", "panning"):
+                    seg.subject_x = result["path"][0][1] if result["path"] else seg.subject_x
+                    seg.motion_path = result["path"]
+
+                l1_count += 1
+
     except Exception as e:
         logger.warning("[%s] L1 camera path failed (non-fatal): %s", job_id, e)
 

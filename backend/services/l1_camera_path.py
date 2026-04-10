@@ -478,6 +478,227 @@ def solve_camera_path(
     }
 
 
+def _classify_segment_mode(
+    times: list[float],
+    solved: list[float],
+    source_width: int,
+) -> dict:
+    """Classify a segment slice as stationary/tracking/panning.
+
+    Returns the same dict shape as solve_camera_path.
+    """
+    if not solved:
+        return {
+            "mode": "stationary",
+            "center": source_width / 2.0,
+            "path": [],
+            "slope": 0.0,
+            "ease_in_ms": 0,
+            "infeasible_frames": [],
+        }
+
+    path_range = max(solved) - min(solved)
+
+    if path_range < STATIONARY_THRESHOLD * source_width:
+        center = sum(solved) / len(solved)
+        return {
+            "mode": "stationary",
+            "center": center,
+            "path": [],
+            "slope": 0.0,
+            "ease_in_ms": 0,
+            "infeasible_frames": [],
+        }
+
+    r2, slope_per_step = _linear_fit_r2(solved)
+    if len(times) >= 3:
+        dt = (times[-1] - times[0]) / max(len(times) - 1, 1)
+        slope_px_per_sec = slope_per_step / max(dt, 0.001)
+    else:
+        slope_px_per_sec = 0.0
+
+    if r2 > PANNING_R2_THRESHOLD and abs(slope_px_per_sec) > PANNING_MIN_SLOPE:
+        return {
+            "mode": "panning",
+            "center": sum(solved) / len(solved),
+            "path": list(zip(times, solved)),
+            "slope": slope_px_per_sec,
+            "ease_in_ms": 0,
+            "infeasible_frames": [],
+        }
+
+    return {
+        "mode": "tracking",
+        "center": solved[0],
+        "path": list(zip(times, solved)),
+        "slope": 0.0,
+        "ease_in_ms": 0,
+        "infeasible_frames": [],
+    }
+
+
+def solve_camera_path_for_shot(
+    shot_start: float,
+    shot_end: float,
+    segments_in_shot: list,
+    propagated_path,
+    source_width: int = 1920,
+    source_height: int = 1080,
+    crop_aspect: float = 9 / 16,
+    target_fps: float = 30.0,
+    lam: float = TV_LAMBDA,
+    hard_features: Optional[list] = None,
+    job_id: str = "",
+) -> list[dict]:
+    """Solve L1-optimal camera path for an entire shot, then slice per segment.
+
+    Runs the TV solver once over the full shot (not per-segment), which:
+    - Eliminates pops at segment boundaries (they're inside one solve)
+    - Provides lookahead: the solver can begin easing BEFORE a target moves
+
+    Mirror-reflects the first/last 30 frames at shot boundaries for
+    symmetric lookahead at the edges.
+
+    Args:
+        shot_start: Shot start time (seconds).
+        shot_end: Shot end time (seconds).
+        segments_in_shot: list of segment objects with .start, .end, .active_slot.
+        propagated_path: InterpolatedFaceTimeline or dense_faces list.
+        source_width, source_height, crop_aspect: Video dimensions.
+        target_fps: Uniform sample rate for the solver.
+        lam: TV regularization weight.
+        hard_features: Required features for hard constraint enforcement.
+        job_id: For telemetry.
+
+    Returns:
+        list[dict] — one result dict per segment (same shape as solve_camera_path).
+    """
+    if not segments_in_shot:
+        return []
+
+    # ── Resolution-independent lambda ──
+    if lam == TV_LAMBDA:
+        lam = TV_LAMBDA_FRAC * source_width
+
+    # ── Build full-shot target at uniform fps ──
+    dt = 1.0 / target_fps
+    pad_frames = 30  # ~1s lookahead padding
+
+    # Collect per-segment targets, concatenated
+    all_times = []
+    all_targets = []
+    segment_boundaries = []  # [(start_idx, end_idx)] into the arrays
+
+    for seg in segments_in_shot:
+        seg_start_idx = len(all_times)
+        positions = get_propagated_positions_for_segment(
+            propagated_path, seg.active_slot, seg.start, seg.end,
+            source_width=source_width, target_fps=target_fps,
+        )
+        for t, x in positions:
+            all_times.append(t)
+            all_targets.append(x)
+        seg_end_idx = len(all_times)
+        segment_boundaries.append((seg_start_idx, seg_end_idx))
+
+    if len(all_targets) < 2:
+        # Not enough data — fall back to per-segment solving
+        results = []
+        for seg in segments_in_shot:
+            results.append(solve_camera_path(
+                [], source_width, lam, hard_features,
+                source_height, crop_aspect, job_id,
+            ))
+        return results
+
+    # ── Pre-solve dead-zone ──
+    deadzone_px = DEADZONE_FRAC * source_width
+    all_targets = _apply_deadzone(all_targets, deadzone_px)
+
+    # ── Mirror-reflection padding at shot boundaries ──
+    n_orig = len(all_targets)
+    pad_left = min(pad_frames, n_orig)
+    pad_right = min(pad_frames, n_orig)
+
+    # Pad left: mirror the first pad_left samples
+    left_pad = list(reversed(all_targets[:pad_left]))
+    # Pad right: mirror the last pad_right samples
+    right_pad = list(reversed(all_targets[n_orig - pad_right:]))
+
+    padded_targets = left_pad + all_targets + right_pad
+    padded_times = []
+    for i in range(len(padded_targets)):
+        padded_times.append(shot_start + (i - pad_left) * dt)
+
+    # ── Compute hard bounds for padded signal (if any) ──
+    lo_bounds = None
+    hi_bounds = None
+    if hard_features:
+        lo_bounds, hi_bounds, infeasible_flags = compute_hard_bounds(
+            hard_features, padded_times, source_width, crop_aspect, source_height,
+        )
+        infeasible_times = [t for t, inf in zip(padded_times, infeasible_flags) if inf]
+        if infeasible_times:
+            logger.warning(
+                "L1 shot solver: %d/%d frames infeasible",
+                len(infeasible_times), len(padded_times),
+            )
+            # Return infeasible for all segments
+            return [{
+                "mode": "infeasible",
+                "center": source_width / 2.0,
+                "path": [],
+                "slope": 0.0,
+                "ease_in_ms": 0,
+                "infeasible_frames": [(t, []) for t in infeasible_times],
+            } for _ in segments_in_shot]
+
+    # ── Solve TV denoise on the padded signal ──
+    padded_solved = _tv_denoise_1d(padded_targets, lam, 0, lo_bounds, hi_bounds)
+
+    # ── Discard padding ──
+    solved = padded_solved[pad_left:pad_left + n_orig]
+    times = all_times
+
+    # ── Debug telemetry dump ──
+    if _DUMP_L1:
+        _dump_solve_csv(
+            job_id, 9000, times, all_targets, solved,
+            lo_bounds[pad_left:pad_left + n_orig] if lo_bounds else None,
+            hi_bounds[pad_left:pad_left + n_orig] if hi_bounds else None,
+        )
+
+    # ── Post-solve verification ──
+    if hard_features:
+        path_pairs = list(zip(times, solved))
+        violations = assert_required_in_frame(
+            path_pairs, hard_features, source_width, crop_aspect, source_height,
+        )
+        if violations:
+            logger.warning(
+                "L1 shot solver: %d frames have required features out of crop",
+                len(violations),
+            )
+            return [{
+                "mode": "infeasible",
+                "center": source_width / 2.0,
+                "path": [],
+                "slope": 0.0,
+                "ease_in_ms": 0,
+                "infeasible_frames": violations,
+            } for _ in segments_in_shot]
+
+    # ── Slice solved path back into per-segment results ──
+    results = []
+    for (seg_start_idx, seg_end_idx) in segment_boundaries:
+        seg_times = times[seg_start_idx:seg_end_idx]
+        seg_solved = solved[seg_start_idx:seg_end_idx]
+        result = _classify_segment_mode(seg_times, seg_solved, source_width)
+        results.append(result)
+
+    return results
+
+
 def get_dense_face_positions_for_segment(
     dense_faces: list,
     active_slot: Optional[int],
