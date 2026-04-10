@@ -259,6 +259,53 @@ class TestRegressionFaceOnlyPath:
             assert base.subject_x == emp.subject_x
 
 
+class TestFeatureMerging:
+    """Fix 5: Verify overlapping saliency features are merged into face/object features."""
+
+    def test_overlapping_saliency_absorbed_into_face(self):
+        """Saliency bbox overlapping a face bbox is absorbed (IoU > 0.3)."""
+        from backend.services.required_regions import _merge_overlapping_features, RequiredRegion
+
+        face = RequiredRegion(
+            timestamp=0.0, cx=0.5, cy=0.5, half_width=0.1, half_height=0.1,
+            score=0.7, tier="required", source="face", face_slot=0,
+        )
+        # Saliency overlapping the face (slightly offset)
+        sal = RequiredRegion(
+            timestamp=0.0, cx=0.52, cy=0.5, half_width=0.09, half_height=0.11,
+            score=0.3, tier="preferred", source="saliency",
+        )
+
+        result = _merge_overlapping_features([face, sal])
+
+        # Only face should remain (saliency absorbed)
+        assert len(result) == 1
+        assert result[0].source == "face"
+        # Face weight increased by saliency score
+        assert result[0].score == min(1.0, 0.7 + 0.3)
+
+    def test_non_overlapping_saliency_kept_separate(self):
+        """Saliency bbox far from face bbox is kept as separate entry."""
+        from backend.services.required_regions import _merge_overlapping_features, RequiredRegion
+
+        face = RequiredRegion(
+            timestamp=0.0, cx=0.2, cy=0.2, half_width=0.05, half_height=0.05,
+            score=0.7, tier="required", source="face",
+        )
+        sal = RequiredRegion(
+            timestamp=0.0, cx=0.8, cy=0.8, half_width=0.05, half_height=0.05,
+            score=0.5, tier="preferred", source="saliency",
+        )
+
+        result = _merge_overlapping_features([face, sal])
+
+        # Both should remain (no overlap)
+        assert len(result) == 2
+        sources = {r.source for r in result}
+        assert "face" in sources
+        assert "saliency" in sources
+
+
 class TestSaliencyBboxWiring:
     """Fix 1: Verify full saliency bboxes are wired into scene_focus."""
 

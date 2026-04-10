@@ -53,6 +53,41 @@ def _overlaps_any(region, existing_regions, iou_threshold=0.3) -> bool:
     return False
 
 
+def _merge_overlapping_features(frame_regions: list) -> list:
+    """Merge saliency features that overlap face/object features.
+
+    For each saliency-source region, compute IoU against all face and
+    object regions in the same frame. If IoU > 0.3 against any, absorb
+    the saliency region into that other feature by adding its score
+    (capped at 1.0) and dropping the standalone saliency entry.
+
+    This prevents a saliency bbox overlapping a face bbox from over-
+    constraining the crop solver.
+    """
+    if not frame_regions:
+        return frame_regions
+
+    non_sal = [r for r in frame_regions if r.source != "saliency"]
+    sal = [r for r in frame_regions if r.source == "saliency"]
+
+    if not sal or not non_sal:
+        return frame_regions
+
+    kept_sal = []
+    for sr in sal:
+        merged = False
+        for nr in non_sal:
+            iou = _iou_normalized(sr, nr)
+            if iou > 0.3:
+                nr.score = min(1.0, nr.score + sr.score)
+                merged = True
+                break
+        if not merged:
+            kept_sal.append(sr)
+
+    return non_sal + kept_sal
+
+
 def build_required_regions(
     frame_faces: list,
     active_speaker_events: list = None,
@@ -99,6 +134,8 @@ def build_required_regions(
             sal_by_time[round(sf.timestamp, 2)] = sf
 
     regions_per_frame = []
+    _pre_merge_total = 0
+    _post_merge_total = 0
 
     for ff in frame_faces:
         active_slot = _active_slot_at(ff.timestamp)
@@ -168,7 +205,15 @@ def build_required_regions(
                 if not _overlaps_any(candidate, frame_regions, 0.5):
                     frame_regions.append(candidate)
 
+        _pre_merge_total += len(frame_regions)
+        frame_regions = _merge_overlapping_features(frame_regions)
+        _post_merge_total += len(frame_regions)
         regions_per_frame.append(frame_regions)
+
+    if _pre_merge_total != _post_merge_total:
+        logger.info("[SaliencyParity] feature merge: %d → %d regions (-%d absorbed)",
+                    _pre_merge_total, _post_merge_total,
+                    _pre_merge_total - _post_merge_total)
 
     total_regions = sum(len(r) for r in regions_per_frame)
     frames_with = sum(1 for r in regions_per_frame if r)
