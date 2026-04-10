@@ -118,24 +118,31 @@ def extract_saliency_bboxes(
 def track_saliency_in_frames(
     frame_paths: list,
     face_results: list = None,
+    stride: int = 1,
 ) -> list:
     """Run spatiotemporal saliency across a list of frames.
 
-    If face_results is provided, skip frames where faces are already detected --
-    saliency is a fallback signal for faceless content.
+    AutoFlip runs saliency unconditionally on every frame and lets the
+    solver fuse signals downstream. The face_results parameter is accepted
+    for backward compatibility but no longer gates saliency computation.
+
+    Args:
+        frame_paths: list[(timestamp, path)] of frames to process.
+        face_results: Unused. Kept for backward compat with existing callers.
+        stride: Process every Nth frame (default 1 = all frames). Use
+            stride > 1 to reduce compute cost on long videos.
 
     Returns: list[SaliencyRegion]
     """
     regions = []
     prev_gray = None
 
+    _pre_count = len(frame_paths)
+
     for i, (timestamp, path) in enumerate(frame_paths):
-        # Skip frames that already have face data
-        if face_results and i < len(face_results):
-            fr = face_results[i]
-            if fr.faces:
-                prev_gray = None  # reset temporal continuity after a skip
-                continue
+        # Stride: skip frames not on the stride boundary
+        if stride > 1 and i % stride != 0:
+            continue
 
         img = cv2.imread(str(path))
         if img is None:
@@ -178,6 +185,6 @@ def track_saliency_in_frames(
 
         prev_gray = gray
 
-    logger.info("[SaliencyTracker] extracted %d regions from %d frames",
-                len(regions), len(frame_paths))
+    logger.info("[SaliencyParity] extracted %d regions from %d frames (stride=%d, input=%d)",
+                len(regions), len(frame_paths), stride, _pre_count)
     return regions

@@ -126,8 +126,8 @@ class TestTrackSaliencyInFrames:
         regions = track_saliency_in_frames(frame_paths)
         assert len(regions) >= 3
 
-    def test_skips_frames_with_faces(self, tmp_path):
-        """Frames with face data are skipped."""
+    def test_processes_all_frames_regardless_of_faces(self, tmp_path):
+        """Saliency runs on ALL frames, even those with face data (parity fix 2)."""
         import cv2
         frame_paths = []
         face_results = []
@@ -145,9 +145,13 @@ class TestTrackSaliencyInFrames:
                 face_results.append(MockFrameFaces(timestamp=float(i) * 0.5, faces=[]))
 
         regions = track_saliency_in_frames(frame_paths, face_results)
-        # Only frames 3 and 4 processed (faceless) — should have some regions
-        for r in regions:
-            assert r.timestamp >= 1.5  # frame 3 = timestamp 1.5
+        # ALL frames should be processed — regions from both face and faceless frames
+        timestamps = {r.timestamp for r in regions}
+        assert len(regions) >= 3
+        # Should have regions from early frames too (not just >= 1.5)
+        assert any(t < 1.5 for t in timestamps), (
+            f"Expected regions from face-containing frames too, got timestamps: {timestamps}"
+        )
 
     def test_empty_frame_list(self):
         """Empty frame list returns empty list."""
