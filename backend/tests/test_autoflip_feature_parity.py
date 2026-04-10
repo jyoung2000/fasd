@@ -257,3 +257,62 @@ class TestRegressionFaceOnlyPath:
         for base, emp in zip(segments_base, segments_empty):
             assert base.strategy == emp.strategy
             assert base.subject_x == emp.subject_x
+
+
+class TestSaliencyBboxWiring:
+    """Fix 1: Verify full saliency bboxes are wired into scene_focus."""
+
+    def test_frame_saliency_produces_real_bbox_features(self):
+        """Given SaliencyRegions with real bboxes, scene_focus emits
+        RequiredFeature entries with matching x, y, w, h — NOT the
+        legacy hardcoded y=50, w=10, h=10."""
+        from backend.services.scene_focus import aggregate_scene_focus
+        from backend.services.saliency_tracker import SaliencyRegion
+
+        # Salient region at 75% width, 30% height, size 20x15
+        regions = [
+            SaliencyRegion(
+                timestamp=1.0, x=75.0, y=30.0, w=20.0, h=15.0,
+                saliency_score=0.8, motion_score=0.4, spatial_score=0.6,
+            ),
+        ]
+
+        focus = aggregate_scene_focus(
+            shot_start=0.0, shot_end=2.0,
+            dense_faces=[], saliency_keyframes=[],
+            persistent_regions=None, face_registry=None,
+            source_width=1920, source_height=1080,
+            frame_saliency=regions,
+        )
+
+        # Should have one optional saliency feature with real bbox
+        sal_features = [f for f in focus.optional if f.kind.value == "saliency"]
+        assert len(sal_features) == 1
+        sf = sal_features[0]
+        assert abs(sf.x - 75.0) < 0.1, f"x={sf.x}, expected ~75"
+        assert abs(sf.y - 30.0) < 0.1, f"y={sf.y}, expected ~30 (NOT 50)"
+        assert abs(sf.w - 20.0) < 0.1, f"w={sf.w}, expected ~20 (NOT 10)"
+        assert abs(sf.h - 15.0) < 0.1, f"h={sf.h}, expected ~15 (NOT 10)"
+        assert abs(sf.weight - 0.8) < 0.1
+
+    def test_legacy_keyframes_still_work_as_fallback(self):
+        """Legacy saliency_keyframes path still works when frame_saliency is None."""
+        from backend.services.scene_focus import aggregate_scene_focus
+
+        keyframes = [(1.0, 60.0, 0.7)]  # (t, x, confidence)
+
+        focus = aggregate_scene_focus(
+            shot_start=0.0, shot_end=2.0,
+            dense_faces=[], saliency_keyframes=keyframes,
+            persistent_regions=None, face_registry=None,
+            source_width=1920, source_height=1080,
+            frame_saliency=None,
+        )
+
+        sal_features = [f for f in focus.optional if f.kind.value == "saliency"]
+        assert len(sal_features) == 1
+        sf = sal_features[0]
+        # Legacy path: y=50, w=10, h=10
+        assert abs(sf.x - 60.0) < 0.1
+        assert abs(sf.y - 50.0) < 0.1
+        assert abs(sf.w - 10.0) < 0.1

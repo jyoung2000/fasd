@@ -2647,6 +2647,7 @@ async def _run_analysis_inner(job_id: str):
                     target_aspect=9/16,
                     job_id=job_id,
                     interpolated_timeline=_interpolated_timeline,
+                    frame_saliency=_saliency_regions if '_saliency_regions' in dir() else None,
                 )
                 if reframe_segments:
                     from backend.models import SceneDescription

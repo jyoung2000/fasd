@@ -28,6 +28,7 @@ def aggregate_scene_focus(
     subject_tracks: list = None,
     job_id: str = "",
     interpolated_timeline=None,
+    frame_saliency: list = None,
 ) -> SceneFocusRegion:
     """Collect all required and non-required features in [shot_start, shot_end],
     compute the minimum bounding rect of required features, and decide whether
@@ -133,8 +134,29 @@ def aggregate_scene_focus(
                     must_be_in_frame=False,
                 ))
 
-    # 3. Collect saliency as non-required
-    if saliency_keyframes:
+    # 3. Collect saliency as non-required features.
+    #    Prefer frame_saliency (SaliencyRegion list with full bboxes) over
+    #    legacy saliency_keyframes (x-only tuples with hardcoded y/w/h).
+    _sal_from_frame_saliency = 0
+    if frame_saliency:
+        for sr in frame_saliency:
+            t = sr.timestamp
+            if t < shot_start or t >= shot_end:
+                continue
+            optional.append(RequiredFeature(
+                t_start=float(t),
+                t_end=float(t),
+                x=float(sr.x),
+                y=float(sr.y),
+                w=float(sr.w),
+                h=float(sr.h),
+                kind=FeatureKind.SALIENCY,
+                weight=float(sr.saliency_score),
+                must_be_in_frame=False,
+            ))
+            _sal_from_frame_saliency += 1
+    elif saliency_keyframes:
+        # Legacy fallback: x-only tuples — hardcoded y/w/h (deprecated path)
         for entry in saliency_keyframes:
             if len(entry) < 3:
                 continue
@@ -152,6 +174,10 @@ def aggregate_scene_focus(
                 weight=float(confidence),
                 must_be_in_frame=False,
             ))
+
+    if _sal_from_frame_saliency > 0:
+        logger.info("[SaliencyParity] scene_focus: %d saliency features from frame_saliency (full bbox)",
+                    _sal_from_frame_saliency)
 
     # 3.5. Object detections as required/non-required features
     if object_detections:

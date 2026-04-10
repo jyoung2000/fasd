@@ -46,6 +46,10 @@ def track_objects_in_frames(
 
     Uses the spatiotemporal saliency tracker internally. For each saliency
     region found, picks the one with the highest saliency_score per timestamp.
+
+    DEPRECATED: This function collapses SaliencyRegion bboxes to x-only tuples.
+    Prefer passing the SaliencyRegion list directly as frame_saliency to
+    scene_focus.aggregate_scene_focus for full bbox data.
     """
     from backend.services.saliency_tracker import track_saliency_in_frames
 

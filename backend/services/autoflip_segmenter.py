@@ -41,6 +41,7 @@ def build_autoflip_segments(
     target_aspect: float = 9 / 16,
     job_id: str = "",
     interpolated_timeline=None,
+    frame_saliency: list = None,
 ) -> list:
     """AutoFlip-parity segmenter.
 
@@ -131,6 +132,7 @@ def build_autoflip_segments(
             subject_tracks=subject_tracks,
             job_id=job_id,
             interpolated_timeline=interpolated_timeline,
+            frame_saliency=frame_saliency,
         )
 
         # 2b. Select camera mode for the whole shot
