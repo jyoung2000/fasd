@@ -1689,24 +1689,53 @@ export function keyframesToCropSegments(keyframes, duration, clusters) {
     return bestDist <= 15 ? bestIdx : -1;
   };
 
+  // Build segments by cluster assignment, not exact position.
+  // This prevents the LP solver's smooth ease curves from creating
+  // dozens of micro-segments during transitions.  A segment break
+  // occurs only when the keyframe's cluster changes (i.e., the camera
+  // has arrived at a different speaker position).
   const segments = [];
   let segStart = keyframes[0].t;
   let segX = keyframes[0].x;
+  let segCluster = clusterLookup(segX);
 
   for (let i = 1; i < keyframes.length; i++) {
     const kf = keyframes[i];
-    if (kf.x !== segX) {
-      // End current segment, start new one
+    const kfCluster = clusterLookup(kf.x);
+
+    // Break on cluster change — smooth transitions between clusters
+    // are absorbed into the preceding segment (the camera is "in transit")
+    if (kfCluster !== segCluster && kfCluster !== -1) {
       segments.push({ startTime: segStart, endTime: kf.t, cropX: segX });
       segStart = kf.t;
       segX = kf.x;
+      segCluster = kfCluster;
     }
   }
   // Final segment to end of clip
   segments.push({ startTime: segStart, endTime: duration, cropX: segX });
 
+  // Merge adjacent segments with the same cluster (can happen if the
+  // solver briefly leaves and re-enters the same cluster)
+  const merged = [segments[0]];
+  for (let i = 1; i < segments.length; i++) {
+    const prev = merged[merged.length - 1];
+    const curr = segments[i];
+    if (clusterLookup(prev.cropX) === clusterLookup(curr.cropX)) {
+      // Merge: extend previous segment
+      prev.endTime = curr.endTime;
+    } else {
+      merged.push(curr);
+    }
+  }
+
+  // Enforce strict contiguity: each segment's endTime === next segment's startTime
+  for (let i = 0; i < merged.length - 1; i++) {
+    merged[i].endTime = merged[i + 1].startTime;
+  }
+
   // Annotate with IDs, cluster info, and labels
-  return segments.map((seg, i) => {
+  return merged.map((seg, i) => {
     const cId = clusterLookup(seg.cropX);
     return {
       id: `crop-${i}`,

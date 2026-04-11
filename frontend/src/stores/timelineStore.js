@@ -785,43 +785,55 @@ const useTimelineStore = create(
         // Add subtitle items if provided — resolve overlaps from server data
         let lastSubEnd = 0;
         if (Array.isArray(subtitleSegments)) {
-          subtitleSegments.forEach((seg, segIdx) => {
-            if (seg.end > clipStart && seg.start < clipEnd) {
-              let clampedStart = Math.max(seg.start, clipStart);
-              const clampedEnd = Math.min(seg.end, clipEnd);
-              // Ensure no overlap with the previous subtitle on the same track
-              const relStart = clampedStart - clipStart;
-              const relEnd = clampedEnd - clipStart;
-              const adjStart = Math.max(relStart, lastSubEnd);
-              if (adjStart >= relEnd) return; // Skip degenerate segments
-              // Preserve word-level timestamps for accurate active word highlighting
-              let segWords = null;
-              if (seg.words && Array.isArray(seg.words)) {
-                segWords = seg.words
-                  .filter(w => w.end > clipStart && w.start < clipEnd)
-                  .map(w => ({
-                    ...w,
-                    start: w.start - clipStart,
-                    end: w.end - clipStart,
-                  }));
+          // Sort by start time and pre-compute relative times for overlap prevention
+          const sorted = subtitleSegments
+            .filter(seg => seg.end > clipStart && seg.start < clipEnd)
+            .sort((a, b) => a.start - b.start);
+
+          sorted.forEach((seg, segIdx) => {
+            const clampedStart = Math.max(seg.start, clipStart);
+            const clampedEnd = Math.min(seg.end, clipEnd);
+            // Ensure no overlap with the previous subtitle on the same track
+            const relStart = clampedStart - clipStart;
+            const relEnd = clampedEnd - clipStart;
+            const adjStart = Math.max(relStart, lastSubEnd);
+            if (adjStart >= relEnd) return; // Skip degenerate segments
+            // Preserve word-level timestamps for accurate active word highlighting
+            let segWords = null;
+            if (seg.words && Array.isArray(seg.words)) {
+              segWords = seg.words
+                .filter(w => w.end > clipStart && w.start < clipEnd)
+                .map(w => ({
+                  ...w,
+                  start: w.start - clipStart,
+                  end: w.end - clipStart,
+                }));
+            }
+            // Extend segment end to cover last word if word timestamps exceed it,
+            // but NEVER extend past the next segment's start (prevents overlap)
+            let effectiveEnd = relEnd;
+            if (segWords && segWords.length > 0) {
+              const lastWordEnd = Math.max(...segWords.map(w => w.end));
+              if (lastWordEnd > effectiveEnd) {
+                effectiveEnd = Math.min(lastWordEnd + 0.05, duration);
               }
-              // Extend segment end to cover last word if word timestamps exceed it
-              let effectiveEnd = relEnd;
-              if (segWords && segWords.length > 0) {
-                const lastWordEnd = Math.max(...segWords.map(w => w.end));
-                if (lastWordEnd > effectiveEnd) {
-                  effectiveEnd = Math.min(lastWordEnd + 0.05, duration);
-                }
-              }
-              lastSubEnd = effectiveEnd;
-              items.push({
-                id: nextItemId(),
-                trackId: 't1',
-                type: 'subtitle',
-                mediaRef: null,
-                start: adjStart,
-                end: effectiveEnd,
-                trimStart: 0,
+            }
+            // Cap at next segment's start to prevent overlap
+            const nextSeg = sorted[segIdx + 1];
+            if (nextSeg) {
+              const nextRelStart = Math.max(nextSeg.start, clipStart) - clipStart;
+              effectiveEnd = Math.min(effectiveEnd, nextRelStart);
+            }
+            if (adjStart >= effectiveEnd) return; // Skip if capping made it degenerate
+            lastSubEnd = effectiveEnd;
+            items.push({
+              id: nextItemId(),
+              trackId: 't1',
+              type: 'subtitle',
+              mediaRef: null,
+              start: adjStart,
+              end: effectiveEnd,
+              trimStart: 0,
                 trimEnd: null,
                 volume: 1.0,
                 speed: 1.0,
@@ -907,7 +919,23 @@ const useTimelineStore = create(
       },
 
       // ── Crop segment actions ──
-      setCropSegments: (segments) => set({ cropSegments: segments, selectedCropSegmentId: null }),
+      setCropSegments: (segments) => {
+        // Enforce no-overlap: sort by startTime, clamp each segment's endTime
+        // to the next segment's startTime.
+        if (!segments || segments.length === 0) {
+          set({ cropSegments: [], selectedCropSegmentId: null });
+          return;
+        }
+        const sorted = [...segments].sort((a, b) => a.startTime - b.startTime);
+        for (let i = 0; i < sorted.length - 1; i++) {
+          if (sorted[i].endTime > sorted[i + 1].startTime) {
+            sorted[i] = { ...sorted[i], endTime: sorted[i + 1].startTime };
+          }
+        }
+        // Drop degenerate segments (zero or negative duration)
+        const valid = sorted.filter(s => s.endTime > s.startTime);
+        set({ cropSegments: valid, selectedCropSegmentId: null });
+      },
       selectCropSegment: (id) => set({ selectedCropSegmentId: id }),
       updateCropSegment: (updated) => set((state) => ({
         cropSegments: state.cropSegments.map(s => s.id === updated.id ? { ...updated, isManualOverride: true } : s),
