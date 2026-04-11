@@ -1360,21 +1360,32 @@ export default function Analysis() {
 
   // Sync activeAR when clip changes or closes
   useEffect(() => {
+    if (!job) return;
+
+    // Full-video editor mode (no clip selected) — promote pending AR directly.
+    // The VideoEditor's own subject-keyframe effect will populate cropSegments
+    // from job.scenes / dense keyframes as soon as isCrop flips true.
     if (!clipPreview) {
-      setActiveAspectRatio(null);
+      setActiveAspectRatio(clipSettings?.aspectRatio || null);
       setTrackingLoading(false);
       return;
     }
-    if (!job) return;
+
+    // Per-clip mode: only promote once tracking data is ready.
     const scenes = job.scenes || [];
-    const hasAiData = scenes.some((s) => {
+    const hasSparseAiData = scenes.some((s) => {
       const sx = typeof s === 'object' ? (s.subject_x ?? 50) : 50;
       return sx !== 50;
     });
-    if (hasAiData) {
+    // Dense pipeline: real positions live in precise_x / face_positions,
+    // and dense_tracking_summary is set when the pipeline ran.
+    const hasDenseData = !!job.dense_tracking_summary ||
+      scenes.some((s) => s.precise_x != null && s.precise_x !== 50);
+
+    if (hasSparseAiData || hasDenseData) {
       setActiveAspectRatio(clipSettings?.aspectRatio || null);
     }
-  }, [clipPreview?.id]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [clipPreview?.id, clipSettings?.aspectRatio, job?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     // Clean up any previous polling interval
@@ -1403,10 +1414,13 @@ export default function Analysis() {
 
     // Check if this job already has AI-detected per-scene subject positions
     const scenes = job.scenes || [];
-    const hasAiData = scenes.some((s) => {
+    const hasSparseData = scenes.some((s) => {
       const sx = typeof s === 'object' ? (s.subject_x ?? 50) : 50;
       return sx !== 50;
     });
+    const hasDenseData = !!job.dense_tracking_summary ||
+      scenes.some((s) => s.precise_x != null && s.precise_x !== 50);
+    const hasAiData = hasSparseData || hasDenseData;
 
     let cancelled = false;
     if (hasAiData) {

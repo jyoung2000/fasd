@@ -899,6 +899,12 @@ export default function VideoEditor({
 
   // Populate crop segments on timeline when keyframes change
   useEffect(() => {
+    console.log('[CropTrack]', {
+      isCrop, aspectRatio, srcRatio, targetRatio,
+      hasKeyframes: !!subjectKeyframes?.length,
+      kfCount: subjectKeyframes?.length || 0,
+      dur: clipEnd - clipStart,
+    });
     const setCropSegments = useTimelineStore.getState().setCropSegments;
     if (!isCrop) {
       setCropSegments([]);
