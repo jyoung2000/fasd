@@ -2,13 +2,13 @@ import React, { useState, useCallback, useRef, useEffect } from 'react';
 import useTimelineStore from '../stores/timelineStore';
 
 const ACCEPT_MAP = {
-  video: { accept: '.mp4,.mov,.webm,.mkv', label: 'Video', icon: '🎬', maxSize: 2 * 1024 * 1024 * 1024 },
+  video: { accept: 'video/*,.mp4,.mov,.webm,.mkv,.avi,.m4v,.3gp', label: 'Video', icon: '🎬', maxSize: 2 * 1024 * 1024 * 1024 },
   audio: { accept: '.mp3,.wav,.aac,.ogg,.flac', label: 'Audio', icon: '🎵', maxSize: 500 * 1024 * 1024 },
   image: { accept: '.png,.jpg,.jpeg,.gif,.webp', label: 'Image', icon: '🖼️', maxSize: 50 * 1024 * 1024 },
 };
 
 const MIME_MAP = {
-  video: ['video/mp4', 'video/quicktime', 'video/webm', 'video/x-matroska'],
+  video: ['video/mp4', 'video/quicktime', 'video/webm', 'video/x-matroska', 'video/x-msvideo', 'video/3gpp'],
   audio: ['audio/mpeg', 'audio/wav', 'audio/aac', 'audio/ogg', 'audio/flac', 'audio/x-wav'],
   image: ['image/png', 'image/jpeg', 'image/gif', 'image/webp'],
 };
@@ -19,7 +19,7 @@ function detectMediaType(file) {
   }
   // Fallback: check extension
   const ext = file.name.split('.').pop().toLowerCase();
-  if (['mp4', 'mov', 'webm', 'mkv'].includes(ext)) return 'video';
+  if (['mp4', 'mov', 'webm', 'mkv', 'avi', 'm4v', '3gp', 'qt'].includes(ext)) return 'video';
   if (['mp3', 'wav', 'aac', 'ogg', 'flac'].includes(ext)) return 'audio';
   if (['png', 'jpg', 'jpeg', 'gif', 'webp'].includes(ext)) return 'image';
   return null;
@@ -384,7 +384,7 @@ export default function MediaUploader({ jobId, compact = false }) {
           ref={fileInputRef}
           type="file"
           multiple
-          accept=".mp4,.mov,.webm,.mkv,.mp3,.wav,.aac,.ogg,.flac,.png,.jpg,.jpeg,.gif,.webp"
+          accept="video/*,.mp4,.mov,.webm,.mkv,.avi,.m4v,.3gp,.mp3,.wav,.aac,.ogg,.flac,.png,.jpg,.jpeg,.gif,.webp"
           style={{ display: 'none' }}
           onChange={(e) => handleFiles(Array.from(e.target.files))}
         />
@@ -415,7 +415,7 @@ export default function MediaUploader({ jobId, compact = false }) {
         ref={fileInputRef}
         type="file"
         multiple
-        accept=".mp4,.mov,.webm,.mkv,.mp3,.wav,.aac,.ogg,.flac,.png,.jpg,.jpeg,.gif,.webp"
+        accept="video/*,.mp4,.mov,.webm,.mkv,.avi,.m4v,.3gp,.mp3,.wav,.aac,.ogg,.flac,.png,.jpg,.jpeg,.gif,.webp"
         style={{ display: 'none' }}
         onChange={(e) => handleFiles(Array.from(e.target.files))}
       />

@@ -17,3 +17,9 @@ ReactDOM.createRoot(document.getElementById('root')).render(
     </BrowserRouter>
   </React.StrictMode>
 );
+
+// Register service worker for Background Fetch (Android upload survival).
+// Only in production — dev mode uses Vite HMR which conflicts with SW.
+if ('serviceWorker' in navigator && import.meta.env.PROD) {
+  navigator.serviceWorker.register('/sw.js', { scope: '/' }).catch(() => {});
+}

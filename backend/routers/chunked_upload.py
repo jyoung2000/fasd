@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/upload", tags=["chunked-upload"])
 
-ALLOWED_EXTENSIONS = {"mp4", "mov", "avi", "mkv", "webm"}
+ALLOWED_EXTENSIONS = {"mp4", "mov", "avi", "mkv", "webm", "m4v", "3gp"}
 CHUNK_SIZE = 25 * 1024 * 1024  # 25 MB — fewer HTTP round-trips for large files
 UPLOAD_DIR = "/data/uploads"
 # Auto-expire stale uploads after 2 hours

@@ -3,14 +3,20 @@ import { useNavigate } from 'react-router-dom';
 import ProgressBar from '../components/ProgressBar';
 import useResponsive from '../hooks/useResponsive';
 
-const ACCEPTED = '.mp4,.mov,.avi,.mkv,.webm';
-const ACCEPTED_DISPLAY = 'MP4 \u00B7 MOV \u00B7 AVI \u00B7 MKV \u00B7 WEBM';
-const DEFAULT_CHUNK_SIZE = 25 * 1024 * 1024; // 25 MB — fewer HTTP round-trips
+const ACCEPTED = 'video/*,.mp4,.mov,.avi,.mkv,.webm,.m4v,.3gp';
+const ACCEPTED_DISPLAY = 'MP4 \u00B7 MOV \u00B7 AVI \u00B7 MKV \u00B7 WEBM \u00B7 M4V \u00B7 3GP';
+const VALID_EXTENSIONS = ['mp4', 'mov', 'avi', 'mkv', 'webm', 'm4v', '3gp', 'qt'];
+
+const IS_MOBILE = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+const IS_ANDROID = /Android/i.test(navigator.userAgent);
+const MOBILE_CHUNK = 4 * 1024 * 1024;           // 4 MB — safe for iOS Safari memory
+const DESKTOP_CHUNK_DEFAULT = 25 * 1024 * 1024;  // 25 MB — fewer HTTP round-trips
 const MIN_CHUNK = 5 * 1024 * 1024;    // 5 MB
 const MAX_CHUNK = 100 * 1024 * 1024;  // 100 MB
 
-// Adaptive chunk sizing: use stored throughput from previous uploads
+// Adaptive chunk sizing: mobile always 4MB; desktop uses stored throughput
 function getAdaptiveChunkSize() {
+  if (IS_MOBILE) return MOBILE_CHUNK;
   try {
     const stored = localStorage.getItem('clipai_chunk_speed');
     if (stored) {
@@ -21,7 +27,7 @@ function getAdaptiveChunkSize() {
       return Math.max(15 * 1024 * 1024, Math.min(ideal, MAX_CHUNK));
     }
   } catch { /* ignore */ }
-  return DEFAULT_CHUNK_SIZE;
+  return DESKTOP_CHUNK_DEFAULT;
 }
 
 const CHUNK_SIZE = getAdaptiveChunkSize();
@@ -42,7 +48,7 @@ function validateFileHeader(file) {
       if (bytes.slice(0, 8).every((b) => b === 0)) {
         resolve(
           'This file appears to be corrupt or an incomplete download \u2014 ' +
-          'the first bytes are all zeros. Please check that it plays on your device.'
+          'the first bytes are all zeros. Try re-downloading or re-exporting the video.'
         );
         return;
       }
@@ -70,6 +76,24 @@ function crc32(buffer) {
   let crc = 0xFFFFFFFF;
   for (let i = 0; i < view.length; i++) {
     crc = CRC32_TABLE[(crc ^ view[i]) & 0xFF] ^ (crc >>> 8);
+  }
+  return (crc ^ 0xFFFFFFFF) >>> 0;
+}
+
+// Streaming CRC32: reads blob in 256KB windows, never holds more than 256KB.
+// Prevents OOM on mobile where blob.arrayBuffer() on a 4MB+ chunk can double-allocate.
+const CRC_WINDOW = 256 * 1024;
+async function crc32Streaming(blob) {
+  let crc = 0xFFFFFFFF;
+  let offset = 0;
+  while (offset < blob.size) {
+    const end = Math.min(offset + CRC_WINDOW, blob.size);
+    const buf = await blob.slice(offset, end).arrayBuffer();
+    const view = new Uint8Array(buf);
+    for (let i = 0; i < view.length; i++) {
+      crc = CRC32_TABLE[(crc ^ view[i]) & 0xFF] ^ (crc >>> 8);
+    }
+    offset = end;
   }
   return (crc ^ 0xFFFFFFFF) >>> 0;
 }
@@ -297,8 +321,13 @@ export default function Upload() {
   const [retryCount, setRetryCount] = useState(0);
   const [uploadLog, setUploadLog] = useState([]);
   const fileRef = useRef(null);
+  const cameraRef = useRef(null);
   const abortRef = useRef(false);
   const uploadIdRef = useRef(null);
+  const wakeLockRef = useRef(null);
+  const hiddenSinceRef = useRef(null);
+  const bgFetchActiveRef = useRef(false);
+  const [bgFetchActive, setBgFetchActive] = useState(false);
   const navigate = useNavigate();
   const { isMobile } = useResponsive();
 
@@ -320,9 +349,11 @@ export default function Upload() {
 
   const handleFile = useCallback(async (file) => {
     if (!file) return;
-    const ext = file.name.split('.').pop().toLowerCase();
-    if (!['mp4', 'mov', 'avi', 'mkv', 'webm'].includes(ext)) {
-      setError(`Unsupported format: .${ext}`);
+    const ext = file.name.split('.').pop()?.toLowerCase() || '';
+    const mimeOk = file.type && file.type.startsWith('video/');
+    const extOk = VALID_EXTENSIONS.includes(ext);
+    if (!mimeOk && !extOk) {
+      setError(`Unsupported format — type="${file.type || 'unknown'}", extension=".${ext}". Accepted: video files (${VALID_EXTENSIONS.join(', ')})`);
       return;
     }
     const headerErr = await validateFileHeader(file);
@@ -348,15 +379,15 @@ export default function Upload() {
   const uploadChunkWithRetry = useCallback(async (uploadId, chunkIndex, blob, onChunkProgress) => {
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
       try {
-        // Compute CRC32 for fast integrity verification (~10ms per 25MB)
-        const buffer = await blob.arrayBuffer();
-        const checksum = crc32(buffer);
+        // Streaming CRC32: reads blob in 256KB windows, never double-allocates
+        const checksum = await crc32Streaming(blob);
 
         const formData = new FormData();
         formData.append('upload_id', uploadId);
         formData.append('chunk_index', chunkIndex.toString());
         formData.append('chunk_crc32', checksum.toString());
-        formData.append('file', new Blob([buffer]), `chunk_${chunkIndex}`);
+        // Pass original blob directly — no new Blob([buffer]) copy
+        formData.append('file', blob, `chunk_${chunkIndex}`);
 
         if (attempt > 0) {
           setChunkStates((prev) => ({ ...prev, [chunkIndex]: 'retrying' }));
@@ -391,21 +422,45 @@ export default function Upload() {
     setRetryCount(0);
     setUploadLog([]);
     abortRef.current = false;
+    bgFetchActiveRef.current = false;
+    setBgFetchActive(false);
+    hiddenSinceRef.current = null;
+
+    // Acquire Wake Lock to keep screen alive during upload (iOS + Android)
+    if ('wakeLock' in navigator) {
+      try {
+        wakeLockRef.current = await navigator.wakeLock.request('screen');
+      } catch { /* Wake lock failure must not block upload */ }
+    }
+
+    // Visibility change handler: track hidden/visible for resume, re-acquire wake lock
+    const onVisibilityChange = async () => {
+      if (document.visibilityState === 'hidden') {
+        hiddenSinceRef.current = Date.now();
+      } else {
+        // Re-acquire wake lock if it was released when page was hidden
+        if ('wakeLock' in navigator && wakeLockRef.current === null) {
+          try { wakeLockRef.current = await navigator.wakeLock.request('screen'); } catch {}
+        }
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
 
     const file = selectedFile;
     const numChunks = Math.ceil(file.size / CHUNK_SIZE);
     setTotalChunks(numChunks);
 
-    addLog(`Starting chunked upload: ${file.name} (${formatBytes(file.size)}, ${numChunks} chunks)`);
+    addLog(`Starting chunked upload: ${file.name} (${formatBytes(file.size)}, ${numChunks} chunks${IS_MOBILE ? `, ${formatBytes(CHUNK_SIZE)} mobile chunks` : ''})`);
 
     // Step 1: Try to resume a previous upload, or initialize a new session
     let uploadId, serverChunkSize, serverTotalChunks;
-    const resumeKey = `clipai_upload_${file.name}_${file.size}`;
+    // Resume key: sessionStorage keyed by file identity so page reload can offer to resume
+    const resumeKey = `clipai_upload_${file.name}_${file.size}_${file.lastModified}`;
     let resumedChunks = new Set();
 
     try {
-      // Check for a resumable upload
-      const savedUploadId = localStorage.getItem(resumeKey);
+      // Check for a resumable upload (check sessionStorage first, fall back to localStorage)
+      const savedUploadId = sessionStorage.getItem(resumeKey) || localStorage.getItem(resumeKey);
       if (savedUploadId) {
         try {
           const resumeResp = await fetch(`/api/upload/resume/${savedUploadId}`);
@@ -462,11 +517,117 @@ export default function Upload() {
       }
 
       uploadIdRef.current = uploadId;
-      localStorage.setItem(resumeKey, uploadId);
+      sessionStorage.setItem(resumeKey, uploadId);
+
+      // ── Android Background Fetch path ──
+      // No auth header needed: chunked upload endpoints have no auth dependency.
+      if ('serviceWorker' in navigator && 'BackgroundFetchManager' in self) {
+        try {
+          const reg = await navigator.serviceWorker.ready;
+          if (reg.backgroundFetch) {
+            const chunkSz = serverChunkSize || CHUNK_SIZE;
+            const nChunks = serverTotalChunks || numChunks;
+            const requests = [];
+            for (let ci = 0; ci < nChunks; ci++) {
+              if (resumedChunks.has(ci)) continue;
+              const s = ci * chunkSz;
+              const e = Math.min(s + chunkSz, file.size);
+              const fd = new FormData();
+              fd.append('upload_id', uploadId);
+              fd.append('chunk_index', ci.toString());
+              fd.append('chunk_crc32', ''); // skip CRC for BG fetch — server validates size
+              fd.append('file', file.slice(s, e), `chunk_${ci}`);
+              requests.push(new Request('/api/upload/chunk', { method: 'POST', body: fd }));
+            }
+            const bgFetch = await reg.backgroundFetch.fetch(
+              `clipai-upload-${uploadId}`,
+              requests,
+              { title: `Uploading ${file.name}`, icons: [], downloadTotal: file.size },
+            );
+            bgFetchActiveRef.current = true;
+            setBgFetchActive(true);
+            addLog(`Background Fetch started — upload will continue even if you close this tab`, 'success');
+
+            // Mirror progress into the UI when tab is foregrounded
+            bgFetch.addEventListener('progress', () => {
+              if (bgFetch.downloaded > 0) {
+                const pct = Math.min(90, Math.round((bgFetch.downloaded / file.size) * 90));
+                setProgress(pct);
+              }
+            });
+
+            // Wait for completion (tab still open)
+            await new Promise((resolve, reject) => {
+              const checkResult = (result) => {
+                if (result === '') resolve(); // success
+                else reject(new Error(`Background Fetch ended: ${result}`));
+              };
+              bgFetch.addEventListener('progress', () => {
+                if (bgFetch.result) checkResult(bgFetch.result);
+              });
+              // Also check immediately in case already done
+              if (bgFetch.result) checkResult(bgFetch.result);
+            });
+
+            // Background Fetch completed — now call /complete
+            setProgress(92);
+            setUploadPhase('assembling');
+            addLog('Background upload complete. Finalizing...');
+            const completeForm = new FormData();
+            completeForm.append('upload_id', uploadId);
+            completeForm.append('file_hash', '');
+            const completeResp = await fetch('/api/upload/complete', { method: 'POST', body: completeForm });
+            if (!completeResp.ok) throw new Error('Assembly failed after Background Fetch');
+            const completeData = await completeResp.json();
+
+            // Poll for assembly completion (same as foreground path below)
+            if (completeData.poll) {
+              const pollStart = Date.now();
+              while (Date.now() - pollStart < 30 * 60 * 1000) {
+                await new Promise(r => setTimeout(r, 2000));
+                const statusResp = await fetch(`/api/upload/status/${uploadId}`);
+                if (!statusResp.ok) continue;
+                const status = await statusResp.json();
+                if (status.state === 'complete') {
+                  setUploadPhase('complete');
+                  setProgress(100);
+                  setUploadDone(true);
+                  setQaReport(status.qa);
+                  sessionStorage.removeItem(resumeKey);
+                  addLog(`Upload complete! Job ID: ${status.job_id || completeData.job_id}`, 'success');
+                  document.removeEventListener('visibilitychange', onVisibilityChange);
+                  try { wakeLockRef.current?.release(); wakeLockRef.current = null; } catch {}
+                  setTimeout(() => navigate(`/analysis/${status.job_id || completeData.job_id}`), 800);
+                  return;
+                }
+                if (status.state === 'error') throw new Error(status.error || 'Assembly failed');
+              }
+              throw new Error('Assembly timed out');
+            }
+
+            // Direct response (no polling)
+            setUploadPhase('complete');
+            setProgress(100);
+            setUploadDone(true);
+            sessionStorage.removeItem(resumeKey);
+            document.removeEventListener('visibilitychange', onVisibilityChange);
+            try { wakeLockRef.current?.release(); wakeLockRef.current = null; } catch {}
+            setTimeout(() => navigate(`/analysis/${completeData.job_id}`), 800);
+            return;
+          }
+        } catch (bgErr) {
+          // Background Fetch failed (quota, permission, unsupported) — fall through to foreground
+          addLog(`Background Fetch unavailable (${bgErr.message}), using foreground upload`, 'warn');
+          bgFetchActiveRef.current = false;
+          setBgFetchActive(false);
+        }
+      }
     } catch (err) {
       setError(err.message);
       setUploading(false);
       addLog(`Init failed: ${err.message}`, 'error');
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      try { wakeLockRef.current?.release(); wakeLockRef.current = null; } catch {}
       return;
     }
 
@@ -498,6 +659,38 @@ export default function Upload() {
         const start = i * chunkSize;
         const end = Math.min(start + chunkSize, file.size);
         const blob = file.slice(start, end);
+
+        // Visibility-aware resume: if page was hidden, check server for completed chunks
+        if (hiddenSinceRef.current !== null) {
+          hiddenSinceRef.current = null;
+          try {
+            const resumeResp = await fetch(`/api/upload/resume/${uploadId}`);
+            if (resumeResp.ok) {
+              const resumeData = await resumeResp.json();
+              const serverDone = new Set(resumeData.chunks_received || []);
+              if (serverDone.has(i)) {
+                // This chunk was already received — mark done and skip
+                setChunkStates((prev) => ({ ...prev, [i]: 'done' }));
+                const skippedBytes = end - start;
+                bytesUploaded += skippedBytes;
+                completedCount++;
+                addLog(`Resumed: chunk ${i + 1} already on server, skipping`, 'info');
+                continue;
+              }
+              // Also drain any other completed chunks from the queue
+              for (let qi = queue.length - 1; qi >= 0; qi--) {
+                if (serverDone.has(queue[qi])) {
+                  const ci = queue.splice(qi, 1)[0];
+                  const cs = ci * chunkSize;
+                  const ce = Math.min(cs + chunkSize, file.size);
+                  setChunkStates((prev) => ({ ...prev, [ci]: 'done' }));
+                  bytesUploaded += (ce - cs);
+                  completedCount++;
+                }
+              }
+            }
+          } catch { /* Resume check failed — just continue uploading */ }
+        }
 
         setChunkStates((prev) => ({ ...prev, [i]: 'uploading' }));
         const chunkBytes = end - start;
@@ -569,6 +762,8 @@ export default function Upload() {
         addLog(`Fatal error: ${err.message}`, 'error');
       }
       setUploading(false);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      try { wakeLockRef.current?.release(); wakeLockRef.current = null; } catch {}
       return;
     }
 
@@ -576,6 +771,8 @@ export default function Upload() {
       addLog('Upload cancelled by user', 'warn');
       setError('Upload cancelled');
       setUploading(false);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      try { wakeLockRef.current?.release(); wakeLockRef.current = null; } catch {}
       return;
     }
 
@@ -670,9 +867,11 @@ export default function Upload() {
               setProgress(100);
               setUploadDone(true);
               setQaReport(status.qa);
-              localStorage.removeItem(resumeKey);
+              sessionStorage.removeItem(resumeKey);
               const jobId = status.job_id || completeData.job_id;
               addLog(`Upload complete! Job ID: ${jobId}, QA: ${status.qa?.overall?.pass ? 'PASSED' : 'ISSUES FOUND'}`, 'success');
+              document.removeEventListener('visibilitychange', onVisibilityChange);
+              try { wakeLockRef.current?.release(); wakeLockRef.current = null; } catch {}
               setTimeout(() => {
                 navigate(`/analysis/${jobId}`);
               }, 800);
@@ -698,8 +897,10 @@ export default function Upload() {
       setProgress(100);
       setUploadDone(true);
       setQaReport(completeData.qa);
-      localStorage.removeItem(resumeKey);
+      sessionStorage.removeItem(resumeKey);
       addLog(`Upload complete! Job ID: ${completeData.job_id}, QA: ${completeData.qa?.overall?.pass ? 'PASSED' : 'ISSUES FOUND'}`, 'success');
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      try { wakeLockRef.current?.release(); wakeLockRef.current = null; } catch {}
 
       setTimeout(() => {
         navigate(`/analysis/${completeData.job_id}`);
@@ -709,11 +910,14 @@ export default function Upload() {
       setUploading(false);
       setUploadPhase('');
       addLog(`Completion failed: ${err.message}`, 'error');
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      try { wakeLockRef.current?.release(); wakeLockRef.current = null; } catch {}
     }
   };
 
   const cancelUpload = useCallback(async () => {
     abortRef.current = true;
+    try { wakeLockRef.current?.release(); wakeLockRef.current = null; } catch {}
     if (uploadIdRef.current) {
       try {
         await fetch(`/api/upload/${uploadIdRef.current}`, { method: 'DELETE' });
@@ -760,6 +964,7 @@ export default function Upload() {
           transition: 'all 0.2s ease',
         }}
       >
+        {/* No capture attribute — on iOS, capture forces camera-only and hides the library */}
         <input
           ref={fileRef}
           type="file"
@@ -772,7 +977,7 @@ export default function Upload() {
           <>
             <div style={{ fontSize: 40, marginBottom: 12, opacity: 0.4 }}>&#x2B06;</div>
             <p style={{ color: 'var(--text-secondary)', marginBottom: 8 }}>
-              Drag and drop your video here, or click to browse
+              {IS_MOBILE ? 'Tap to choose a video' : 'Drag and drop your video here, or click to browse'}
             </p>
             <p style={{ color: 'var(--text-muted)', fontSize: 12 }}>
               {ACCEPTED_DISPLAY}
@@ -789,6 +994,34 @@ export default function Upload() {
           </div>
         )}
       </div>
+
+      {/* Record new video button — mobile only, uses capture="environment" for camera */}
+      {IS_MOBILE && !uploading && (
+        <div style={{ marginTop: 8, textAlign: 'center' }}>
+          <input
+            ref={cameraRef}
+            type="file"
+            accept="video/*"
+            capture="environment"
+            onChange={(e) => handleFile(e.target.files?.[0])}
+            style={{ display: 'none' }}
+          />
+          <button
+            onClick={() => cameraRef.current?.click()}
+            style={{
+              padding: '8px 16px',
+              fontSize: 13,
+              background: 'transparent',
+              color: 'var(--text-secondary)',
+              border: '1px solid var(--border)',
+              borderRadius: 'var(--radius-sm)',
+              cursor: 'pointer',
+            }}
+          >
+            Record new video
+          </button>
+        </div>
+      )}
 
       {/* Language selector */}
       {selectedFile && !uploading && (
@@ -1015,6 +1248,43 @@ export default function Upload() {
 
           {/* Chunk progress grid */}
           <ChunkGrid totalChunks={totalChunks} chunkStates={chunkStates} />
+
+          {/* Debug: chunk size info */}
+          <div style={{ marginTop: 4, fontSize: 10, color: 'var(--text-muted)', fontFamily: 'var(--font-mono)', opacity: 0.6 }}>
+            Chunk size: {formatBytes(CHUNK_SIZE)}{IS_MOBILE ? ' (mobile)' : ' (desktop)'}
+          </div>
+        </div>
+      )}
+
+      {/* Android Background Fetch banner */}
+      {uploading && !uploadDone && bgFetchActive && IS_ANDROID && (
+        <div style={{
+          marginTop: 12,
+          padding: '10px 14px',
+          background: 'rgba(48, 209, 88, 0.08)',
+          border: '1px solid rgba(48, 209, 88, 0.3)',
+          borderRadius: 'var(--radius-sm)',
+          fontSize: 12,
+          color: '#30D158',
+          lineHeight: 1.4,
+        }}>
+          Upload running in background — you can close this tab.
+        </div>
+      )}
+
+      {/* iOS foreground upload warning */}
+      {uploading && !uploadDone && IS_MOBILE && !bgFetchActive && !IS_ANDROID && (
+        <div style={{
+          marginTop: 12,
+          padding: '10px 14px',
+          background: 'rgba(245, 158, 11, 0.08)',
+          border: '1px solid rgba(245, 158, 11, 0.3)',
+          borderRadius: 'var(--radius-sm)',
+          fontSize: 12,
+          color: 'var(--accent-amber)',
+          lineHeight: 1.4,
+        }}>
+          Keep this tab visible — iOS limits background uploads. If you switch apps, the upload will resume when you return.
         </div>
       )}
 

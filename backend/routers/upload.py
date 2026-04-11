@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["upload"])
 
-ALLOWED_EXTENSIONS = {"mp4", "mov", "avi", "mkv", "webm"}
+ALLOWED_EXTENSIONS = {"mp4", "mov", "avi", "mkv", "webm", "m4v", "3gp"}
 
 from backend.services.video_validation import validate_video_header as _validate_video_header
 
