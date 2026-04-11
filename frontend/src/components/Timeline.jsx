@@ -3,7 +3,7 @@ import useTimelineStore, { getMaxItemDuration, hashGroupId } from '../stores/tim
 
 // ── Constants ────────────────────────────────────────────────────────────────
 const TRACK_HEIGHT = 64;
-const TRACK_GAP = 4;
+const TRACK_GAP = 0;
 const LABEL_WIDTH = 120;
 const HANDLE_WIDTH = 6;
 const HANDLE_HIT_AREA = 12;

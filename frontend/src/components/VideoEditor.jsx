@@ -900,11 +900,26 @@ export default function VideoEditor({
   // Populate crop segments on timeline when keyframes change
   useEffect(() => {
     const setCropSegments = useTimelineStore.getState().setCropSegments;
-    if (!isCrop || !subjectKeyframes?.length) {
+    if (!isCrop) {
       setCropSegments([]);
       return;
     }
     const dur = clipEnd - clipStart;
+    if (!subjectKeyframes?.length) {
+      // No scene data yet — generate a default center-crop segment so the crop
+      // track isn't empty while the user waits for subject tracking to complete.
+      setCropSegments([{
+        id: 'crop-default',
+        startTime: 0,
+        endTime: dur,
+        cropX: 50,
+        originalCropX: 50,
+        clusterId: 0,
+        isManualOverride: false,
+        label: 'Center',
+      }]);
+      return;
+    }
     const clusters = detectPositionClusters(subjectKeyframes);
     const segments = keyframesToCropSegments(subjectKeyframes, dur, clusters);
     setCropSegments(segments);
