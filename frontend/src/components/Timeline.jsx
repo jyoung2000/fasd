@@ -274,17 +274,17 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
       ctx.rect(0, y, canvasW, TRACK_HEIGHT);
       ctx.clip();
 
-      if (x2 < contentLeft || x1 > canvasW) return;
+      if (x2 < contentLeft || x1 > canvasW) { ctx.restore(); return; }
 
       const color = TRACK_COLORS[item.type] || TRACK_COLORS.video;
       const isSelected = item.id === selectedItemId;
       const isMultiSelected = selectedItemIds.includes(item.id);
 
-      // Clip body
+      // Clip body — enforce minimum visual width so short items stay rectangles
       ctx.fillStyle = (isSelected || isMultiSelected) ? color + 'DD' : color + '77';
       const rr = 4;
       const clipX = Math.max(x1, contentLeft);
-      const clipW = Math.min(w, canvasW - clipX);
+      const clipW = Math.max(Math.min(w, canvasW - clipX), 6);
       ctx.beginPath();
       ctx.roundRect(clipX, y + 2, clipW, TRACK_HEIGHT - 4, rr);
       ctx.fill();
@@ -384,7 +384,7 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
             const cw = cx2 - cx1;
             if (cx2 < contentLeft || cx1 > canvasW) return;
             const clipCX = Math.max(cx1, contentLeft);
-            const clipCW = Math.min(cw, canvasW - clipCX);
+            const clipCW = Math.max(Math.min(cw, canvasW - clipCX), 6);
 
             // Color by cluster or manual override
             const clrIdx = seg.isManualOverride ? 4 : Math.max(0, seg.clusterId);
