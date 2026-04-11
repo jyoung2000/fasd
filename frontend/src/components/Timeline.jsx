@@ -3,7 +3,7 @@ import useTimelineStore, { getMaxItemDuration, hashGroupId } from '../stores/tim
 
 // ── Constants ────────────────────────────────────────────────────────────────
 const TRACK_HEIGHT = 64;
-const TRACK_GAP = 1;
+const TRACK_GAP = 4;
 const LABEL_WIDTH = 120;
 const HANDLE_WIDTH = 6;
 const HANDLE_HIT_AREA = 12;
@@ -246,6 +246,17 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
         ctx.fillRect(contentLeft, y, contentWidth, TRACK_HEIGHT);
         ctx.fillRect(0, y, LABEL_WIDTH - 1, TRACK_HEIGHT);
       }
+
+      // Track separator line — drawn in the gap between this track and the next
+      if (idx < tracks.length - 1) {
+        const sepY = y + TRACK_HEIGHT + Math.floor(TRACK_GAP / 2);
+        ctx.strokeStyle = isDark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.08)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(0, sepY);
+        ctx.lineTo(canvasW, sepY);
+        ctx.stroke();
+      }
     });
 
     // ── Items (clips) ──
@@ -256,6 +267,12 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
       const x1 = contentLeft + item.start * pps - sx;
       const x2 = contentLeft + item.end * pps - sx;
       const w = x2 - x1;
+
+      // Clip rendering to track bounds — prevents visual bleed across the gap
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(0, y, canvasW, TRACK_HEIGHT);
+      ctx.clip();
 
       if (x2 < contentLeft || x1 > canvasW) return;
 
@@ -344,6 +361,7 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
           ctx.fill();
         }
       }
+      ctx.restore(); // End per-item track clip
     });
 
     // ── Crop segments (on the crop track) ──
@@ -353,6 +371,13 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
         const cropTrack = tracks[cropTrackIdx];
         if (cropTrack.visible !== false) {
           const cy = RULER_HEIGHT + cropTrackIdx * (TRACK_HEIGHT + TRACK_GAP);
+
+          // Clip crop segment rendering to crop track bounds
+          ctx.save();
+          ctx.beginPath();
+          ctx.rect(0, cy, canvasW, TRACK_HEIGHT);
+          ctx.clip();
+
           cropSegments.forEach((seg) => {
             const cx1 = contentLeft + seg.startTime * pps - sx;
             const cx2 = contentLeft + seg.endTime * pps - sx;
@@ -389,6 +414,7 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
               ctx.fillText(lbl, Math.max(cx1 + 6, contentLeft + 4), cy + TRACK_HEIGHT / 2 + 3, cw - 12);
             }
           });
+          ctx.restore(); // End crop track clip
         }
       }
     }
