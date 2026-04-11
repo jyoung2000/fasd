@@ -190,6 +190,97 @@ function resolveAllOverlaps(items) {
   }
 }
 
+/**
+ * Resolve overlaps in crop segments by clamping endTime to next segment's startTime.
+ * Modifies the array in place. Drops zero/negative-duration segments.
+ * Returns the cleaned array.
+ */
+function resolveAllCropOverlaps(cropSegments) {
+  if (!cropSegments || cropSegments.length <= 1) return cropSegments;
+  cropSegments.sort((a, b) => a.startTime - b.startTime);
+  for (let i = 0; i < cropSegments.length - 1; i++) {
+    if (cropSegments[i].endTime > cropSegments[i + 1].startTime) {
+      cropSegments[i].endTime = cropSegments[i + 1].startTime;
+    }
+  }
+  // Remove degenerate segments
+  for (let i = cropSegments.length - 1; i >= 0; i--) {
+    if (cropSegments[i].endTime <= cropSegments[i].startTime) {
+      cropSegments.splice(i, 1);
+    }
+  }
+  return cropSegments;
+}
+
+/**
+ * Centralized overlap invariant enforcement.
+ *
+ * This is the SINGLE safety net that guarantees no two elements on the same
+ * track ever overlap, regardless of which action mutated the state.
+ * Runs as a Zustand middleware after every set() call that touches items
+ * or cropSegments.
+ *
+ * - For items: calls resolveAllOverlaps (push-forward strategy)
+ * - For cropSegments: calls resolveAllCropOverlaps (clamp-endTime strategy)
+ * - In development, logs a warning when overlaps are auto-fixed so bugs
+ *   in individual action handlers are surfaced early.
+ */
+function enforceNoOverlapsMiddleware(config) {
+  return (set, get, api) =>
+    config(
+      (...args) => {
+        set(...args);
+        const state = get();
+
+        // Check items for overlaps
+        if (state.items && state.items.length > 1) {
+          const byTrack = {};
+          for (const item of state.items) {
+            (byTrack[item.trackId] || (byTrack[item.trackId] = [])).push(item);
+          }
+          let hadOverlap = false;
+          for (const trackItems of Object.values(byTrack)) {
+            if (trackItems.length < 2) continue;
+            trackItems.sort((a, b) => a.start - b.start);
+            for (let i = 1; i < trackItems.length; i++) {
+              if (trackItems[i].start < trackItems[i - 1].end - 0.001) {
+                hadOverlap = true;
+                break;
+              }
+            }
+            if (hadOverlap) break;
+          }
+          if (hadOverlap) {
+            if (process.env.NODE_ENV === 'development') {
+              console.warn('[TimelineStore] Overlap detected in items — auto-fixing');
+            }
+            set((s) => { resolveAllOverlaps(s.items); }, true);
+          }
+        }
+
+        // Check crop segments for overlaps
+        if (state.cropSegments && state.cropSegments.length > 1) {
+          const sorted = [...state.cropSegments].sort((a, b) => a.startTime - b.startTime);
+          let hadCropOverlap = false;
+          for (let i = 1; i < sorted.length; i++) {
+            if (sorted[i].startTime < sorted[i - 1].endTime - 0.001) {
+              hadCropOverlap = true;
+              break;
+            }
+          }
+          if (hadCropOverlap) {
+            if (process.env.NODE_ENV === 'development') {
+              console.warn('[TimelineStore] Overlap detected in cropSegments — auto-fixing');
+            }
+            set((s) => { resolveAllCropOverlaps(s.cropSegments); }, true);
+          }
+        }
+      },
+      get,
+      api,
+    );
+}
+
 // ── Group ID helpers ────────────────────────────────────────────────────────
 let _groupIdCounter = 1;
 const nextGroupId = () => `g${_groupIdCounter++}`;
@@ -210,6 +301,7 @@ const nextMediaId = () => `media-${Date.now()}-${Math.random().toString(36).slic
 // ── Store with Immer + Zundo ────────────────────────────────────────────────
 const useTimelineStore = create(
   temporal(
+    enforceNoOverlapsMiddleware(
     immer((set, get) => ({
       // ── Project settings ──
       project: {
@@ -834,24 +926,23 @@ const useTimelineStore = create(
               start: adjStart,
               end: effectiveEnd,
               trimStart: 0,
-                trimEnd: null,
-                volume: 1.0,
-                speed: 1.0,
-                opacity: 1.0,
-                position: { x: 50, y: 90 },
-                size: { w: 100, h: 100 },
-                transform: { x: 0, y: 0, scaleX: 1, scaleY: 1, rotation: 0, opacity: 1 },
-                effects: {},
-                fadeIn: 0,
-                fadeOut: 0,
-                subtitleText: seg.text,
-                subtitleStyle: null,
-                speaker: seg.speaker || null,
-                transition: null,
-                words: segWords,
-                transcriptIndex: segIdx,
-              });
-            }
+              trimEnd: null,
+              volume: 1.0,
+              speed: 1.0,
+              opacity: 1.0,
+              position: { x: 50, y: 90 },
+              size: { w: 100, h: 100 },
+              transform: { x: 0, y: 0, scaleX: 1, scaleY: 1, rotation: 0, opacity: 1 },
+              effects: {},
+              fadeIn: 0,
+              fadeOut: 0,
+              subtitleText: seg.text,
+              subtitleStyle: null,
+              speaker: seg.speaker || null,
+              transition: null,
+              words: segWords,
+              transcriptIndex: segIdx,
+            });
           });
         }
 
@@ -937,9 +1028,27 @@ const useTimelineStore = create(
         set({ cropSegments: valid, selectedCropSegmentId: null });
       },
       selectCropSegment: (id) => set({ selectedCropSegmentId: id }),
-      updateCropSegment: (updated) => set((state) => ({
-        cropSegments: state.cropSegments.map(s => s.id === updated.id ? { ...updated, isManualOverride: true } : s),
-      })),
+      updateCropSegment: (updated) => set((state) => {
+        const idx = state.cropSegments.findIndex(s => s.id === updated.id);
+        if (idx < 0) return;
+        const merged = { ...updated, isManualOverride: true };
+        // Clamp timing against neighbors to prevent overlap
+        if (idx > 0) {
+          merged.startTime = Math.max(merged.startTime, state.cropSegments[idx - 1].startTime);
+          if (merged.startTime < state.cropSegments[idx - 1].endTime) {
+            // Push start to prev's end (can't overlap)
+            merged.startTime = state.cropSegments[idx - 1].endTime;
+          }
+        }
+        if (idx < state.cropSegments.length - 1) {
+          const next = state.cropSegments[idx + 1];
+          if (merged.endTime > next.startTime) {
+            merged.endTime = next.startTime;
+          }
+        }
+        if (merged.endTime <= merged.startTime) return; // Degenerate
+        state.cropSegments[idx] = merged;
+      }),
       splitCropSegment: (segmentId, splitTime) => set((state) => {
         const seg = state.cropSegments.find(s => s.id === segmentId);
         if (!seg || splitTime <= seg.startTime || splitTime >= seg.endTime) return {};
@@ -1052,7 +1161,7 @@ const useTimelineStore = create(
           });
         }
       },
-    })),
+    }))),
     {
       // Zundo temporal config
       limit: 100,
