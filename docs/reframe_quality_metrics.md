@@ -5,12 +5,14 @@ Measured against synthetic speaker-change fixtures using
 
 ## Summary
 
-| Metric | Baseline (Before) | After | Target | Status |
-|--------|-------------------|-------|--------|--------|
-| Lag at speaker change | -6 frames (anticipation) | -6 frames (anticipation) | 0-1 frame | Anticipation is by design |
-| Sub-second switch recall (>=150ms, conf>=0.7) | **0%** (0/4) | **100%** (4/4) | 100% | FIXED |
-| Overlap count | **9** | **0** | 0 | FIXED |
-| Pixel precision (subject_x) | ~19.2px buckets (int 0-100) | <1px (float pixel-precise) | <=2px | FIXED |
+| Metric | Baseline (Before) | After | After AutoFlip parity pass | Target | Status |
+|--------|-------------------|-------|---------------------------|--------|--------|
+| Lag at speaker change | -6 frames (anticipation) | -6 frames (anticipation) | -6 frames (anticipation) | 0-1 frame | Anticipation is by design |
+| Sub-second switch recall (>=150ms, conf>=0.7) | **0%** (0/4) | **100%** (4/4) | **100%** (4/4) | 100% | MAINTAINED |
+| Overlap count | **9** | **0** | **0** | 0 | MAINTAINED |
+| Pixel precision (subject_x) | ~19.2px buckets (int 0-100) | <1px (float pixel-precise) | <1px | <=2px | MAINTAINED |
+| Pan smoothness (max |Δ²x| on linear-pan) | N/A | 1096.64 (Condat) | **2.69** (LP) | >50% reduction | **>99% reduction** |
+| Jerk on tracking shots (max |Δ³x|) | N/A | 2193.28 (Condat) | **2.69** (LP) | >30% reduction | **>99% reduction** |
 
 ## Detailed Results
 
@@ -81,3 +83,40 @@ to match. Exit assertion enforces `[start, end)` half-open contiguity.
 - **`l1_camera_path.py`**: 1D total-variation denoising solver for
   AutoFlip-quality camera motion. Per-segment mode selection:
   stationary / tracking / panning.
+
+## AutoFlip Parity Pass
+
+### Defaults Changed
+
+| Setting | Before | After |
+|---------|--------|-------|
+| `CLIPAI_L1_SOLVER` | N/A (`CLIPAI_L1_LP=1` env flag) | `auto` (LP for <= 900 frames, Condat above) |
+| `LP_MAX_FRAMES` | 600 | 900 |
+| LP λ₂ (velocity) | 10.0 | 10.0 (unchanged) |
+| LP λ₃ (acceleration) | 100.0 | 100.0 (unchanged) |
+| LP λ₄ (jerk) | 1000.0 | 100.0 (matches AutoFlip paper) |
+| `PANNING_R2_THRESHOLD` | 0.95 | 0.90 (pre-solve detection on noisier data) |
+| Saliency spatial weight | 0.4 | 0.3 |
+| Saliency temporal weight | 0.6 | 0.5 |
+| Saliency color weight | N/A | 0.2 (new color-opponent channel) |
+
+### LP-vs-Condat Decision Tree
+
+The solver selection (`CLIPAI_L1_SOLVER=auto`, the new default) works as follows:
+
+1. If the shot has **<= 900 frames** (30s @ 30fps): use the **LP solver**
+   with acceleration and jerk penalties (Grundmann et al. 2011). This
+   produces smooth ease-in/ease-out curves instead of Condat's piecewise-
+   constant steps. Solve time is under 2s for 900 frames on dev hardware.
+
+2. If the shot has **> 900 frames**: fall back to **Condat TV** which is
+   O(n) and handles arbitrarily long shots. The LP is O(n³) worst case
+   and would be too slow for long-form content.
+
+3. Override with `CLIPAI_L1_SOLVER=lp` (force LP, error above 1800 frames)
+   or `CLIPAI_L1_SOLVER=condat` (force Condat, escape hatch).
+
+### measure_reframe_lag.py Results
+
+Baseline (before): Sub-second recall 100%, overlaps 0, lag -6 frames.
+After parity pass: Sub-second recall 100%, overlaps 0, lag -6 frames. No regression.
