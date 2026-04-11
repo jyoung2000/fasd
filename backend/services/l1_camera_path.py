@@ -57,20 +57,25 @@ LP_MAX_FRAMES = 900
 
 # LP cost weights (Grundmann et al. 2011, Section 4.2).
 # λ₁ = data fidelity (always 1.0), λ₂ = velocity, λ₃ = acceleration, λ₄ = jerk.
-# Paper defaults: (10, 100, 100). Our codebase previously used lam4=1000;
-# we now match the paper values.
-LP_LAMBDA_V = 10.0    # λ₂: velocity penalty
+# Paper defaults: (10, 100, 100). We use λ₂=20 (2× paper) to bias toward
+# holding still — face-keypoint noise in our pipeline is noisier than
+# AutoFlip's feature tracks, so the solver needs more velocity resistance
+# to avoid chasing jitter and to hold on subjects longer.
+LP_LAMBDA_V = 20.0    # λ₂: velocity penalty (paper: 10, ours: 20 for stickier holds)
 LP_LAMBDA_A = 100.0   # λ₃: acceleration penalty
 LP_LAMBDA_J = 100.0   # λ₄: jerk penalty
 
 # TV denoise regularization: fraction of source_width for resolution independence.
-# Actual lambda = TV_LAMBDA_FRAC * source_width. 0.015 * 1920 = 28.8
-TV_LAMBDA_FRAC = 0.015
+# Actual lambda = TV_LAMBDA_FRAC * source_width. 0.02 * 1920 = 38.4
+# Higher = smoother/stickier holds. 0.02 produces longer holds than 0.015
+# while still snapping cleanly to new subjects.
+TV_LAMBDA_FRAC = 0.02
 # Legacy constant (kept for backward-compat callers passing lam= explicitly)
 TV_LAMBDA = 10.0
 # Dead-zone: ignore target jitter smaller than this fraction of source_width.
-# 0.013 * 1920 ≈ 25px — covers face-keypoint noise without masking real motion.
-DEADZONE_FRAC = 0.013
+# 0.018 * 1920 ≈ 35px — covers face-keypoint noise (which can be 20-30px
+# frame-to-frame) without masking genuine subject motion.
+DEADZONE_FRAC = 0.018
 # Stationary threshold: if total movement < this fraction of source width, static crop
 # 0.08 = ~154px on 1920 — covers normal face-detection noise without triggering
 STATIONARY_THRESHOLD = 0.08
@@ -290,6 +295,41 @@ def assert_required_in_frame(
     return violations
 
 
+def _post_solve_smooth(solved: list[float], alpha: float = 0.15) -> list[float]:
+    """Light bidirectional exponential smoothing to kill residual jitter.
+
+    Runs a forward EMA then a backward EMA and averages them (Holt-style
+    symmetric smoothing). This preserves transition timing while suppressing
+    sub-pixel wiggles left by the LP/Condat solver.
+
+    Args:
+        solved: Solved camera path from TV/LP.
+        alpha: Smoothing factor (0 = no smoothing, 1 = no smoothing).
+            0.15 kills 1-2px jitter without visibly delaying transitions.
+
+    Returns:
+        Smoothed path of the same length.
+    """
+    if len(solved) < 3 or alpha >= 1.0:
+        return list(solved)
+
+    n = len(solved)
+    # Forward pass
+    fwd = [0.0] * n
+    fwd[0] = solved[0]
+    for i in range(1, n):
+        fwd[i] = alpha * solved[i] + (1 - alpha) * fwd[i - 1]
+
+    # Backward pass
+    bwd = [0.0] * n
+    bwd[n - 1] = solved[n - 1]
+    for i in range(n - 2, -1, -1):
+        bwd[i] = alpha * solved[i] + (1 - alpha) * bwd[i + 1]
+
+    # Average — symmetric, so transitions aren't shifted in time
+    return [(f + b) / 2.0 for f, b in zip(fwd, bwd)]
+
+
 def _apply_condat_weights(
     targets: list[float],
     weights: list[float],
@@ -325,16 +365,20 @@ def _apply_condat_weights(
 def _apply_deadzone(targets: list[float], deadzone_px: float) -> list[float]:
     """Replace target values within deadzone of a running hold with the hold value.
 
-    Uses a running median over the previous 0.5s (15 samples at 30fps) as
+    Uses a running median over the previous 1.0s (30 samples at 30fps) as
     the hold reference. If a target is within deadzone_px of the hold,
     it's replaced by the hold value — this suppresses keypoint jitter
     without masking genuine subject motion.
+
+    The 1s window keeps the hold reference stable during stationary shots,
+    preventing the camera from drifting with noise. Genuine motion (subject
+    walks, speaker switch) produces deltas >> deadzone_px and breaks through.
     """
     if not targets or deadzone_px <= 0:
         return list(targets)
 
     result = list(targets)
-    window = 15  # ~0.5s at 30fps
+    window = 30  # ~1.0s at 30fps — long enough to anchor holds
     hold = targets[0]
 
     for i in range(len(targets)):
@@ -552,6 +596,9 @@ def solve_camera_path(
         _solver_used = "condat"
     _solve_ms = (time.perf_counter() - _t0) * 1000
 
+    # ── Post-solve smoothing: kill residual jitter ──
+    solved = _post_solve_smooth(solved)
+
     logger.info(
         "L1 solver: shot=%d frames=%d mode=%s solver=%s solve_ms=%.1f",
         seg_idx, n_frames, "pending", _solver_used, _solve_ms,
@@ -736,7 +783,8 @@ def solve_camera_path_for_shot(
 
     # ── Build full-shot target at uniform fps ──
     dt = 1.0 / target_fps
-    pad_frames = 30  # ~1s lookahead padding
+    pad_frames = 45  # ~1.5s lookahead padding — longer than the original 1s
+    # to give the solver more context for hold decisions and prevent early snap-off
 
     # Collect per-segment targets, concatenated
     all_times = []
@@ -850,6 +898,9 @@ def solve_camera_path_for_shot(
     # ── Discard padding ──
     solved = padded_solved[pad_left:pad_left + n_orig]
     times = all_times
+
+    # ── Post-solve smoothing: kill residual jitter ──
+    solved = _post_solve_smooth(solved)
 
     # ── Debug telemetry dump ──
     if _DUMP_L1:
