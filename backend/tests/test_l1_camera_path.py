@@ -433,3 +433,70 @@ class TestPreSolvePanDetection:
         # (the post-solve check might still classify it as panning if the solved path
         # happens to be linear, but the pre-solve shortcut should have been skipped)
         assert result["mode"] in ("stationary", "tracking", "panning", "infeasible")
+
+
+class TestWeightedDataTerm:
+    """Task 2: Verify per-frame weights in the camera-path data term."""
+
+    def test_weights_none_matches_unweighted(self):
+        """weights=None produces bit-identical output to no weights."""
+        positions = [(i / 30.0, 400.0 if i < 75 else 1500.0) for i in range(150)]
+
+        result_none = solve_camera_path(positions, source_width=1920, weights=None)
+        result_default = solve_camera_path(positions, source_width=1920)
+
+        # Both should produce identical results
+        assert result_none["mode"] == result_default["mode"]
+        if result_none["path"] and result_default["path"]:
+            for (t1, x1), (t2, x2) in zip(result_none["path"], result_default["path"]):
+                assert t1 == t2
+                assert abs(x1 - x2) < 1e-6, f"Mismatch: {x1} vs {x2}"
+
+    def test_high_weight_region_pulls_camera(self):
+        """Two competing targets, weight the second 3x higher → camera closer to it."""
+        n = 100
+        # Target alternates between x=400 and x=1500 frame-by-frame
+        # Weight the x=1500 frames 3x higher
+        positions = []
+        wts = []
+        for i in range(n):
+            if i % 2 == 0:
+                positions.append((i / 30.0, 400.0))
+                wts.append(1.0)
+            else:
+                positions.append((i / 30.0, 1500.0))
+                wts.append(3.0)
+
+        result = solve_camera_path(positions, source_width=1920, weights=wts)
+        # The solved center should be pulled toward 1500
+        if result["path"]:
+            avg_x = sum(x for _, x in result["path"]) / len(result["path"])
+            assert avg_x > 950.0, (
+                f"Camera center {avg_x:.1f} should be pulled toward 1500 (> 950)"
+            )
+        else:
+            # Stationary mode — center should be pulled toward 1500
+            assert result["center"] > 950.0, (
+                f"Camera center {result['center']:.1f} should be pulled toward 1500"
+            )
+
+    def test_weak_saliency_does_not_dominate_face(self):
+        """Face at x=500 (weight 1.0) vs saliency at x=1500 (weight ~0.42)."""
+        n = 100
+        positions = []
+        wts = []
+        for i in range(n):
+            if i % 2 == 0:
+                positions.append((i / 30.0, 500.0))
+                wts.append(1.0)  # face weight
+            else:
+                positions.append((i / 30.0, 1500.0))
+                wts.append(0.3 + 0.6 * 0.2)  # saliency weight ≈ 0.42
+        result = solve_camera_path(positions, source_width=1920, weights=wts)
+        if result["path"]:
+            avg_x = sum(x for _, x in result["path"]) / len(result["path"])
+        else:
+            avg_x = result["center"]
+        assert abs(avg_x - 500.0) < 100.0, (
+            f"Camera center {avg_x:.1f} should stay within 100px of face at 500"
+        )

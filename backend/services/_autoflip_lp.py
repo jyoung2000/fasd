@@ -34,6 +34,8 @@ def solve_autoflip_lp(
     lam2: float = 10.0,
     lam3: float = 100.0,
     lam4: float = 1000.0,
+    *,
+    weights: list[float] | None = None,
 ) -> list[float]:
     """Solve the AutoFlip L1-optimal camera path via linear programming.
 
@@ -45,6 +47,9 @@ def solve_autoflip_lp(
         lam2: Velocity smoothness weight.
         lam3: Acceleration smoothness weight.
         lam4: Jerk smoothness weight.
+        weights: Optional per-frame weights for data fidelity term.
+            When provided, scales lam1 per frame: lam1 * weights[t].
+            None = uniform weights of 1.0 (bit-identical to unweighted).
 
     Returns:
         Solved camera path, length n.
@@ -74,9 +79,13 @@ def solve_autoflip_lp(
     off_s3 = off_s2 + n_s2
     off_s4 = off_s3 + n_s3
 
-    # ── Objective: min lam1*sum(s1) + lam2*sum(s2) + lam3*sum(s3) + lam4*sum(s4)
+    # ── Objective: min lam1*w[t]*sum(s1) + lam2*sum(s2) + lam3*sum(s3) + lam4*sum(s4)
     c = np.zeros(n_vars)
-    c[off_s1:off_s1 + n] = lam1
+    if weights is not None:
+        for t in range(n):
+            c[off_s1 + t] = lam1 * weights[t]
+    else:
+        c[off_s1:off_s1 + n] = lam1
     c[off_s2:off_s2 + n_s2] = lam2
     c[off_s3:off_s3 + n_s3] = lam3
     c[off_s4:off_s4 + n_s4] = lam4

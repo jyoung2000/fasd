@@ -25,6 +25,12 @@ class RequiredRegion:
     tier: str = "required"   # "required" | "preferred"
     source: str = "face"     # "face" | "object" | "saliency"
     face_slot: int = -1
+    saliency_score: float = 0.0  # original saliency score (0-1), preserved from tracker
+    weight: float = 1.0  # camera-path data-term weight:
+    #   face (active speaker): 1.0
+    #   face (passive):        0.7
+    #   person/object:         0.8
+    #   saliency:              0.3 + 0.6 * saliency_score
 
 
 def _iou_normalized(a, b) -> float:
@@ -164,6 +170,7 @@ def build_required_regions(
                 tier="required",
                 source="face",
                 face_slot=slot_id,
+                weight=1.0 if is_active else 0.7,
             ))
 
         # ── Object regions: person class → required, non-face ──
@@ -182,6 +189,7 @@ def build_required_regions(
                 score=0.6,
                 tier="required",
                 source="object",
+                weight=0.8,
             )
             if not _overlaps_any(candidate, frame_regions, 0.3):
                 frame_regions.append(candidate)
@@ -194,13 +202,16 @@ def build_required_regions(
                 area = bw * bh
                 if area < 0.02:
                     continue
+                _sal_score = getattr(sal_frame, 'mean_score', 0.5)
                 candidate = RequiredRegion(
                     timestamp=ff.timestamp,
                     cx=bx + bw / 2, cy=by + bh / 2,
                     half_width=bw / 2, half_height=bh / 2,
-                    score=getattr(sal_frame, 'mean_score', 0.5) * 0.5,
+                    score=_sal_score * 0.5,
                     tier="preferred",
                     source="saliency",
+                    saliency_score=_sal_score,
+                    weight=0.3 + 0.6 * _sal_score,
                 )
                 if not _overlaps_any(candidate, frame_regions, 0.5):
                     frame_regions.append(candidate)
