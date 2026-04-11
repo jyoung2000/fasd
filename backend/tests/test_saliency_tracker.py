@@ -10,6 +10,7 @@ from backend.services.saliency_tracker import (
     TEMPORAL_WEIGHT,
     COLOR_WEIGHT,
     _compute_color_opponent,
+    _compute_adaptive_center_bias,
     compute_spatiotemporal_saliency,
     extract_saliency_bboxes,
     track_saliency_in_frames,
@@ -322,3 +323,39 @@ class TestColorOpponentChannel:
     def test_three_channels_sum_to_one(self):
         """Weight constants sum to exactly 1.0."""
         assert SPATIAL_WEIGHT + TEMPORAL_WEIGHT + COLOR_WEIGHT == 1.0
+
+
+class TestAdaptiveCenterBias:
+    """Task 5: Adaptive center bias based on face positions."""
+
+    def test_adaptive_bias_widens_with_spread(self):
+        """Two faces at opposite edges → sigma_frac > 0.5."""
+        @dataclass
+        class _Face:
+            nose_x: float = 50.0
+            nose_y: float = 50.0
+
+        faces = [_Face(nose_x=10.4), _Face(nose_x=88.5)]  # x=200 and x=1700 on 1920
+        cx, cy, sigma = _compute_adaptive_center_bias(faces, 1920, 1080)
+        assert sigma > 0.5, f"sigma_frac={sigma} should be > 0.5 with spread faces"
+        # Centroid should be roughly in the middle
+        assert 800 < cx < 1100, f"cx={cx} should be near center"
+
+    def test_adaptive_bias_centers_on_single_face(self):
+        """One face at x=300 → bias_cx ≈ 300, sigma = 0.35."""
+        @dataclass
+        class _Face:
+            nose_x: float = 15.625  # 300/1920 * 100
+            nose_y: float = 50.0
+
+        faces = [_Face()]
+        cx, cy, sigma = _compute_adaptive_center_bias(faces, 1920, 1080)
+        assert abs(cx - 300.0) < 1.0, f"cx={cx}, expected ~300"
+        assert sigma == 0.35, f"sigma_frac={sigma}, expected 0.35"
+
+    def test_no_faces_falls_back_to_default(self):
+        """Empty face list → (w/2, h/2, 0.35)."""
+        cx, cy, sigma = _compute_adaptive_center_bias([], 1920, 1080)
+        assert cx == 1920 / 2.0
+        assert cy == 1080 / 2.0
+        assert sigma == 0.35

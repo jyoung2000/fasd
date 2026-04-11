@@ -51,6 +51,58 @@ TEMPORAL_WEIGHT = 0.5
 COLOR_WEIGHT = 0.2
 
 
+def _compute_adaptive_center_bias(
+    face_bboxes: list,
+    w: int,
+    h: int,
+) -> tuple[float, float, float]:
+    """Compute adaptive center-bias parameters based on face positions.
+
+    Args:
+        face_bboxes: list of face objects with .nose_x, .nose_y attributes
+            (percentage 0-100 coordinates).
+        w: frame width in pixels.
+        h: frame height in pixels.
+
+    Returns:
+        (cx, cy, sigma_frac) where cx/cy are pixel positions and
+        sigma_frac is the Gaussian sigma as fraction of max(w, h).
+
+    Logic:
+        - No faces: (w/2, h/2, 0.35) — default centered bias.
+        - 1 face: (face.cx, face.cy, 0.35) — center bias on subject.
+        - 2+ faces: centroid of face centers, sigma widens with spread.
+          sigma_frac = clip(0.35 + 0.5 * spread, 0.35, 0.8) where spread
+          is std-dev of face x-positions normalized by frame width.
+    """
+    if not face_bboxes:
+        return (w / 2.0, h / 2.0, 0.35)
+
+    # Extract face center positions in pixel space
+    face_xs = []
+    face_ys = []
+    for f in face_bboxes:
+        fx = getattr(f, 'nose_x', 50.0) / 100.0 * w
+        fy = getattr(f, 'nose_y', 50.0) / 100.0 * h
+        face_xs.append(fx)
+        face_ys.append(fy)
+
+    if len(face_bboxes) == 1:
+        return (face_xs[0], face_ys[0], 0.35)
+
+    # 2+ faces: centroid + adaptive sigma
+    cx = sum(face_xs) / len(face_xs)
+    cy = sum(face_ys) / len(face_ys)
+
+    # Spread: std-dev of face x-positions normalized by frame width
+    mean_x = cx
+    variance = sum((x - mean_x) ** 2 for x in face_xs) / len(face_xs)
+    spread = (variance ** 0.5) / w
+
+    sigma_frac = min(0.8, max(0.35, 0.35 + 0.5 * spread))
+    return (cx, cy, sigma_frac)
+
+
 def _compute_color_opponent(curr_bgr: np.ndarray) -> np.ndarray:
     """Compute color-opponent saliency from BGR input (Itti–Koch style).
 
@@ -226,6 +278,8 @@ def track_saliency_in_frames(
     face_results: list = None,
     stride: int = 1,
     persistent_regions=None,
+    *,
+    frame_faces: list = None,
 ) -> list:
     """Run spatiotemporal saliency across a list of frames.
 
@@ -240,6 +294,9 @@ def track_saliency_in_frames(
             stride > 1 to reduce compute cost on long videos.
         persistent_regions: Optional persistent region detector output. If
             it has hud_regions, builds a binary mask to suppress HUD pixels.
+        frame_faces: Optional list of FrameFaces objects for adaptive center
+            bias computation. When provided, the center bias adapts to face
+            positions per frame. None = fixed center bias (backward compat).
 
     Returns: list[SaliencyRegion]
     """
@@ -267,6 +324,12 @@ def track_saliency_in_frames(
                 logger.info("[SaliencyParity] HUD mask built from %d regions (%dx%d)",
                             len(_hud_regions), fw, fh)
 
+    # Build face lookup by rounded timestamp for adaptive center bias
+    _faces_by_time = {}
+    if frame_faces:
+        for ff in frame_faces:
+            _faces_by_time[round(ff.timestamp, 2)] = getattr(ff, 'faces', [])
+
     for i, (timestamp, path) in enumerate(frame_paths):
         # Stride: skip frames not on the stride boundary
         if stride > 1 and i % stride != 0:
@@ -280,9 +343,17 @@ def track_saliency_in_frames(
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         h, w = gray.shape[:2]
 
+        # Adaptive center bias from face detections
+        _bias_kwargs = {}
+        _frame_face_list = _faces_by_time.get(round(timestamp, 2))
+        if _frame_face_list is not None:
+            _bcx, _bcy, _bsf = _compute_adaptive_center_bias(_frame_face_list, w, h)
+            _bias_kwargs = dict(bias_cx=_bcx, bias_cy=_bcy, bias_sigma_frac=_bsf)
+
         try:
             sal_map = compute_spatiotemporal_saliency(
                 gray, prev_gray, hud_mask=_hud_mask, curr_bgr=img,
+                **_bias_kwargs,
             )
             bboxes = extract_saliency_bboxes(sal_map)
         except Exception as e:
