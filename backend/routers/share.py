@@ -10,7 +10,11 @@ import os
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
-from backend.middleware.og_injection import render_og_html, _get_base_url_from_request
+from backend.middleware.og_injection import (
+    render_og_html,
+    _get_base_url_from_request,
+    _resolve_clip_metadata,
+)
 from backend import database
 
 router = APIRouter()
@@ -73,20 +77,18 @@ async def share_clip(job_id: str, clip_id: int, request: Request):
             clip = c
             break
 
-    title = (getattr(clip, 'title', None) if clip
-             else f"ClipAI Clip")
-    description = (getattr(clip, 'seo_description', None) if clip
-                   else "Watch on ClipAI")
-    if not description:
-        description = "Watch on ClipAI"
-    image_url = f"{base_url}/thumbnails/{job_id}.jpg"
-    canonical_url = f"{base_url}/seo/{job_id}/{clip_id}"
+    meta = _resolve_clip_metadata(clip, job, job_id, clip_id, base_url)
 
     html = render_og_html(
-        title=title,
-        description=description,
-        image_url=image_url,
-        canonical_url=canonical_url,
+        title=meta["title"],
+        description=meta["description"],
+        image_url=meta["image_url"],
+        canonical_url=meta["canonical_url"],
         og_type="video.other",
+        video_url=meta["video_url"],
+        image_width=meta["image_width"],
+        image_height=meta["image_height"],
+        video_width=meta["video_width"],
+        video_height=meta["video_height"],
     )
     return HTMLResponse(content=html)

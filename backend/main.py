@@ -17,6 +17,8 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, Response
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.middleware.trustedhost import TrustedHostMiddleware
+from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 from backend.routers import upload, jobs, clips, fonts, presets, settings as settings_router, ws
 from backend.routers import agent as agent_router
@@ -73,6 +75,22 @@ class CrossOriginIsolationMiddleware(BaseHTTPMiddleware):
 
 
 app.add_middleware(CrossOriginIsolationMiddleware)
+
+# Trust proxy headers (X-Forwarded-For, X-Forwarded-Proto) so request.url.scheme
+# resolves to "https" behind nginx / Caddy / Cloudflare Tunnel.  Without this,
+# all emitted og:image and og:url are http:// on HTTPS sites, which Facebook
+# and iMessage silently drop and Discord may downgrade.
+app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
+
+# Trusted host allowlist — prevents Host-header spoofing that could make OG URLs
+# point at an attacker's domain.  Read from TRUSTED_HOSTS env (comma-separated)
+# with sensible defaults including common LAN patterns.
+_trusted_hosts = os.environ.get("TRUSTED_HOSTS", "").strip()
+if _trusted_hosts:
+    app.add_middleware(
+        TrustedHostMiddleware,
+        allowed_hosts=[h.strip() for h in _trusted_hosts.split(",")],
+    )
 
 # OG injection middleware: serves minimal HTML with Open Graph tags to crawler
 # user agents (Slackbot, Twitterbot, etc.) so link previews show thumbnails.

@@ -128,3 +128,88 @@ def extract_thumbnail(
     logger.info("[%s] thumbnail: extracted %d bytes at t=%.2f -> %s",
                 job_id, out_path.stat().st_size, timestamp, out_path)
     return out_path
+
+
+# ── Per-clip thumbnails (9:16 clips) ──
+
+CLIP_THUMB_WIDTH = 1080
+CLIP_THUMB_HEIGHT = 1920
+CLIP_THUMB_MAX_BYTES = 300_000  # WhatsApp drops images > 300 KB
+
+
+def get_clip_thumbnail_path(job_id: str, clip_id: int, output_dir: Optional[Path] = None) -> Path:
+    """Return the expected path for a per-clip thumbnail."""
+    if output_dir is None:
+        output_dir = get_thumbnail_dir()
+    return output_dir / f"{job_id}_clip{clip_id}.jpg"
+
+
+def extract_clip_thumbnail(
+    job_id: str,
+    clip_id: int,
+    clip_video_path: str,
+    clip_duration: float = 0,
+    output_dir: Optional[Path] = None,
+) -> Optional[Path]:
+    """Extract a 9:16 JPG thumbnail from a rendered clip's midpoint.
+
+    Uses the reframed clip output (not the source) so the thumbnail matches
+    what the viewer sees.  Targets < 300 KB for WhatsApp compatibility.
+
+    Returns the absolute path to the thumbnail file, or None on failure.
+    """
+    if output_dir is None:
+        output_dir = get_thumbnail_dir()
+
+    if not clip_video_path or not Path(clip_video_path).exists():
+        logger.warning("[%s] clip thumbnail: video missing at %s", job_id, clip_video_path)
+        return None
+
+    out_path = get_clip_thumbnail_path(job_id, clip_id, output_dir)
+    timestamp = clip_duration / 2.0 if clip_duration > 0 else 1.0
+
+    cmd = [
+        "ffmpeg",
+        "-ss", f"{timestamp:.3f}",
+        "-i", str(clip_video_path),
+        "-frames:v", "1",
+        "-q:v", "4",  # Slightly more compression to stay under 300 KB
+        "-y",
+        str(out_path),
+    ]
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=30)
+        if result.returncode != 0:
+            logger.warning("[%s] clip thumbnail: ffmpeg failed (rc=%d): %s",
+                           job_id, result.returncode,
+                           result.stderr.decode("utf-8", errors="ignore")[:500])
+            return None
+    except subprocess.TimeoutExpired:
+        logger.warning("[%s] clip thumbnail: ffmpeg timeout", job_id)
+        return None
+    except Exception as e:
+        logger.warning("[%s] clip thumbnail: extraction failed: %s", job_id, e)
+        return None
+
+    if not out_path.exists() or out_path.stat().st_size < 500:
+        logger.warning("[%s] clip thumbnail: output file missing or too small", job_id)
+        return None
+
+    # If too large for WhatsApp, re-encode at lower quality
+    if out_path.stat().st_size > CLIP_THUMB_MAX_BYTES:
+        cmd_shrink = [
+            "ffmpeg",
+            "-i", str(out_path),
+            "-q:v", "8",
+            "-y",
+            str(out_path),
+        ]
+        try:
+            subprocess.run(cmd_shrink, capture_output=True, timeout=15)
+        except Exception:
+            pass  # Best effort — original is still usable
+
+    logger.info("[%s] clip thumbnail: %d bytes at t=%.2f -> %s",
+                job_id, out_path.stat().st_size, timestamp, out_path)
+    return out_path
