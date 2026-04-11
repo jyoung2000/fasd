@@ -125,6 +125,21 @@ Tracking progress toward full parity with Google AutoFlip
 
 ---
 
+## Saliency Parity Fixes (Fixes 1-6)
+
+Six fixes to bring saliency signal processing to AutoFlip parity:
+
+1. **Wire full bboxes** — `scene_focus` now receives real `(x, y, w, h)` from SaliencyRegion instead of hardcoded `y=50, w=10, h=10`
+2. **Unconditional saliency** — removed face-gated skip; saliency runs on every frame like AutoFlip
+3. **Adaptive threshold** — percentile-based (top 15%) instead of fixed 0.5; low-contrast shots now produce regions
+4. **Center bias + HUD masking** — 2D Gaussian center prior (σ=0.35) suppresses background motion; HUD mask zeros out known HUD pixels
+5. **Feature merging** — overlapping saliency+face bboxes (IoU>0.3) are absorbed to prevent over-constraining the crop solver
+6. **Temporal smoothing** — EMA (α=0.3) on promoted saliency cluster trajectories reduces jitter
+
+Tests: 27 → 37 passing (+10 new tests across 3 test files)
+
+---
+
 ## Out of scope (follow-ups)
 
 - Multi-region tracking (AutoFlip handles multiple required regions with a unified LP)
