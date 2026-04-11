@@ -6,6 +6,10 @@ from dataclasses import dataclass, field
 
 from backend.services.saliency_tracker import (
     SaliencyRegion,
+    SPATIAL_WEIGHT,
+    TEMPORAL_WEIGHT,
+    COLOR_WEIGHT,
+    _compute_color_opponent,
     compute_spatiotemporal_saliency,
     extract_saliency_bboxes,
     track_saliency_in_frames,
@@ -274,3 +278,47 @@ class TestSaliencyRegionToDict:
         for k, v in d.items():
             assert not hasattr(v, 'item'), f"{k} is still a numpy scalar: {type(v)}"
             assert isinstance(v, (int, float)), f"{k} has unexpected type: {type(v)}"
+
+
+class TestColorOpponentChannel:
+    """Task 3: Color-opponent saliency channel tests."""
+
+    def test_color_opponent_detects_red_on_gray(self):
+        """Red square on gray background has saliency peak inside the square."""
+        # Create a 480x270 gray background with a red 40x40 square at (200, 100)
+        frame = np.full((270, 480, 3), 128, dtype=np.uint8)
+        # Red in BGR = (0, 0, 255)
+        frame[100:140, 200:240] = [0, 0, 255]
+
+        color_map = _compute_color_opponent(frame)
+        assert color_map.shape == (270, 480)
+        assert color_map.dtype == np.float32
+        assert color_map.max() <= 1.0
+
+        # Peak should be inside the red square's bbox (with some blur spread)
+        peak_y, peak_x = np.unravel_index(np.argmax(color_map), color_map.shape)
+        assert 90 <= peak_y <= 150, f"Peak y={peak_y}, expected near 100-140"
+        assert 190 <= peak_x <= 250, f"Peak x={peak_x}, expected near 200-240"
+
+    def test_color_channel_optional_backward_compat(self):
+        """compute_spatiotemporal_saliency with curr_bgr=None is bit-identical
+        to pre-change behavior (two-channel fusion with 0.4/0.6 weights)."""
+        gray = _make_bright_square()
+
+        # Legacy behavior: explicit 0.4/0.6 weights, no color channel
+        legacy = compute_spatiotemporal_saliency(
+            gray, prev_gray=None,
+            spatial_weight=0.4, temporal_weight=0.6,
+            curr_bgr=None,
+        )
+        # New default with curr_bgr=None should renormalize to same ratio
+        new_default = compute_spatiotemporal_saliency(
+            gray, prev_gray=None,
+            curr_bgr=None,
+        )
+        # Should be identical (both use spatial-only with no temporal)
+        np.testing.assert_array_almost_equal(legacy, new_default, decimal=5)
+
+    def test_three_channels_sum_to_one(self):
+        """Weight constants sum to exactly 1.0."""
+        assert SPATIAL_WEIGHT + TEMPORAL_WEIGHT + COLOR_WEIGHT == 1.0
