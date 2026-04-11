@@ -74,8 +74,8 @@ DEADZONE_FRAC = 0.013
 # Stationary threshold: if total movement < this fraction of source width, static crop
 # 0.08 = ~154px on 1920 — covers normal face-detection noise without triggering
 STATIONARY_THRESHOLD = 0.08
-# Panning R^2 threshold for linear-fit detection
-PANNING_R2_THRESHOLD = 0.95
+# Panning R^2 threshold for linear-fit detection (0.90 for pre-solve noisy data)
+PANNING_R2_THRESHOLD = 0.90
 # Minimum slope (pixels per second) to qualify as a pan
 PANNING_MIN_SLOPE = 50.0
 
@@ -440,6 +440,48 @@ def solve_camera_path(
     deadzone_px = DEADZONE_FRAC * source_width  # ~25px at 1920
     targets_dz = _apply_deadzone(targets, deadzone_px)
 
+    # ── Pre-solve panning detection on target signal ──
+    # Detect panning BEFORE solving — the raw (dead-zoned) target is noisier
+    # but won't be staircase-smoothed by TV, so a genuine linear pan has
+    # higher R² here than in post-solve Condat output.
+    if len(targets_dz) >= 3:
+        _pre_r2, _pre_slope_step = _linear_fit_r2(targets_dz)
+        _pre_dt = (times[-1] - times[0]) / max(len(times) - 1, 1)
+        _pre_slope_pps = _pre_slope_step / max(_pre_dt, 0.001)
+
+        if (_pre_r2 > PANNING_R2_THRESHOLD
+                and abs(_pre_slope_pps) > PANNING_MIN_SLOPE):
+            # Verify the linear fit stays within hard_bounds everywhere
+            n_t = len(targets_dz)
+            y_mean = sum(targets_dz) / n_t
+            x_mean = (n_t - 1) / 2.0
+            _fit_vals = [_pre_slope_step * (i - x_mean) + y_mean for i in range(n_t)]
+            bounds_ok = True
+            if lo_bounds is not None and hi_bounds is not None:
+                for i in range(n_t):
+                    lo_v = lo_bounds[i]
+                    hi_v = hi_bounds[i]
+                    if lo_v is not None and _fit_vals[i] < lo_v - 1.0:
+                        bounds_ok = False
+                        break
+                    if hi_v is not None and _fit_vals[i] > hi_v + 1.0:
+                        bounds_ok = False
+                        break
+
+            if bounds_ok:
+                logger.info(
+                    "L1 solver: shot=%d frames=%d mode=panning solver=pre_solve_linear solve_ms=0.0",
+                    seg_idx, n_t,
+                )
+                return {
+                    "mode": "panning",
+                    "center": sum(_fit_vals) / len(_fit_vals),
+                    "path": list(zip(times, _fit_vals)),
+                    "slope": _pre_slope_pps,
+                    "ease_in_ms": 0,
+                    "infeasible_frames": [],
+                }
+
     # ── Solver selection ──
     n_frames = len(targets_dz)
     _t0 = time.perf_counter()
@@ -514,7 +556,8 @@ def solve_camera_path(
             "infeasible_frames": [],
         }
 
-    # Check for panning (linear motion)
+    # Post-solve panning check (fallback for cases where pre-solve fit was
+    # close-but-not-quite and the solver smoothed it into something more linear)
     r2, slope_per_step = _linear_fit_r2(solved)
     if len(times) >= 3:
         dt = (times[-1] - times[0]) / max(len(times) - 1, 1)
