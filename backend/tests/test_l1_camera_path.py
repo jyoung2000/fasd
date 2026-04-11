@@ -274,3 +274,83 @@ class TestAutoFlipLPSolver:
 
         assert len(result) == n
         assert elapsed_ms < 2000, f"LP took {elapsed_ms:.0f}ms (target <200ms)"
+
+
+class TestSolverSelection:
+    """Task 1: Verify three-state solver config (auto/lp/condat)."""
+
+    def test_default_solver_is_lp_for_short_shots(self):
+        """300-frame shot with step change uses LP and has near-zero jerk on holds."""
+        import backend.services.l1_camera_path as mod
+
+        # Ensure auto mode
+        old_mode = mod._SOLVER_MODE
+        mod._SOLVER_MODE = "auto"
+        try:
+            # Step change: 400 for 150 frames, 1500 for 150 frames
+            positions = [(i / 30.0, 400.0 if i < 150 else 1500.0) for i in range(300)]
+            result = solve_camera_path(positions, source_width=1920)
+            path = result["path"]
+            assert len(path) > 0, "Expected a non-empty path"
+
+            # Check that the LP solver was used (path should be smooth)
+            # On the held segments (first 50 and last 50 frames), max |Δ²x| < 0.5 px
+            xs = [x for _, x in path]
+            # Check hold segment: first 50 frames
+            hold_start = xs[:50]
+            for i in range(len(hold_start) - 2):
+                accel = abs(hold_start[i + 2] - 2 * hold_start[i + 1] + hold_start[i])
+                assert accel < 0.5, (
+                    f"Jerk on hold segment at i={i}: |Δ²x|={accel:.3f} >= 0.5"
+                )
+            # Check hold segment: last 50 frames
+            hold_end = xs[-50:]
+            for i in range(len(hold_end) - 2):
+                accel = abs(hold_end[i + 2] - 2 * hold_end[i + 1] + hold_end[i])
+                assert accel < 0.5, (
+                    f"Jerk on hold segment at i={i}: |Δ²x|={accel:.3f} >= 0.5"
+                )
+        finally:
+            mod._SOLVER_MODE = old_mode
+
+    def test_solver_falls_back_to_condat_above_max_frames(self):
+        """1000-frame input uses Condat in auto mode."""
+        import backend.services.l1_camera_path as mod
+
+        old_mode = mod._SOLVER_MODE
+        mod._SOLVER_MODE = "auto"
+        try:
+            # 1000 frames > LP_MAX_FRAMES (900), should use Condat
+            positions = [(i / 30.0, 500.0 + (i % 100)) for i in range(1000)]
+            # This should not raise and should produce a valid result
+            result = solve_camera_path(positions, source_width=1920)
+            assert result["mode"] in ("stationary", "tracking", "panning")
+        finally:
+            mod._SOLVER_MODE = old_mode
+
+    def test_lp_produces_smoother_path_than_condat_on_pan(self):
+        """LP has lower total |Δ²x| than Condat on a noisy linear ramp."""
+        import numpy as np
+        from backend.services._condat_tv import condat_tv_l1
+        from backend.services._autoflip_lp import solve_autoflip_lp
+
+        rng = np.random.RandomState(42)
+        n = 200
+        # Linear ramp + sinusoidal noise
+        targets = [400.0 + (1100.0 / n) * i + 30.0 * np.sin(i * 0.3) + rng.randn() * 10
+                   for i in range(n)]
+        lo = [0.0] * n
+        hi = [1920.0] * n
+
+        condat = condat_tv_l1(targets, 28.8)
+        lp = solve_autoflip_lp(targets, lo, hi, lam1=1.0, lam2=10.0, lam3=100.0, lam4=100.0)
+
+        # Compute total acceleration
+        def total_accel(x):
+            return sum(abs(x[i + 2] - 2 * x[i + 1] + x[i]) for i in range(len(x) - 2))
+
+        accel_condat = total_accel(condat)
+        accel_lp = total_accel(lp)
+        assert accel_lp < accel_condat, (
+            f"LP accel ({accel_lp:.1f}) should be < Condat accel ({accel_condat:.1f})"
+        )

@@ -20,6 +20,8 @@ Per-segment mode selection from the solved path:
 import csv
 import logging
 import os
+import time
+import warnings
 from pathlib import Path
 from typing import Optional
 
@@ -30,12 +32,36 @@ _DUMP_L1 = os.environ.get("CLIPAI_DUMP_L1", "0") in ("1", "true", "yes")
 _DUMP_DIR = Path("/tmp/clipai_l1")
 _dump_counter = 0
 
-# Feature flag: set CLIPAI_L1_LP=1 to use the LP-based AutoFlip solver
-# with acceleration (λ₃) and jerk (λ₄) penalties instead of Condat TV.
-USE_LP_SOLVER = os.environ.get("CLIPAI_L1_LP", "0") in ("1", "true", "yes")
+# ── Solver selection ──
+# CLIPAI_L1_SOLVER controls which solver is used:
+#   "auto"   (default) — LP for shots <= LP_MAX_FRAMES, Condat above.
+#   "lp"     — force LP; error if shot exceeds LP_MAX_FRAMES * 2.
+#   "condat" — force Condat (legacy default, kept as escape hatch).
+#
+# Deprecated: CLIPAI_L1_LP=1 maps to "lp" with a DeprecationWarning.
+_DEPRECATED_LP_FLAG = os.environ.get("CLIPAI_L1_LP", "0") in ("1", "true", "yes")
+_SOLVER_MODE = os.environ.get("CLIPAI_L1_SOLVER", "auto").lower()
+if _DEPRECATED_LP_FLAG and _SOLVER_MODE == "auto":
+    _SOLVER_MODE = "lp"
+    warnings.warn(
+        "CLIPAI_L1_LP is deprecated; use CLIPAI_L1_SOLVER=lp instead.",
+        DeprecationWarning,
+        stacklevel=1,
+    )
+# Keep USE_LP_SOLVER for any downstream readers (read-only alias)
+USE_LP_SOLVER = _SOLVER_MODE in ("lp", "auto")
+
 # Performance guardrail: LP is O(n³) worst case. Fall back to Condat for
-# shots longer than this many frames (20s at 30fps = 600).
-LP_MAX_FRAMES = 600
+# shots longer than this many frames (30s at 30fps = 900).
+LP_MAX_FRAMES = 900
+
+# LP cost weights (Grundmann et al. 2011, Section 4.2).
+# λ₁ = data fidelity (always 1.0), λ₂ = velocity, λ₃ = acceleration, λ₄ = jerk.
+# Paper defaults: (10, 100, 100). Our codebase previously used lam4=1000;
+# we now match the paper values.
+LP_LAMBDA_V = 10.0    # λ₂: velocity penalty
+LP_LAMBDA_A = 100.0   # λ₃: acceleration penalty
+LP_LAMBDA_J = 100.0   # λ₄: jerk penalty
 
 # TV denoise regularization: fraction of source_width for resolution independence.
 # Actual lambda = TV_LAMBDA_FRAC * source_width. 0.015 * 1920 = 28.8
@@ -295,6 +321,9 @@ def _dump_solve_csv(
     job_id: str, seg_idx: int,
     times: list[float], targets: list[float], solved: list[float],
     lo_bounds: Optional[list[float]], hi_bounds: Optional[list[float]],
+    *,
+    solver: str = "condat",
+    weights: Optional[list[float]] = None,
 ) -> None:
     """Write a per-call CSV for telemetry analysis (behind CLIPAI_DUMP_L1=1)."""
     global _dump_counter
@@ -305,11 +334,13 @@ def _dump_solve_csv(
         path = _DUMP_DIR / fname
         with open(path, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["t", "target_x", "solved_x", "lo_bound", "hi_bound"])
+            writer.writerow(["t", "target_x", "solved_x", "lo_bound", "hi_bound", "solver", "weight"])
             for i, t in enumerate(times):
                 lo = lo_bounds[i] if lo_bounds and lo_bounds[i] is not None else ""
                 hi = hi_bounds[i] if hi_bounds and hi_bounds[i] is not None else ""
-                writer.writerow([f"{t:.4f}", f"{targets[i]:.2f}", f"{solved[i]:.2f}", lo, hi])
+                w = weights[i] if weights else 1.0
+                writer.writerow([f"{t:.4f}", f"{targets[i]:.2f}", f"{solved[i]:.2f}",
+                                 lo, hi, solver, f"{w:.4f}"])
         _dump_counter += 1
         logger.debug("L1 telemetry: wrote %s (%d rows)", path, len(times))
     except Exception as e:
@@ -409,12 +440,39 @@ def solve_camera_path(
     deadzone_px = DEADZONE_FRAC * source_width  # ~25px at 1920
     targets_dz = _apply_deadzone(targets, deadzone_px)
 
-    # Solve TV denoise with constraint projection
-    solved = _tv_denoise_1d(targets_dz, lam, 0, lo_bounds, hi_bounds)
+    # ── Solver selection ──
+    n_frames = len(targets_dz)
+    _t0 = time.perf_counter()
+    if _SOLVER_MODE == "lp" or (_SOLVER_MODE == "auto" and n_frames <= LP_MAX_FRAMES):
+        if _SOLVER_MODE == "lp" and n_frames > LP_MAX_FRAMES * 2:
+            raise ValueError(
+                f"LP solver forced but shot has {n_frames} frames "
+                f"(> {LP_MAX_FRAMES * 2} max). Use CLIPAI_L1_SOLVER=auto."
+            )
+        from backend.services._autoflip_lp import solve_autoflip_lp
+        _lp_lo = [lo_bounds[i] if lo_bounds and lo_bounds[i] is not None else 0.0
+                  for i in range(n_frames)]
+        _lp_hi = [hi_bounds[i] if hi_bounds and hi_bounds[i] is not None else float(source_width)
+                  for i in range(n_frames)]
+        solved = solve_autoflip_lp(
+            targets_dz, _lp_lo, _lp_hi,
+            lam1=1.0, lam2=LP_LAMBDA_V, lam3=LP_LAMBDA_A, lam4=LP_LAMBDA_J,
+        )
+        _solver_used = "lp"
+    else:
+        solved = _tv_denoise_1d(targets_dz, lam, 0, lo_bounds, hi_bounds)
+        _solver_used = "condat"
+    _solve_ms = (time.perf_counter() - _t0) * 1000
+
+    logger.info(
+        "L1 solver: shot=%d frames=%d mode=%s solver=%s solve_ms=%.1f",
+        seg_idx, n_frames, "pending", _solver_used, _solve_ms,
+    )
 
     # ── Debug telemetry dump ──
     if _DUMP_L1:
-        _dump_solve_csv(job_id, seg_idx, times, targets, solved, lo_bounds, hi_bounds)
+        _dump_solve_csv(job_id, seg_idx, times, targets, solved, lo_bounds, hi_bounds,
+                        solver=_solver_used)
 
     # Post-solve verification: check that all hard features are in frame
     if hard_features:
@@ -661,33 +719,44 @@ def solve_camera_path_for_shot(
             } for _ in segments_in_shot]
 
     # ── Solve: LP (with accel+jerk) or Condat TV ──
-    use_lp = USE_LP_SOLVER and len(padded_targets) <= LP_MAX_FRAMES
-    if USE_LP_SOLVER and len(padded_targets) > LP_MAX_FRAMES:
-        logger.warning(
-            "L1 shot solver: LP fallback to Condat for %d-frame shot (> %d max)",
-            len(padded_targets), LP_MAX_FRAMES,
+    n_padded = len(padded_targets)
+    _t0 = time.perf_counter()
+    use_lp = (
+        _SOLVER_MODE == "lp"
+        or (_SOLVER_MODE == "auto" and n_padded <= LP_MAX_FRAMES)
+    )
+    if _SOLVER_MODE == "lp" and n_padded > LP_MAX_FRAMES * 2:
+        raise ValueError(
+            f"LP solver forced but shot has {n_padded} frames "
+            f"(> {LP_MAX_FRAMES * 2} max). Use CLIPAI_L1_SOLVER=auto."
         )
+    if use_lp and n_padded > LP_MAX_FRAMES and _SOLVER_MODE == "auto":
+        use_lp = False
 
     if use_lp:
         from backend.services._autoflip_lp import solve_autoflip_lp
         # Build bounds for LP solver (None → unconstrained as source_width bounds)
         lp_lo = []
         lp_hi = []
-        for i in range(len(padded_targets)):
+        for i in range(n_padded):
             lo_val = lo_bounds[i] if lo_bounds and lo_bounds[i] is not None else 0.0
             hi_val = hi_bounds[i] if hi_bounds and hi_bounds[i] is not None else float(source_width)
             lp_lo.append(lo_val)
             lp_hi.append(hi_val)
-        # AutoFlip LP weights (Grundmann et al. 2011 relative scaling)
         padded_solved = solve_autoflip_lp(
             padded_targets, lp_lo, lp_hi,
-            lam1=1.0,
-            lam2=10.0,
-            lam3=100.0,
-            lam4=1000.0,
+            lam1=1.0, lam2=LP_LAMBDA_V, lam3=LP_LAMBDA_A, lam4=LP_LAMBDA_J,
         )
+        _solver_used = "lp"
     else:
         padded_solved = _tv_denoise_1d(padded_targets, lam, 0, lo_bounds, hi_bounds)
+        _solver_used = "condat"
+    _solve_ms = (time.perf_counter() - _t0) * 1000
+
+    logger.info(
+        "L1 solver: shot=%d frames=%d mode=%s solver=%s solve_ms=%.1f",
+        0, n_padded, "shot", _solver_used, _solve_ms,
+    )
 
     # ── Discard padding ──
     solved = padded_solved[pad_left:pad_left + n_orig]
@@ -699,6 +768,7 @@ def solve_camera_path_for_shot(
             job_id, 9000, times, all_targets, solved,
             lo_bounds[pad_left:pad_left + n_orig] if lo_bounds else None,
             hi_bounds[pad_left:pad_left + n_orig] if hi_bounds else None,
+            solver=_solver_used,
         )
 
     # ── Post-solve verification ──
