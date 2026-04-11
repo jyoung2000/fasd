@@ -230,50 +230,54 @@ function enforceNoOverlapsMiddleware(config) {
     config(
       (...args) => {
         set(...args);
+
+        // After every state update, check for and fix overlaps.
+        // We read the current state and produce a new immutable update
+        // via a normal set() call (no replace flag) so immer and Zustand
+        // subscribers both see the change.
         const state = get();
 
         // Check items for overlaps
+        let itemsNeedFix = false;
         if (state.items && state.items.length > 1) {
           const byTrack = {};
           for (const item of state.items) {
             (byTrack[item.trackId] || (byTrack[item.trackId] = [])).push(item);
           }
-          let hadOverlap = false;
           for (const trackItems of Object.values(byTrack)) {
             if (trackItems.length < 2) continue;
             trackItems.sort((a, b) => a.start - b.start);
             for (let i = 1; i < trackItems.length; i++) {
               if (trackItems[i].start < trackItems[i - 1].end - 0.001) {
-                hadOverlap = true;
+                itemsNeedFix = true;
                 break;
               }
             }
-            if (hadOverlap) break;
-          }
-          if (hadOverlap) {
-            if (process.env.NODE_ENV === 'development') {
-              console.warn('[TimelineStore] Overlap detected in items — auto-fixing');
-            }
-            set((s) => { resolveAllOverlaps(s.items); }, true);
+            if (itemsNeedFix) break;
           }
         }
 
         // Check crop segments for overlaps
+        let cropsNeedFix = false;
         if (state.cropSegments && state.cropSegments.length > 1) {
           const sorted = [...state.cropSegments].sort((a, b) => a.startTime - b.startTime);
-          let hadCropOverlap = false;
           for (let i = 1; i < sorted.length; i++) {
             if (sorted[i].startTime < sorted[i - 1].endTime - 0.001) {
-              hadCropOverlap = true;
+              cropsNeedFix = true;
               break;
             }
           }
-          if (hadCropOverlap) {
-            if (process.env.NODE_ENV === 'development') {
-              console.warn('[TimelineStore] Overlap detected in cropSegments — auto-fixing');
-            }
-            set((s) => { resolveAllCropOverlaps(s.cropSegments); }, true);
+        }
+
+        if (itemsNeedFix || cropsNeedFix) {
+          if (process.env.NODE_ENV === 'development') {
+            if (itemsNeedFix) console.warn('[TimelineStore] Overlap detected in items — auto-fixing');
+            if (cropsNeedFix) console.warn('[TimelineStore] Overlap detected in cropSegments — auto-fixing');
           }
+          set((s) => {
+            if (itemsNeedFix) resolveAllOverlaps(s.items);
+            if (cropsNeedFix) resolveAllCropOverlaps(s.cropSegments);
+          });
         }
       },
       get,
