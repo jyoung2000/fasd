@@ -31,6 +31,7 @@ USE_CONTENT_AWARE_REFRAME = os.environ.get(
 class ClipContentType(str, Enum):
     """Simplified content types for camera solver tuning."""
     TALKING_HEAD = "talking_head"      # debates, podcasts, interviews
+    CINEMATIC_DIALOGUE = "cinematic_dialogue"   # narrative w/ detected dialogue shots
     ANIMATION = "animation"            # anime, cartoons
     MUSIC_VIDEO = "music_video"
     GAMEPLAY = "gameplay"              # pure game footage
@@ -39,6 +40,8 @@ class ClipContentType(str, Enum):
 
 
 # Map from existing ContentType to ClipContentType
+# Note: NARRATIVE is dynamically promoted to CINEMATIC_DIALOGUE inside
+# classify_content() when dialogue-shot signals are present.
 _CONTENT_TYPE_MAP = {
     ContentType.PODCAST.value: ClipContentType.TALKING_HEAD,
     ContentType.VLOG.value: ClipContentType.TALKING_HEAD,
@@ -62,6 +65,10 @@ class ContentProfile:
     hud_regions: list = field(default_factory=list)
     motion_profile: str = "low"  # "static" | "low" | "medium" | "high" | "chaotic"
     cut_rate_per_minute: float = 0.0
+    # Set to True when narrative content also has dialogue-shot signals
+    # (≥2 face slots and ≥30s of speech in the first 120s). Drives routing
+    # to ClipContentType.CINEMATIC_DIALOGUE in classify_clip().
+    is_cinematic_dialogue: bool = False
 
 
 def classify_content(
@@ -72,6 +79,7 @@ def classify_content(
     video_duration: float,
     metadata: dict = None,
     job_id: str = "",
+    transcript_segments=None,
 ) -> ContentProfile:
     """Classify content type from available signals.
 
@@ -267,7 +275,34 @@ def classify_content(
         profile.content_type = best_type
         profile.confidence = min(1.0, confidence)
 
+    # ── Cinematic dialogue detection ──
+    # Promote NARRATIVE → CINEMATIC_DIALOGUE when we have ≥2 face slots AND
+    # ≥30s of cumulative speech in the first 120s. This is the signal for
+    # dialogue-driven film/TV where the pipeline should treat the active
+    # speaker as load-bearing and background motion as noise.
+    is_cinematic_dialogue = False
+    num_slots_for_dialogue = (
+        len(face_registry.slots) if face_registry and face_registry.slots else 0
+    )
+    cumulative_speech_seconds = 0.0
+    if transcript_segments:
+        for seg in transcript_segments:
+            seg_start = seg.start if hasattr(seg, 'start') else seg.get('start', 0)
+            seg_end = seg.end if hasattr(seg, 'end') else seg.get('end', 0)
+            if seg_start >= 120.0:
+                break
+            clip_end_t = min(seg_end, 120.0)
+            if clip_end_t > seg_start:
+                cumulative_speech_seconds += (clip_end_t - seg_start)
+    if (profile.content_type == ContentType.NARRATIVE.value
+            and num_slots_for_dialogue >= 2
+            and cumulative_speech_seconds >= 30.0):
+        is_cinematic_dialogue = True
+        signals["cinematic_dialogue"] = True
+        signals["cumulative_speech_first_120s"] = round(cumulative_speech_seconds, 1)
+
     profile.signals = signals
+    profile.is_cinematic_dialogue = is_cinematic_dialogue
     _log(
         "%s (conf=%.2f, signals=%s, scores=%s)",
         profile.content_type, profile.confidence,
@@ -308,6 +343,9 @@ def classify_clip(
         base_type = _CONTENT_TYPE_MAP.get(
             content_profile.content_type, ClipContentType.GENERIC
         )
+        # Narrative → CINEMATIC_DIALOGUE promotion
+        if getattr(content_profile, "is_cinematic_dialogue", False):
+            base_type = ClipContentType.CINEMATIC_DIALOGUE
 
     # STREAM override: gameplay HUD + corner facecam
     if persistent_regions:

@@ -18,7 +18,13 @@ from dataclasses import dataclass
 logger = logging.getLogger(__name__)
 
 LAR_SPEAKING_THRESHOLD = 0.025
-CONTINUITY_BONUS = 0.015  # Bonus score for previous speaker (stickiness)
+# Continuity bonus raised from 0.015 → 0.04 so it clears the speaking
+# threshold. This makes speaker slots sticky across single-frame
+# laughter/yawn artifacts from the listener.
+CONTINUITY_BONUS = 0.04
+MIN_DWELL_SECONDS = 0.6  # Collapse runs shorter than this
+MIN_DWELL_WIN_MARGIN = 0.08  # ...unless a competing slot beats us by this
+VAD_BRIDGE_GAP_SECONDS = 1.0  # Extend a SpeakerEvent into voiced VAD that starts within this gap
 
 
 @dataclass
@@ -28,6 +34,9 @@ class SpeakerEvent:
     end: float
     slot_id: int
     confidence: float
+    # False when the speaker's face is not visible in the current shot
+    # (e.g. over-the-shoulder reaction shot that spans a shot cut).
+    on_screen: bool = True
 
 
 def _compute_lip_motion_score(
@@ -156,11 +165,337 @@ def _compute_lip_audio_sync(
     return sum(word_sync_scores) / len(word_sync_scores) if word_sync_scores else 0.5
 
 
+def build_vad_presence(
+    audio_path: str,
+    sample_rate: int = 16000,
+) -> list[tuple[float, float]]:
+    """Return a list of (start, end) voiced intervals in seconds.
+
+    Prefers `webrtcvad` (mode=2, 30ms frames). Falls back to a pure-numpy
+    energy + ZCR gate when webrtcvad is unavailable or audio loading fails.
+
+    Used to bridge Whisper silence gaps (breaths, laughter, reaction beats)
+    so SpeakerEvents can extend across the gap. Silently returns [] on any
+    failure — callers must treat "no VAD data" as acceptable.
+    """
+    if not audio_path:
+        return []
+
+    # Load the audio → mono int16 at sample_rate using soundfile or wave.
+    try:
+        import numpy as np
+        samples = None
+        try:
+            import soundfile as sf
+            data, sr = sf.read(audio_path, dtype="int16", always_2d=False)
+            if hasattr(data, "ndim") and data.ndim > 1:
+                data = data.mean(axis=1).astype("int16")
+            if sr != sample_rate:
+                # Naive decimation/upsampling via numpy. Good enough for VAD.
+                ratio = sr / sample_rate
+                idx = (np.arange(int(len(data) / ratio)) * ratio).astype(int)
+                idx = idx[idx < len(data)]
+                data = data[idx].astype("int16")
+            samples = data
+        except Exception:
+            import wave
+            with wave.open(audio_path, "rb") as wf:
+                nch = wf.getnchannels()
+                sw = wf.getsampwidth()
+                sr = wf.getframerate()
+                raw = wf.readframes(wf.getnframes())
+            if sw != 2:
+                return []
+            data = np.frombuffer(raw, dtype=np.int16)
+            if nch > 1:
+                data = data.reshape(-1, nch).mean(axis=1).astype(np.int16)
+            if sr != sample_rate:
+                ratio = sr / sample_rate
+                idx = (np.arange(int(len(data) / ratio)) * ratio).astype(int)
+                idx = idx[idx < len(data)]
+                data = data[idx].astype(np.int16)
+            samples = data
+        if samples is None or len(samples) == 0:
+            return []
+    except Exception as e:
+        logger.info("[SpeakerV2] VAD: audio load failed (%s) — skipping", e)
+        return []
+
+    frame_ms = 30
+    frame_len = int(sample_rate * frame_ms / 1000)
+    if frame_len <= 0 or len(samples) < frame_len:
+        return []
+
+    voiced_frames: list[bool] = []
+
+    # ── Preferred: webrtcvad ──
+    try:
+        import webrtcvad  # type: ignore
+        vad = webrtcvad.Vad(2)
+        for i in range(0, len(samples) - frame_len + 1, frame_len):
+            frame_bytes = samples[i:i + frame_len].tobytes()
+            try:
+                voiced_frames.append(vad.is_speech(frame_bytes, sample_rate))
+            except Exception:
+                voiced_frames.append(False)
+    except Exception:
+        # ── Fallback: numpy energy + ZCR gate ──
+        try:
+            import numpy as np
+            # Work in float32 for RMS.
+            f = samples.astype(np.float32) / 32768.0
+            n_frames = (len(f) - frame_len) // frame_len + 1
+            rms_all = np.empty(n_frames, dtype=np.float32)
+            zcr_all = np.empty(n_frames, dtype=np.float32)
+            for k in range(n_frames):
+                chunk = f[k * frame_len:(k + 1) * frame_len]
+                rms_all[k] = float(np.sqrt(np.mean(chunk * chunk) + 1e-12))
+                # Zero-crossing rate
+                signs = np.sign(chunk)
+                zcr_all[k] = float(np.mean(np.abs(np.diff(signs)) > 0))
+            median_rms = float(np.median(rms_all))
+            thresh = max(1e-4, 0.5 * median_rms)
+            for k in range(n_frames):
+                voiced_frames.append(
+                    bool(rms_all[k] > thresh and 0.01 <= zcr_all[k] <= 0.3)
+                )
+        except Exception as e:
+            logger.info("[SpeakerV2] VAD fallback failed (%s) — skipping", e)
+            return []
+
+    # Collapse voiced frames into intervals.
+    intervals: list[tuple[float, float]] = []
+    in_voice = False
+    v_start = 0.0
+    for k, is_v in enumerate(voiced_frames):
+        t = k * frame_ms / 1000.0
+        if is_v and not in_voice:
+            in_voice = True
+            v_start = t
+        elif not is_v and in_voice:
+            in_voice = False
+            intervals.append((v_start, t))
+    if in_voice:
+        intervals.append((v_start, len(voiced_frames) * frame_ms / 1000.0))
+
+    # Merge intervals with gaps < 150ms (smooths out single non-voiced blips).
+    merged: list[tuple[float, float]] = []
+    for iv in intervals:
+        if merged and iv[0] - merged[-1][1] < 0.15:
+            merged[-1] = (merged[-1][0], iv[1])
+        else:
+            merged.append(iv)
+    logger.info("[SpeakerV2] VAD: %d voiced intervals from %s", len(merged), audio_path)
+    return merged
+
+
+def _apply_vad_bridging(
+    events: list[SpeakerEvent],
+    vad_intervals: list[tuple[float, float]],
+) -> tuple[list[SpeakerEvent], int]:
+    """Extend each SpeakerEvent's end into VAD-voiced intervals that begin
+    within VAD_BRIDGE_GAP_SECONDS of the event end, without overlapping a
+    different-speaker event that follows. Returns (new_events, n_extended).
+    """
+    if not events or not vad_intervals:
+        return events, 0
+    extended = 0
+    out: list[SpeakerEvent] = []
+    for i, ev in enumerate(events):
+        next_different = None
+        for j in range(i + 1, len(events)):
+            if events[j].slot_id != ev.slot_id and events[j].slot_id >= 0:
+                next_different = events[j]
+                break
+        new_end = ev.end
+        for (vs, ve) in vad_intervals:
+            # Only VAD intervals that *start* within the gap window
+            gap = vs - new_end
+            if gap < 0 or gap > VAD_BRIDGE_GAP_SECONDS:
+                continue
+            target_end = ve
+            if next_different is not None:
+                target_end = min(target_end, next_different.start)
+            if target_end > new_end:
+                new_end = target_end
+                extended += 1
+        if new_end != ev.end:
+            out.append(SpeakerEvent(
+                start=ev.start, end=new_end,
+                slot_id=ev.slot_id, confidence=ev.confidence,
+                on_screen=getattr(ev, "on_screen", True),
+            ))
+        else:
+            out.append(ev)
+    return out, extended
+
+
+def _collapse_short_runs(
+    events: list[SpeakerEvent],
+    min_dwell: float = MIN_DWELL_SECONDS,
+    win_margin: float = MIN_DWELL_WIN_MARGIN,
+) -> tuple[list[SpeakerEvent], int]:
+    """Collapse runs of same-speaker events shorter than min_dwell into the
+    neighbor on the higher-scoring side, unless the short run's speaker beats
+    BOTH neighbors by at least win_margin.
+
+    This is the "minimum-dwell" rule from the spec: once slot S becomes
+    active, it stays active for ≥ min_dwell of subsequent segments unless
+    another slot beats S by ≥ win_margin.
+
+    Returns (collapsed_events, n_runs_collapsed).
+    """
+    if len(events) < 3:
+        return events, 0
+
+    # First merge consecutive same-slot events into runs.
+    runs: list[SpeakerEvent] = [events[0]]
+    for ev in events[1:]:
+        prev = runs[-1]
+        if ev.slot_id == prev.slot_id:
+            runs[-1] = SpeakerEvent(
+                start=prev.start, end=ev.end,
+                slot_id=prev.slot_id,
+                confidence=max(prev.confidence, ev.confidence),
+                on_screen=getattr(prev, "on_screen", True) and getattr(ev, "on_screen", True),
+            )
+        else:
+            runs.append(ev)
+
+    if len(runs) < 3:
+        return runs, 0
+
+    collapsed_count = 0
+    changed = True
+    while changed and len(runs) >= 3:
+        changed = False
+        for i in range(1, len(runs) - 1):
+            run = runs[i]
+            duration = run.end - run.start
+            if duration >= min_dwell:
+                continue
+            prev = runs[i - 1]
+            nxt = runs[i + 1]
+            # Keep the short run only if it beats BOTH neighbors by the margin.
+            beats_prev = run.confidence - prev.confidence >= win_margin
+            beats_next = run.confidence - nxt.confidence >= win_margin
+            if beats_prev and beats_next:
+                continue
+            # Collapse into the higher-scoring neighbor.
+            if prev.confidence >= nxt.confidence:
+                runs[i - 1] = SpeakerEvent(
+                    start=prev.start, end=run.end,
+                    slot_id=prev.slot_id, confidence=prev.confidence,
+                    on_screen=getattr(prev, "on_screen", True),
+                )
+                del runs[i]
+            else:
+                runs[i + 1] = SpeakerEvent(
+                    start=run.start, end=nxt.end,
+                    slot_id=nxt.slot_id, confidence=nxt.confidence,
+                    on_screen=getattr(nxt, "on_screen", True),
+                )
+                del runs[i]
+            collapsed_count += 1
+            changed = True
+            break
+    # Final same-slot merge after collapses
+    merged: list[SpeakerEvent] = [runs[0]]
+    for ev in runs[1:]:
+        prev = merged[-1]
+        if ev.slot_id == prev.slot_id:
+            merged[-1] = SpeakerEvent(
+                start=prev.start, end=ev.end,
+                slot_id=prev.slot_id,
+                confidence=max(prev.confidence, ev.confidence),
+                on_screen=getattr(prev, "on_screen", True) and getattr(ev, "on_screen", True),
+            )
+        else:
+            merged.append(ev)
+    return merged, collapsed_count
+
+
+def _apply_shot_reverse_tolerance(
+    events: list[SpeakerEvent],
+    transcript_segments: list,
+    face_results: list,
+    shot_cuts: list,
+    face_registry=None,
+) -> tuple[list[SpeakerEvent], int]:
+    """Mark events as on_screen=False when a shot-cut lands inside a
+    transcript segment and the new shot has no face with lip_aperture > 0.03.
+
+    This captures over-the-shoulder / reaction shots where the *listener*
+    is visible while the previous speaker continues to talk. The crop then
+    anchors on the listener (reaction-shot framing) — see the logic in
+    required_regions.build_required_regions() — rather than fabricating a
+    speaker anchor.
+
+    Returns (new_events, n_offscreen).
+    """
+    if not events or not shot_cuts or not transcript_segments or not face_results:
+        return events, 0
+
+    sorted_cuts = sorted(float(c) for c in shot_cuts)
+
+    def _has_active_lips_between(t0: float, t1: float) -> bool:
+        for fr in face_results:
+            if fr.timestamp < t0 or fr.timestamp > t1:
+                continue
+            for face in fr.faces:
+                if getattr(face, "lip_aperture", 0.0) > 0.03:
+                    return True
+        return False
+
+    # Build a timestamp → transcript segment lookup.
+    def _seg_containing(t: float):
+        for seg in transcript_segments:
+            s = seg.start if hasattr(seg, "start") else seg.get("start", 0)
+            e = seg.end if hasattr(seg, "end") else seg.get("end", 0)
+            if s <= t <= e:
+                return (s, e)
+        return None
+
+    offscreen = 0
+    out: list[SpeakerEvent] = []
+    for ev in events:
+        on_screen = getattr(ev, "on_screen", True)
+        if ev.slot_id < 0:
+            out.append(ev)
+            continue
+        # Find any shot cut inside this event's time range.
+        cuts_in = [c for c in sorted_cuts if ev.start < c < ev.end]
+        for cut in cuts_in:
+            seg_range = _seg_containing(cut)
+            if seg_range is None:
+                continue
+            seg_s, seg_e = seg_range
+            # Transcript segment must extend past the cut.
+            if seg_e <= cut + 0.05:
+                continue
+            post_end = min(ev.end, seg_e)
+            if not _has_active_lips_between(cut, post_end):
+                on_screen = False
+                offscreen += 1
+                break
+        if on_screen != getattr(ev, "on_screen", True):
+            out.append(SpeakerEvent(
+                start=ev.start, end=ev.end,
+                slot_id=ev.slot_id, confidence=ev.confidence,
+                on_screen=on_screen,
+            ))
+        else:
+            out.append(ev)
+    return out, offscreen
+
+
 def build_active_speaker_timeline(
     face_results: list,
     transcript_segments: list,
     face_registry=None,
     window_seconds: float = 2.0,
+    shot_cuts: list = None,
+    audio_path: str = None,
 ) -> list[SpeakerEvent]:
     """Build a timeline of who is speaking when.
 
@@ -339,6 +674,31 @@ def build_active_speaker_timeline(
             )
         events = refined
 
+    # ── Minimum-dwell collapse ──
+    events, collapsed_runs = _collapse_short_runs(events)
+
+    # ── Shot-reverse (off-screen speaker) detection ──
+    events, offscreen_count = _apply_shot_reverse_tolerance(
+        events, transcript_segments, face_results, shot_cuts or [], face_registry,
+    )
+
+    # ── VAD bridging ──
+    if audio_path:
+        try:
+            vad_intervals = build_vad_presence(audio_path)
+        except Exception as e:
+            logger.info("[SpeakerV2] VAD bridging skipped (%s)", e)
+            vad_intervals = []
+        if vad_intervals:
+            events, bridged_count = _apply_vad_bridging(events, vad_intervals)
+            if bridged_count > 0:
+                logger.info("[SpeakerV2] VAD bridged %d speaker event extensions", bridged_count)
+
+    logger.info(
+        "[SpeakerV2] offscreen_speaker_events=%d collapsed_short_runs=%d",
+        offscreen_count, collapsed_runs,
+    )
+
     logger.info(
         "Active speaker timeline: %d events, %d unique speakers, avg confidence=%.2f",
         len(events),
@@ -375,6 +735,8 @@ def build_active_speaker_timeline_v2(
     transcript_segments: list,
     face_registry=None,
     window_seconds: float = 1.0,
+    shot_cuts: list = None,
+    audio_path: str = None,
 ) -> list[SpeakerEvent]:
     """V2: Uses face identity embeddings for accurate speaker tracking.
 
@@ -396,7 +758,8 @@ def build_active_speaker_timeline_v2(
     if not has_identity:
         logger.info("No identity data — falling back to V1 active speaker detection")
         return build_active_speaker_timeline(
-            face_results, transcript_segments, face_registry, window_seconds
+            face_results, transcript_segments, face_registry, window_seconds,
+            shot_cuts=shot_cuts, audio_path=audio_path,
         )
 
     has_lip_data = any(
@@ -546,6 +909,31 @@ def build_active_speaker_timeline_v2(
                         else:
                             merged2.append(ev)
                     events = merged2
+
+    # ── Minimum-dwell collapse ──
+    events, collapsed_runs = _collapse_short_runs(events)
+
+    # ── Shot-reverse (off-screen speaker) detection ──
+    events, offscreen_count = _apply_shot_reverse_tolerance(
+        events, transcript_segments, face_results, shot_cuts or [], face_registry,
+    )
+
+    # ── VAD bridging ──
+    if audio_path:
+        try:
+            vad_intervals = build_vad_presence(audio_path)
+        except Exception as e:
+            logger.info("[SpeakerV2] VAD bridging skipped (%s)", e)
+            vad_intervals = []
+        if vad_intervals:
+            events, bridged_count = _apply_vad_bridging(events, vad_intervals)
+            if bridged_count > 0:
+                logger.info("[SpeakerV2] VAD bridged %d speaker event extensions (v2)", bridged_count)
+
+    logger.info(
+        "[SpeakerV2] offscreen_speaker_events=%d collapsed_short_runs=%d (v2)",
+        offscreen_count, collapsed_runs,
+    )
 
     logger.info(
         "Active speaker V2 timeline: %d events, %d unique speakers, avg confidence=%.2f",

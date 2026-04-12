@@ -2393,15 +2393,20 @@ async def _run_analysis_inner(job_id: str):
             )
             # Use V2 (identity-based) with dense data when available
             _speaker_face_data = dense_face_results if dense_face_results else face_results
+            _shot_cuts_for_speaker = scene_cut_timestamps if scene_cut_timestamps else []
             if dense_face_results:
                 active_speaker_events = build_active_speaker_timeline_v2(
                     _speaker_face_data, transcript, face_registry,
                     window_seconds=0.5,
+                    shot_cuts=_shot_cuts_for_speaker,
+                    audio_path=audio_path,
                 )
             else:
                 active_speaker_events = build_active_speaker_timeline(
                     _speaker_face_data, transcript, face_registry,
                     window_seconds=0.5 if dense_face_results else 2.0,
+                    shot_cuts=_shot_cuts_for_speaker,
+                    audio_path=audio_path,
                 )
             if active_speaker_events:
                 logger.info(
@@ -2551,6 +2556,7 @@ async def _run_analysis_inner(job_id: str):
                 video_duration=_video_dur,
                 metadata=metadata,
                 job_id=job_id,
+                transcript_segments=transcript,
             )
         except Exception as e:
             logger.warning("[%s] Content classification failed (non-fatal): %s", job_id, e)

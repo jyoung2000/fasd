@@ -21,16 +21,13 @@ class RequiredRegion:
     cy: float            # normalized 0-1
     half_width: float    # normalized half-width
     half_height: float   # normalized half-height
-    score: float         # 1.0 for active speaker, 0.7 for passive face
+    score: float         # 1.0 for active speaker, 0.55 passive (same shot), 0.8 passive (no speaker)
     tier: str = "required"   # "required" | "preferred"
     source: str = "face"     # "face" | "object" | "saliency"
     face_slot: int = -1
     saliency_score: float = 0.0  # original saliency score (0-1), preserved from tracker
-    weight: float = 1.0  # camera-path data-term weight:
-    #   face (active speaker): 1.0
-    #   face (passive):        0.7
-    #   person/object:         0.8
-    #   saliency:              0.3 + 0.6 * saliency_score
+    weight: float = 1.0  # camera-path data-term weight (see build_required_regions)
+    is_active_speaker: bool = False  # True when this face is the active speaker
 
 
 def _iou_normalized(a, b) -> float:
@@ -94,6 +91,35 @@ def _merge_overlapping_features(frame_regions: list) -> list:
     return non_sal + kept_sal
 
 
+def _is_dialogue_mode(content_type) -> bool:
+    """True for content types where faces are load-bearing and background
+    saliency should not compete: TALKING_HEAD and CINEMATIC_DIALOGUE.
+    """
+    if content_type is None:
+        return False
+    # Match by string value so this works whether content_type is the enum
+    # or its .value — callers pass both forms.
+    val = getattr(content_type, "value", content_type)
+    return val in ("talking_head", "cinematic_dialogue")
+
+
+def _saliency_weight_for_content(content_type, sal_score: float):
+    """Return (weight, min_area) tuple for saliency regions, per content type.
+
+    Table (from the spec):
+        TALKING_HEAD / CINEMATIC_DIALOGUE: 0.15 + 0.25·s, max 0.40, min_area 0.04
+        ANIMATION / GAMEPLAY:               0.30 + 0.60·s (legacy),   min_area 0.02
+        STREAM / MUSIC_VIDEO / GENERIC:     0.25 + 0.45·s, max 0.70, min_area 0.03
+    """
+    val = getattr(content_type, "value", content_type) if content_type is not None else None
+    if val in ("talking_head", "cinematic_dialogue"):
+        return (min(0.40, 0.15 + 0.25 * sal_score), 0.04)
+    if val in ("animation", "gameplay"):
+        return (0.30 + 0.60 * sal_score, 0.02)
+    # STREAM / MUSIC_VIDEO / GENERIC / None
+    return (min(0.70, 0.25 + 0.45 * sal_score), 0.03)
+
+
 def build_required_regions(
     frame_faces: list,
     active_speaker_events: list = None,
@@ -113,18 +139,19 @@ def build_required_regions(
         frame_objects: list[list[ObjectDetection]] — one list per frame,
             or flat list indexed by timestamp
         frame_saliency: list[FrameSaliency] from saliency_detector
-        content_type: ClipContentType for future per-type weighting
+        content_type: ClipContentType for per-type weighting / saliency
+            downrank / lead-room bias.
 
     Returns:
         list of lists — one inner list per frame.
     """
-    def _active_slot_at(timestamp: float) -> int:
+    def _active_event_at(timestamp: float):
         if not active_speaker_events:
-            return -1
+            return None
         for ev in active_speaker_events:
             if ev.start <= timestamp <= ev.end and ev.slot_id >= 0:
-                return ev.slot_id
-        return -1
+                return ev
+        return None
 
     # Index object detections by rounded timestamp
     obj_by_time = {}
@@ -139,14 +166,36 @@ def build_required_regions(
         for sf in frame_saliency:
             sal_by_time[round(sf.timestamp, 2)] = sf
 
+    dialogue_mode = _is_dialogue_mode(content_type)
+
     regions_per_frame = []
     _pre_merge_total = 0
     _post_merge_total = 0
+    _active_count = 0
+    _passive_same_count = 0
+    _passive_no_speaker_count = 0
+    _saliency_dropped_outside_face = 0
+    _lead_room_applied = 0
 
     for ff in frame_faces:
-        active_slot = _active_slot_at(ff.timestamp)
+        active_ev = _active_event_at(ff.timestamp)
+        active_slot = active_ev.slot_id if active_ev else -1
+        on_screen = getattr(active_ev, "on_screen", True) if active_ev else True
         frame_regions = []
         ts_key = round(ff.timestamp, 2)
+
+        # Is there any active speaker in this frame at all?
+        frame_has_active_speaker = (active_slot >= 0 and on_screen)
+
+        # For the tightened lip-aperture override: check whether any face in
+        # this frame already has identity_id == active_slot.
+        slot_ids_in_frame = {
+            getattr(f, 'identity_id', -1) for f in ff.faces
+            if getattr(f, 'is_human', True)
+        }
+        active_slot_visible_as_identity = (
+            active_slot >= 0 and active_slot in slot_ids_in_frame
+        )
 
         # ── Face regions (required tier) ──
         for face in ff.faces:
@@ -154,23 +203,77 @@ def build_required_regions(
                 continue
             slot_id = getattr(face, 'identity_id', -1)
             is_active = (slot_id >= 0 and slot_id == active_slot)
-            if not is_active and getattr(face, 'lip_aperture', 0) > 0.05:
+            # Lip-aperture override: only promote passive→active when no
+            # other face in this frame already has identity_id == active_slot
+            # (stops a laughing/yawning listener from shadow-promoting).
+            if (not is_active
+                    and getattr(face, 'lip_aperture', 0) > 0.05
+                    and not active_slot_visible_as_identity):
                 is_active = True
+
+            # Off-screen speaker: treat every visible face as passive-same-shot.
+            # The crop then anchors on the listener (reaction-shot framing)
+            # instead of fabricating a speaker anchor.
+            if active_ev is not None and not on_screen:
+                is_active = False
 
             cx = face.nose_x / 100.0
             cy = face.nose_y / 100.0
             hw = (face.width / 100.0) / 2.0
             hh = (face.height / 100.0) / 2.0
 
+            # Weight rules:
+            #   active speaker:                          score=1.00 weight=1.40
+            #   passive, same shot as active speaker:    score=0.55 weight=0.45
+            #   passive, no active speaker in frame:     score=0.80 weight=0.80
+            if is_active:
+                score = 1.0
+                weight = 1.4
+                _active_count += 1
+            elif frame_has_active_speaker or (active_ev is not None and not on_screen):
+                # Another face in this frame is the speaker, OR the speaker
+                # is off-screen (reaction shot) — demote heavily.
+                score = 0.55
+                weight = 0.45
+                _passive_same_count += 1
+            else:
+                # No active speaker attributed to this frame — fall back to
+                # the legacy "faces matter" behavior.
+                score = 0.8
+                weight = 0.8
+                _passive_no_speaker_count += 1
+
+            # ── Lead-room bias ──
+            # Only the active speaker; requires a `yaw` attribute populated
+            # upstream. Shifts cx by -0.05·sign(yaw) (in the direction the
+            # subject is looking) and clamps to [hw, 1 - hw].
+            if is_active:
+                yaw = getattr(face, "yaw", None)
+                if yaw is not None:
+                    try:
+                        yaw_val = float(yaw)
+                        if abs(yaw_val) > 15.0:
+                            sign = 1.0 if yaw_val > 0 else -1.0
+                            cx = cx - 0.05 * sign
+                            # Clamp so the region stays in-bounds.
+                            lo = hw
+                            hi = 1.0 - hw
+                            if lo <= hi:
+                                cx = max(lo, min(hi, cx))
+                            _lead_room_applied += 1
+                    except (TypeError, ValueError):
+                        pass
+
             frame_regions.append(RequiredRegion(
                 timestamp=ff.timestamp,
                 cx=cx, cy=cy,
                 half_width=hw, half_height=hh,
-                score=1.0 if is_active else 0.7,
+                score=score,
                 tier="required",
                 source="face",
                 face_slot=slot_id,
-                weight=1.0 if is_active else 0.7,
+                weight=weight,
+                is_active_speaker=is_active,
             ))
 
         # ── Object regions: person class → required, non-face ──
@@ -197,21 +300,45 @@ def build_required_regions(
         # ── Saliency regions: preferred tier ──
         sal_frame = sal_by_time.get(ts_key)
         if sal_frame:
+            face_regions_this_frame = [
+                r for r in frame_regions if r.source == "face"
+            ]
             for blob in getattr(sal_frame, 'blobs', []):
                 bx, by, bw, bh = blob[0], blob[1], blob[2], blob[3]
                 area = bw * bh
-                if area < 0.02:
-                    continue
                 _sal_score = getattr(sal_frame, 'mean_score', 0.5)
+                # Per-content-type weight + min-area gate
+                sal_weight, min_area = _saliency_weight_for_content(
+                    content_type, _sal_score,
+                )
+                if area < min_area:
+                    continue
+                cand_cx = bx + bw / 2
+                cand_cy = by + bh / 2
+                # Dialogue-mode gate: drop saliency regions whose center lies
+                # outside the union of face bboxes expanded by 1.5× when
+                # faces exist in the frame.
+                if dialogue_mode and face_regions_this_frame:
+                    inside_any = False
+                    for fr_reg in face_regions_this_frame:
+                        ehw = fr_reg.half_width * 1.5
+                        ehh = fr_reg.half_height * 1.5
+                        if (fr_reg.cx - ehw <= cand_cx <= fr_reg.cx + ehw
+                                and fr_reg.cy - ehh <= cand_cy <= fr_reg.cy + ehh):
+                            inside_any = True
+                            break
+                    if not inside_any:
+                        _saliency_dropped_outside_face += 1
+                        continue
                 candidate = RequiredRegion(
                     timestamp=ff.timestamp,
-                    cx=bx + bw / 2, cy=by + bh / 2,
+                    cx=cand_cx, cy=cand_cy,
                     half_width=bw / 2, half_height=bh / 2,
                     score=_sal_score * 0.5,
                     tier="preferred",
                     source="saliency",
                     saliency_score=_sal_score,
-                    weight=0.3 + 0.6 * _sal_score,
+                    weight=sal_weight,
                 )
                 if not _overlaps_any(candidate, frame_regions, 0.5):
                     frame_regions.append(candidate)
@@ -220,6 +347,21 @@ def build_required_regions(
         frame_regions = _merge_overlapping_features(frame_regions)
         _post_merge_total += len(frame_regions)
         regions_per_frame.append(frame_regions)
+
+    logger.info(
+        "[SpeakerV2] weights: active=%d passive_same_shot=%d passive_no_speaker=%d",
+        _active_count, _passive_same_count, _passive_no_speaker_count,
+    )
+    if _saliency_dropped_outside_face > 0:
+        logger.info(
+            "[SaliencyV2] dialogue-mode gate dropped %d saliency regions outside face bboxes",
+            _saliency_dropped_outside_face,
+        )
+    if _lead_room_applied > 0:
+        logger.info(
+            "[SpeakerV2] lead-room bias applied to %d active-speaker regions",
+            _lead_room_applied,
+        )
 
     if _pre_merge_total != _post_merge_total:
         logger.info("[SaliencyParity] feature merge: %d → %d regions (-%d absorbed)",
@@ -238,13 +380,23 @@ def build_required_regions(
     return regions_per_frame
 
 
-def promote_preferred_to_required(regions_per_frame: List[List[RequiredRegion]]) -> None:
+def promote_preferred_to_required(
+    regions_per_frame: List[List[RequiredRegion]],
+    content_type=None,
+) -> None:
     """For frames with no required regions, promote the highest-scoring
     preferred region to required.
 
     This is what makes anime and gameplay work — saliency becomes
     load-bearing exactly when faces are absent.
+
+    No-op for TALKING_HEAD / CINEMATIC_DIALOGUE: for those modes a frame
+    with no face means "wait" — let camera_path.py smooth through it
+    rather than fabricating a new anchor from background saliency.
     """
+    if _is_dialogue_mode(content_type):
+        logger.info("[SaliencyV2] promote_preferred_to_required skipped (dialogue mode)")
+        return
     promoted = 0
     for frame_regions in regions_per_frame:
         has_required = any(r.tier == "required" for r in frame_regions)

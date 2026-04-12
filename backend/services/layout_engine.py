@@ -413,8 +413,10 @@ def _plan_layout_impl(
     )
 
     # Promote preferred → required for frames with no faces
-    # (critical for anime and gameplay where saliency is load-bearing)
-    promote_preferred_to_required(regions)
+    # (critical for anime and gameplay where saliency is load-bearing).
+    # For TALKING_HEAD / CINEMATIC_DIALOGUE this is a no-op — a no-face
+    # frame means "wait", not "invent a saliency anchor".
+    promote_preferred_to_required(regions, content_type=content_type)
 
     # 3. Solve camera mode per shot (with content-type tuning)
     shot_cameras = solve_all_shots(
@@ -509,6 +511,18 @@ def _build_padded_segment(
 
     # Content-type-specific routing
     if content_type and ClipContentType:
+        # CINEMATIC_DIALOGUE: never SPLIT, never PIP. Always follow the
+        # active speaker as a single-subject crop. A split-screen layout
+        # on a drama scene looks like a zoom call and kills the
+        # cinematography. PADDING (blur-fill) is acceptable when the
+        # active speaker's bbox alone doesn't fit 9:16.
+        if content_type == ClipContentType.CINEMATIC_DIALOGUE:
+            return LayoutSegment(
+                start=sc.start, end=sc.end,
+                layout_mode=LayoutMode.SINGLE,
+                transition_type="cut",
+            )
+
         if content_type == ClipContentType.TALKING_HEAD:
             # Debates/podcasts: SPLIT layout with two speakers
             pad_faces = [fr for fr in frame_faces if sc.start <= fr.timestamp < sc.end]
