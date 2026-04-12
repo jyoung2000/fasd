@@ -3177,10 +3177,26 @@ async def _run_analysis_inner(job_id: str):
                                 except Exception as _oe:
                                     logger.warning("[%s] Content-routed object detection failed: %s", job_id, _oe)
 
-                            if _content_routing == "on" and _clip_content_type in (
+                            # Saliency detection for the solver path.
+                            #
+                            # v3 wiring: animation modes need saliency
+                            # *unconditionally* — not gated behind
+                            # CLIPAI_CONTENT_ROUTING — so the SaliencyFallback
+                            # adapter in build_required_regions has data to
+                            # convert and the camera solver has anchors for
+                            # faceless action beats. Without this the anime
+                            # crop drifts onto background motion. Other
+                            # content types still respect the env-var gate.
+                            _animation_modes = (
+                                ClipContentType.ANIMATION,
+                                ClipContentType.ANIMATION_DIALOGUE,
+                            )
+                            _saliency_for_animation = _clip_content_type in _animation_modes
+                            _saliency_routed = _content_routing == "on" and _clip_content_type in (
                                 ClipContentType.ANIMATION, ClipContentType.ANIMATION_DIALOGUE,
                                 ClipContentType.MUSIC_VIDEO, ClipContentType.GAMEPLAY,
-                            ):
+                            )
+                            if _saliency_for_animation or _saliency_routed:
                                 try:
                                     from backend.services.saliency_tracker import track_saliency_in_frames
                                     _frame_list_sal = [(f.timestamp, f.path) for f in frames]
@@ -3188,8 +3204,12 @@ async def _run_analysis_inner(job_id: str):
                                         _frame_list_sal, face_results,
                                         persistent_regions=_persistent_regions,
                                     )
-                                    logger.info("[%s] Content-routed saliency detection: %d regions",
-                                                job_id, len(_solver_saliency))
+                                    logger.info(
+                                        "[%s] Content-routed saliency detection: "
+                                        "%d regions (animation_unconditional=%s)",
+                                        job_id, len(_solver_saliency),
+                                        _saliency_for_animation,
+                                    )
                                 except Exception as _se:
                                     logger.warning("[%s] Content-routed saliency detection failed: %s", job_id, _se)
 

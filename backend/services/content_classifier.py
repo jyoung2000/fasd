@@ -429,9 +429,16 @@ def classify_clip(
             if corner_ratio > 0.7:
                 base_type = ClipContentType.STREAM
 
-    logger.info("classify_clip: %s (from base=%s)",
-                base_type.value,
-                content_profile.content_type if content_profile else "none")
+    # Emit a stable, grep-friendly signal at the end of classify_clip so the
+    # v3 verifier can confirm content_type=animation_dialogue (or whichever
+    # ClipContentType won) actually landed at the classifier layer. The
+    # `[ContentClassifier]` tag mirrors the [Layout+Solver] tag emitted at
+    # the solver layer so both signals can be correlated by job_id.
+    logger.info(
+        "[ContentClassifier] classify_clip: content_type=%s (from base=%s)",
+        base_type.value,
+        content_profile.content_type if content_profile else "none",
+    )
     return base_type
 
 
