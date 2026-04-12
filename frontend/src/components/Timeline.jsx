@@ -669,6 +669,42 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
     return matches[0];
   }, []);
 
+  // Hit-test a crop segment on the crop track. Returns { seg, edge } or null.
+  const hitTestCropSegment = useCallback((clientX, clientY) => {
+    const { cropSegments: segs, scrollX: currentScrollX, tracks: currentTracks } = useTimelineStore.getState();
+    if (!segs?.length) return null;
+
+    const cropTrackIdx = currentTracks.findIndex((t) => t.type === 'crop');
+    if (cropTrackIdx < 0) return null;
+    const cropTrack = currentTracks[cropTrackIdx];
+    if (!cropTrack || cropTrack.visible === false || cropTrack.locked) return null;
+
+    const canvas = canvasRef.current;
+    if (!canvas) return null;
+    const rect = canvas.getBoundingClientRect();
+    const px = clientX - rect.left;
+    const mouseY = clientY - rect.top;
+    const currentPps = ppsRef.current;
+
+    // Verify Y is on the crop track
+    const trackIdx = Math.floor((mouseY - RULER_HEIGHT) / (TRACK_HEIGHT + TRACK_GAP));
+    if (trackIdx !== cropTrackIdx) return null;
+
+    const x = px - LABEL_WIDTH + currentScrollX;
+    const time = Math.max(0, x / currentPps);
+
+    for (const seg of segs) {
+      if (time < seg.startTime || time > seg.endTime) continue;
+      const x1 = LABEL_WIDTH + seg.startTime * currentPps - currentScrollX;
+      const x2 = LABEL_WIDTH + seg.endTime * currentPps - currentScrollX;
+      let edge = 'body';
+      if (Math.abs(px - x1) < HANDLE_HIT_AREA) edge = 'left';
+      else if (Math.abs(px - x2) < HANDLE_HIT_AREA) edge = 'right';
+      return { seg, edge, x1, x2 };
+    }
+    return null;
+  }, []);
+
   // ── Pointer events ─────────────────────────────────────────────────────────
   const onPointerDown = useCallback((e) => {
     const canvas = canvasRef.current;
@@ -801,18 +837,35 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
       // No item hit — check crop track click, then playhead, then seek
       const time = getTimeFromX(e.clientX);
 
-      // Check if click is on the crop track
-      const cropTrackIdx = tracks.findIndex((t) => t.type === 'crop');
-      const clickTrackIdx = Math.floor((mouseY - RULER_HEIGHT) / (TRACK_HEIGHT + TRACK_GAP));
-      if (cropTrackIdx >= 0 && clickTrackIdx === cropTrackIdx) {
-        const { cropSegments: segs } = useTimelineStore.getState();
-        const hitSeg = segs.find(s => time >= s.startTime && time < s.endTime);
-        if (hitSeg) {
-          selectCropSegment(hitSeg.id);
-          setSelectedItemId(null);
-          onItemSelect?.(null); // Open properties panel for crop segment
-          return;
+      // Check if click is on a crop segment (with edge detection for trim/move)
+      const cropHit = hitTestCropSegment(e.clientX, e.clientY);
+      if (cropHit) {
+        selectCropSegment(cropHit.seg.id);
+        setSelectedItemId(null);
+        onItemSelect?.(null); // Open properties panel for crop segment
+
+        // Pause undo history during drag so intermediate frames don't flood it
+        useTimelineStore.temporal.getState().pause();
+        setIsDragging(true);
+        if (cropHit.edge === 'left' || cropHit.edge === 'right') {
+          setDragInfo({
+            type: 'trim-crop',
+            segId: cropHit.seg.id,
+            edge: cropHit.edge,
+            origStart: cropHit.seg.startTime,
+            origEnd: cropHit.seg.endTime,
+            startX: e.clientX,
+          });
+        } else {
+          setDragInfo({
+            type: 'move-crop',
+            segId: cropHit.seg.id,
+            origStart: cropHit.seg.startTime,
+            origEnd: cropHit.seg.endTime,
+            startX: e.clientX,
+          });
         }
+        return;
       }
 
       if (!isInRuler && distToPlayhead <= Math.max(PLAYHEAD_GRAB_WIDTH / 2, 8)) {
@@ -831,7 +884,7 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
         setDragInfo({ type: 'scrub', startX: e.clientX });
       }
     }
-  }, [hitTestItem, getTimeFromX, setPlayhead, setSelectedItemId, setSelectedItemIds, toggleSelectedItem, onSeek, activeTool, splitItem, spaceHeld, scrollX, onItemSelect]);
+  }, [hitTestItem, hitTestCropSegment, getTimeFromX, setPlayhead, setSelectedItemId, setSelectedItemIds, toggleSelectedItem, selectCropSegment, onSeek, activeTool, splitItem, spaceHeld, scrollX, onItemSelect]);
 
   useEffect(() => {
     if (!isDragging || !dragInfo) return;
@@ -941,12 +994,54 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
           const itemTrackId = snap.id === dragInfo.itemId ? primaryTrackId : snap.origTrackId;
           updateItem(snap.id, { start: itemNewStart, end: itemNewStart + itemDur, trackId: itemTrackId });
         }
+      } else if (dragInfo.type === 'trim-crop') {
+        // Trim the left or right edge of a crop segment
+        const { cropSegments: segs, updateCropSegment } = useTimelineStore.getState();
+        const seg = segs.find((s) => s.id === dragInfo.segId);
+        if (!seg) return;
+        const idx = segs.findIndex((s) => s.id === dragInfo.segId);
+        const prev = idx > 0 ? segs[idx - 1] : null;
+        const next = idx < segs.length - 1 ? segs[idx + 1] : null;
+        const MIN_DUR = 0.05; // minimum 50ms so handles don't collapse
+
+        if (dragInfo.edge === 'left') {
+          let newStart = Math.max(0, time);
+          // Clamp against previous neighbor's end
+          if (prev) newStart = Math.max(newStart, prev.endTime);
+          // Keep at least MIN_DUR
+          newStart = Math.min(newStart, dragInfo.origEnd - MIN_DUR);
+          updateCropSegment({ ...seg, startTime: newStart, endTime: dragInfo.origEnd });
+        } else {
+          let newEnd = Math.max(dragInfo.origStart + MIN_DUR, time);
+          // Clamp against next neighbor's start
+          if (next) newEnd = Math.min(newEnd, next.startTime);
+          // Clamp against clip duration (if known)
+          if (duration > 0) newEnd = Math.min(newEnd, duration);
+          updateCropSegment({ ...seg, startTime: dragInfo.origStart, endTime: newEnd });
+        }
+      } else if (dragInfo.type === 'move-crop') {
+        // Move (slide) a crop segment along the timeline
+        const { cropSegments: segs, updateCropSegment } = useTimelineStore.getState();
+        const seg = segs.find((s) => s.id === dragInfo.segId);
+        if (!seg) return;
+        const idx = segs.findIndex((s) => s.id === dragInfo.segId);
+        const prev = idx > 0 ? segs[idx - 1] : null;
+        const next = idx < segs.length - 1 ? segs[idx + 1] : null;
+        const dur = dragInfo.origEnd - dragInfo.origStart;
+        const dx = (e.clientX - dragInfo.startX) / pps;
+        let newStart = Math.max(0, dragInfo.origStart + dx);
+        // Clamp within neighbor boundaries
+        if (prev) newStart = Math.max(newStart, prev.endTime);
+        if (next) newStart = Math.min(newStart, next.startTime - dur);
+        if (duration > 0) newStart = Math.min(newStart, Math.max(0, duration - dur));
+        updateCropSegment({ ...seg, startTime: newStart, endTime: newStart + dur });
       }
     };
 
     const onUp = () => {
       // Resume undo history so the final drag state is recorded as one snapshot
-      if (dragInfo.type === 'move' || dragInfo.type === 'trim') {
+      if (dragInfo.type === 'move' || dragInfo.type === 'trim' ||
+          dragInfo.type === 'trim-crop' || dragInfo.type === 'move-crop') {
         useTimelineStore.temporal.getState().resume();
       }
       useTimelineStore.getState().setSnapLine(null);
@@ -1000,13 +1095,20 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
     const hit = hitTestItem(e.clientX, e.clientY);
     if (hit) {
       canvas.style.cursor = hit.edge === 'left' || hit.edge === 'right' ? 'col-resize' : 'grab';
-    } else if (!isInRulerArea && Math.abs(e.clientX - phPixelX) <= Math.max(PLAYHEAD_GRAB_WIDTH / 2, 8)) {
+      return;
+    }
+    const cropHit = hitTestCropSegment(e.clientX, e.clientY);
+    if (cropHit) {
+      canvas.style.cursor = cropHit.edge === 'left' || cropHit.edge === 'right' ? 'col-resize' : 'grab';
+      return;
+    }
+    if (!isInRulerArea && Math.abs(e.clientX - phPixelX) <= Math.max(PLAYHEAD_GRAB_WIDTH / 2, 8)) {
       // Show col-resize cursor on the playhead line outside ruler when no item is under cursor
       canvas.style.cursor = 'col-resize';
     } else {
       canvas.style.cursor = 'pointer';
     }
-  }, [isDragging, getTimeFromX, hitTestItem, activeTool, spaceHeld, playhead, pps, scrollX]);
+  }, [isDragging, getTimeFromX, hitTestItem, hitTestCropSegment, activeTool, spaceHeld, playhead, pps, scrollX]);
 
   const onPointerLeave = useCallback(() => setHoverTime(null), []);
 
