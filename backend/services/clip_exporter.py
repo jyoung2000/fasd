@@ -7615,9 +7615,19 @@ async def export_clip(
                             continue
                         # Remove NVENC-specific args
                         if arg in ("-gpu", "-rc", "-rc:v", "-spatial_aq", "-temporal_aq",
-                                   "-b_ref_mode", "-weighted_pred"):
+                                   "-b_ref_mode", "-weighted_pred", "-cq", "-tag:v"):
                             skip_next = True
                             continue
+                        # -preset is legitimate for libx264, BUT NVENC uses
+                        # p1..p7 preset names (fastest..slowest) which libx264
+                        # rejects as "invalid preset 'p5'". Strip any NVENC-
+                        # style preset so the CPU default gets inserted below.
+                        if arg == "-preset" and ci + 1 < len(cmd):
+                            next_val = cmd[ci + 1]
+                            if (len(next_val) == 2 and next_val[0] == "p"
+                                    and next_val[1].isdigit()):
+                                skip_next = True
+                                continue
                         if arg in ("1", "middle", "vbr", "vbr_hq"):
                             # Could be a value for a skipped arg; but if we're not
                             # skipping, keep it. This is handled by skip_next above.
