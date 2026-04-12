@@ -4382,7 +4382,11 @@ def _build_filter_chain(
         filters.append(f"scale={out_w}:{out_h}")
 
         # ── Centering verification for preview-export parity ──
-        if subject_keyframes:
+        # Only runs when a crop actually happened (src_ratio != target_ratio).
+        # When the source already matches the target ratio, crop_w/crop_h
+        # are never defined and there's nothing to verify — the full frame
+        # is passed through and centering is trivially correct.
+        if subject_keyframes and abs(src_ratio - target_ratio) > 0.01:
             for label_kf, kf in [("first", subject_keyframes[0]), ("last", subject_keyframes[-1])]:
                 t_kf, sx_kf = kf
                 sx_safe = _safe_subject_x(sx_kf, src_ratio=src_ratio, target_ratio=target_ratio)
