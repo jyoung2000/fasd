@@ -511,12 +511,16 @@ def _build_padded_segment(
 
     # Content-type-specific routing
     if content_type and ClipContentType:
-        # CINEMATIC_DIALOGUE: never SPLIT, never PIP. Always follow the
-        # active speaker as a single-subject crop. A split-screen layout
-        # on a drama scene looks like a zoom call and kills the
-        # cinematography. PADDING (blur-fill) is acceptable when the
-        # active speaker's bbox alone doesn't fit 9:16.
-        if content_type == ClipContentType.CINEMATIC_DIALOGUE:
+        # CINEMATIC_DIALOGUE / ANIMATION_DIALOGUE: never SPLIT, never PIP.
+        # Always follow the active speaker as a single-subject crop. A
+        # split-screen layout on a drama or anime dialogue scene looks
+        # like a zoom call and kills the cinematography. PADDING
+        # (blur-fill) is acceptable when the active speaker's bbox alone
+        # doesn't fit 9:16.
+        if content_type in (
+            ClipContentType.CINEMATIC_DIALOGUE,
+            ClipContentType.ANIMATION_DIALOGUE,
+        ):
             return LayoutSegment(
                 start=sc.start, end=sc.end,
                 layout_mode=LayoutMode.SINGLE,

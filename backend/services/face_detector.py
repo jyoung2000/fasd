@@ -632,6 +632,35 @@ def _verify_faces_in_results(results: list, frame_paths: list) -> list:
         "Human face verification (%s): %d faces checked, %d non-human detected",
         "strict" if use_strict else "legacy", verified, non_human,
     )
+
+    # ── Auto-detect animated content ──
+    # MediaPipe Pose is a human-proportions model; anime / cartoon / stylized
+    # faces fail it ~70-80% of the time and get penalized to weight=0.35 in
+    # the face registry, which drops anime speakers below the saliency ceiling
+    # and causes the crop to drift onto background motion.
+    #
+    # Heuristic: if >50% of faces were rejected, this is almost certainly
+    # animated content. Reset every face back to is_human=True so the
+    # registry treats them all at full weight. Gated by the
+    # ALLOW_ANIMATED_AUTO_DETECT env var (default on) for rollback.
+    import os as _os
+    _allow_anim_auto = _os.environ.get(
+        "ALLOW_ANIMATED_AUTO_DETECT", "true",
+    ).lower() in ("true", "1", "yes")
+    if _allow_anim_auto and verified > 0 and (non_human / verified) > 0.5:
+        _restored = 0
+        for fr in results:
+            for face in fr.faces:
+                if not getattr(face, "is_human", True):
+                    face.is_human = True
+                    face.pose_confidence = 1.0
+                    _restored += 1
+        logger.info(
+            "[AnimeMode] skipping human verifier, kept %d faces at weight=1.0 "
+            "(rejection rate %.0f%% > 50%% — presumed animated content)",
+            verified, non_human / verified * 100,
+        )
+
     return results
 
 

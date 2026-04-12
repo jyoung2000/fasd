@@ -33,6 +33,7 @@ class ClipContentType(str, Enum):
     TALKING_HEAD = "talking_head"      # debates, podcasts, interviews
     CINEMATIC_DIALOGUE = "cinematic_dialogue"   # narrative w/ detected dialogue shots
     ANIMATION = "animation"            # anime, cartoons
+    ANIMATION_DIALOGUE = "animation_dialogue"   # talking anime characters
     MUSIC_VIDEO = "music_video"
     GAMEPLAY = "gameplay"              # pure game footage
     STREAM = "stream"                  # facecam + gameplay
@@ -69,6 +70,10 @@ class ContentProfile:
     # (≥2 face slots and ≥30s of speech in the first 120s). Drives routing
     # to ClipContentType.CINEMATIC_DIALOGUE in classify_clip().
     is_cinematic_dialogue: bool = False
+    # Set to True when the content is animated (anime / cartoon). Drives
+    # ClipContentType.ANIMATION_DIALOGUE routing (narrative + animated) and
+    # skips per-face human verification downstream.
+    is_animated: bool = False
 
 
 def classify_content(
@@ -301,8 +306,21 @@ def classify_content(
         signals["cinematic_dialogue"] = True
         signals["cumulative_speech_first_120s"] = round(cumulative_speech_seconds, 1)
 
+    # ── Animation detection ──
+    # Set is_animated=True when ANIME was voted OR scene descriptions
+    # contain enough anime keywords to be confident. This drives
+    # ANIMATION_DIALOGUE routing downstream and tells the face pipeline
+    # to skip the human-proportions verifier (anime proportions fail it).
+    is_animated = False
+    if profile.content_type == ContentType.ANIME.value:
+        is_animated = True
+    elif signals.get("scene_desc_anime", 0) >= 3:
+        is_animated = True
+        signals["animated_by_scene_desc"] = True
+
     profile.signals = signals
     profile.is_cinematic_dialogue = is_cinematic_dialogue
+    profile.is_animated = is_animated
     _log(
         "%s (conf=%.2f, signals=%s, scores=%s)",
         profile.content_type, profile.confidence,
@@ -346,6 +364,16 @@ def classify_clip(
         # Narrative → CINEMATIC_DIALOGUE promotion
         if getattr(content_profile, "is_cinematic_dialogue", False):
             base_type = ClipContentType.CINEMATIC_DIALOGUE
+        # Animated narrative → ANIMATION_DIALOGUE (talking anime characters).
+        # This takes priority over CINEMATIC_DIALOGUE and uses the same
+        # saliency downrank rules, since the dialogue framing conventions
+        # (don't drift onto background motion) apply identically.
+        if getattr(content_profile, "is_animated", False):
+            if getattr(content_profile, "is_cinematic_dialogue", False):
+                base_type = ClipContentType.ANIMATION_DIALOGUE
+            elif base_type == ClipContentType.GENERIC:
+                # Raw anime without dialogue signals — standard animation.
+                base_type = ClipContentType.ANIMATION
 
     # STREAM override: gameplay HUD + corner facecam
     if persistent_regions:

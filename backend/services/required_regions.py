@@ -93,26 +93,39 @@ def _merge_overlapping_features(frame_regions: list) -> list:
 
 def _is_dialogue_mode(content_type) -> bool:
     """True for content types where faces are load-bearing and background
-    saliency should not compete: TALKING_HEAD and CINEMATIC_DIALOGUE.
+    saliency should not compete: TALKING_HEAD, CINEMATIC_DIALOGUE, and
+    ANIMATION_DIALOGUE (talking anime characters).
     """
     if content_type is None:
         return False
     # Match by string value so this works whether content_type is the enum
     # or its .value — callers pass both forms.
     val = getattr(content_type, "value", content_type)
-    return val in ("talking_head", "cinematic_dialogue")
+    return val in ("talking_head", "cinematic_dialogue", "animation_dialogue")
+
+
+def _is_animated_mode(content_type) -> bool:
+    """True for content types that are animated (anime / cartoons).
+    Used to tune the lip-aperture promotion threshold since anime neutral
+    expressions sit around 0.05 aperture and need a higher bar.
+    """
+    if content_type is None:
+        return False
+    val = getattr(content_type, "value", content_type)
+    return val in ("animation", "animation_dialogue")
 
 
 def _saliency_weight_for_content(content_type, sal_score: float):
     """Return (weight, min_area) tuple for saliency regions, per content type.
 
     Table (from the spec):
-        TALKING_HEAD / CINEMATIC_DIALOGUE: 0.15 + 0.25·s, max 0.40, min_area 0.04
-        ANIMATION / GAMEPLAY:               0.30 + 0.60·s (legacy),   min_area 0.02
-        STREAM / MUSIC_VIDEO / GENERIC:     0.25 + 0.45·s, max 0.70, min_area 0.03
+        TALKING_HEAD / CINEMATIC_DIALOGUE / ANIMATION_DIALOGUE:
+            0.15 + 0.25·s, max 0.40, min_area 0.04
+        ANIMATION / GAMEPLAY:   0.30 + 0.60·s (legacy), min_area 0.02
+        STREAM / MUSIC_VIDEO / GENERIC: 0.25 + 0.45·s, max 0.70, min_area 0.03
     """
     val = getattr(content_type, "value", content_type) if content_type is not None else None
-    if val in ("talking_head", "cinematic_dialogue"):
+    if val in ("talking_head", "cinematic_dialogue", "animation_dialogue"):
         return (min(0.40, 0.15 + 0.25 * sal_score), 0.04)
     if val in ("animation", "gameplay"):
         return (0.30 + 0.60 * sal_score, 0.02)
@@ -167,6 +180,18 @@ def build_required_regions(
             sal_by_time[round(sf.timestamp, 2)] = sf
 
     dialogue_mode = _is_dialogue_mode(content_type)
+    animated_mode = _is_animated_mode(content_type)
+
+    # ── Lip-aperture promotion threshold ──
+    # Live-action neutral faces have lip_aperture ~0-0.03. Anime neutral
+    # expressions can sit around 0.05 (drawn open-mouth style), so a
+    # 0.05 threshold fires on listeners and wrongly promotes them. Bump
+    # to 0.09 for animated content and require ≥3 consecutive frames to
+    # hold before promoting (persist state across the per-frame loop).
+    lip_thr = 0.09 if animated_mode else 0.05
+    min_consec = 3 if animated_mode else 1
+    # identity_id → consecutive count of frames with lip_aperture > lip_thr
+    _lip_streak: dict = {}
 
     regions_per_frame = []
     _pre_merge_total = 0
@@ -176,6 +201,7 @@ def build_required_regions(
     _passive_no_speaker_count = 0
     _saliency_dropped_outside_face = 0
     _lead_room_applied = 0
+    _hard_floor_boosts = 0
 
     for ff in frame_faces:
         active_ev = _active_event_at(ff.timestamp)
@@ -198,6 +224,25 @@ def build_required_regions(
         )
 
         # ── Face regions (required tier) ──
+        # Update lip streak counters for this frame (per identity) before
+        # building regions, so the consecutive-frame rule can fire.
+        _seen_this_frame = set()
+        for face in ff.faces:
+            if not getattr(face, 'is_human', True):
+                continue
+            fid = getattr(face, 'identity_id', -1)
+            if fid < 0:
+                continue
+            _seen_this_frame.add(fid)
+            if getattr(face, 'lip_aperture', 0) > lip_thr:
+                _lip_streak[fid] = _lip_streak.get(fid, 0) + 1
+            else:
+                _lip_streak[fid] = 0
+        # Reset streak for any identity that wasn't in this frame
+        for fid in list(_lip_streak.keys()):
+            if fid not in _seen_this_frame:
+                _lip_streak[fid] = 0
+
         for face in ff.faces:
             if not getattr(face, 'is_human', True):
                 continue
@@ -206,8 +251,12 @@ def build_required_regions(
             # Lip-aperture override: only promote passive→active when no
             # other face in this frame already has identity_id == active_slot
             # (stops a laughing/yawning listener from shadow-promoting).
+            # For animated content the threshold is 0.09 and the face must
+            # have held open lips for ≥3 consecutive frames.
             if (not is_active
-                    and getattr(face, 'lip_aperture', 0) > 0.05
+                    and slot_id >= 0
+                    and getattr(face, 'lip_aperture', 0) > lip_thr
+                    and _lip_streak.get(slot_id, 0) >= min_consec
                     and not active_slot_visible_as_identity):
                 is_active = True
 
@@ -343,6 +392,22 @@ def build_required_regions(
                 if not _overlaps_any(candidate, frame_regions, 0.5):
                     frame_regions.append(candidate)
 
+        # ── Hard floor: active speaker weight >= 1.5 × max other face weight ──
+        # Guarantees the L1 camera solver's data term cannot pick a non-
+        # speaking face over a speaking one, regardless of relative bbox
+        # sizes. Only applies within the frame's face regions — saliency
+        # and object regions are unaffected.
+        face_regs = [r for r in frame_regions if r.source == "face"]
+        active_regs = [r for r in face_regs if r.is_active_speaker]
+        passive_regs = [r for r in face_regs if not r.is_active_speaker]
+        if active_regs and passive_regs:
+            max_other = max(r.weight for r in passive_regs)
+            floor = 1.5 * max_other
+            for ar in active_regs:
+                if ar.weight < floor:
+                    ar.weight = floor
+                    _hard_floor_boosts += 1
+
         _pre_merge_total += len(frame_regions)
         frame_regions = _merge_overlapping_features(frame_regions)
         _post_merge_total += len(frame_regions)
@@ -352,6 +417,12 @@ def build_required_regions(
         "[SpeakerV2] weights: active=%d passive_same_shot=%d passive_no_speaker=%d",
         _active_count, _passive_same_count, _passive_no_speaker_count,
     )
+    if _hard_floor_boosts > 0:
+        logger.info(
+            "[SpeakerV2] hard-floor boosted %d active-speaker weights "
+            "(>= 1.5x passive in-frame max)",
+            _hard_floor_boosts,
+        )
     if _saliency_dropped_outside_face > 0:
         logger.info(
             "[SaliencyV2] dialogue-mode gate dropped %d saliency regions outside face bboxes",

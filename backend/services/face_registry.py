@@ -690,6 +690,29 @@ def build_face_registry_with_embeddings(
             )
             return build_face_registry(face_results, min_appearances)
 
+    # ── Cross-shot merge sanity check ──
+    # Any embedding slot whose x-position spans >60% of the frame across
+    # >30 detected frames is almost certainly a cross-shot merge — one
+    # "identity" that's actually several different people or the same
+    # person appearing at wildly different positions in unrelated shots.
+    # When >25% of slots fail this check, the embedding registry is
+    # corrupted (typical for multi-character anime / TV drama) and we
+    # fall back to position-based clustering.
+    if slots:
+        wide_span_bad = [
+            s for s in slots
+            if (s.x_max - s.x_min) > 60 and s.frame_count > 30
+        ]
+        bad_frac = len(wide_span_bad) / max(len(slots), 1)
+        if bad_frac > 0.25:
+            pos_reg = build_face_registry(face_results, min_appearances)
+            logger.warning(
+                "[FaceRegistry] embedding slots rejected: %d of %d had span>60%% "
+                "and frame_count>30, falling back to position-based (%d slots)",
+                len(wide_span_bad), len(slots), len(pos_reg.slots),
+            )
+            return pos_reg
+
     # Take max(embedding_count, position_count): whichever finds more identities wins.
     # Embeddings are the primary source of truth, but position-based may catch
     # speakers that the embedding clusterer missed (e.g., no embeddings available).

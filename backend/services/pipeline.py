@@ -1284,8 +1284,9 @@ async def _run_analysis_inner(job_id: str):
                 # (if available) as a sanity check. Large discrepancies suggest
                 # the registry is undercounting.
                 transcript_speakers = set()
-                if transcript_result:
-                    for seg in transcript_result:
+                _trx_for_sanity = transcript if 'transcript' in dir() else None
+                if _trx_for_sanity:
+                    for seg in _trx_for_sanity:
                         spk = getattr(seg, 'speaker', None)
                         if spk:
                             transcript_speakers.add(spk)
@@ -3128,6 +3129,12 @@ async def _run_analysis_inner(job_id: str):
                     from backend.services.layout_engine import plan_layout
 
                     # ── Content-type classification for solver tuning ──
+                    # IMPORTANT: _clip_content_type must flow to plan_layout
+                    # unconditionally so the downstream per-content-type
+                    # branches (saliency downrank, speaker weight rules,
+                    # CINEMATIC_DIALOGUE / ANIMATION_DIALOGUE routing) can
+                    # activate. The CLIPAI_CONTENT_ROUTING env var gates
+                    # only the extra conditional object/saliency detection.
                     _clip_content_type = None
                     _solver_objects = None
                     _solver_saliency = None
@@ -3135,7 +3142,7 @@ async def _run_analysis_inner(job_id: str):
                     _enabled_types = os.environ.get("CLIPAI_CONTENT_TYPES_ENABLED", "").lower().split(",")
                     _enabled_types = [t.strip() for t in _enabled_types if t.strip()]
 
-                    if _content_routing == "on" and _content_profile:
+                    if _content_profile:
                         try:
                             from backend.services.content_classifier import classify_clip, ClipContentType
                             _clip_content_type = classify_clip(
@@ -3154,9 +3161,10 @@ async def _run_analysis_inner(job_id: str):
                                 _clip_content_type = ClipContentType.GENERIC
 
                             # Conditional object/saliency detection by content type
-                            if _clip_content_type in (
-                                ClipContentType.ANIMATION, ClipContentType.MUSIC_VIDEO,
-                                ClipContentType.GENERIC,
+                            # (still gated behind CLIPAI_CONTENT_ROUTING=on)
+                            if _content_routing == "on" and _clip_content_type in (
+                                ClipContentType.ANIMATION, ClipContentType.ANIMATION_DIALOGUE,
+                                ClipContentType.MUSIC_VIDEO, ClipContentType.GENERIC,
                             ):
                                 try:
                                     from backend.services.object_detector import detect_objects_in_frames
@@ -3167,9 +3175,9 @@ async def _run_analysis_inner(job_id: str):
                                 except Exception as _oe:
                                     logger.warning("[%s] Content-routed object detection failed: %s", job_id, _oe)
 
-                            if _clip_content_type in (
-                                ClipContentType.ANIMATION, ClipContentType.MUSIC_VIDEO,
-                                ClipContentType.GAMEPLAY,
+                            if _content_routing == "on" and _clip_content_type in (
+                                ClipContentType.ANIMATION, ClipContentType.ANIMATION_DIALOGUE,
+                                ClipContentType.MUSIC_VIDEO, ClipContentType.GAMEPLAY,
                             ):
                                 try:
                                     from backend.services.saliency_tracker import track_saliency_in_frames
