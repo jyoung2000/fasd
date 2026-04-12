@@ -260,6 +260,24 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
     });
 
     // ── Items (clips) ──
+    // Precompute each item's next sibling start (on same track) so we can
+    // cap the minimum render width without visually overlapping neighbors.
+    const nextSiblingStartByItemId = {};
+    {
+      const byTrackSorted = {};
+      for (const it of items) {
+        (byTrackSorted[it.trackId] || (byTrackSorted[it.trackId] = [])).push(it);
+      }
+      for (const trackItems of Object.values(byTrackSorted)) {
+        trackItems.sort((a, b) => a.start - b.start);
+        for (let i = 0; i < trackItems.length; i++) {
+          nextSiblingStartByItemId[trackItems[i].id] = i + 1 < trackItems.length
+            ? trackItems[i + 1].start
+            : Infinity;
+        }
+      }
+    }
+
     items.forEach((item) => {
       const trackIdx = tracks.findIndex((t) => t.id === item.trackId);
       if (trackIdx < 0) return;
@@ -280,11 +298,19 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
       const isSelected = item.id === selectedItemId;
       const isMultiSelected = selectedItemIds.includes(item.id);
 
-      // Clip body — enforce minimum visual width so short items stay rectangles
+      // Clip body — enforce minimum visual width of 4px for visibility, but
+      // cap against the next sibling's start position so short adjacent
+      // items never visually overlap each other.
       ctx.fillStyle = (isSelected || isMultiSelected) ? color + 'DD' : color + '77';
       const rr = 4;
       const clipX = Math.max(x1, contentLeft);
-      const clipW = Math.max(Math.min(w, canvasW - clipX), 6);
+      const nextSiblingStart = nextSiblingStartByItemId[item.id];
+      const maxRightX = nextSiblingStart !== undefined && nextSiblingStart !== Infinity
+        ? contentLeft + nextSiblingStart * pps - sx
+        : canvasW;
+      const availableW = Math.max(0, maxRightX - clipX);
+      const actualW = Math.min(w, canvasW - clipX);
+      const clipW = Math.min(Math.max(actualW, 4), availableW || actualW);
       ctx.beginPath();
       ctx.roundRect(clipX, y + 2, clipW, TRACK_HEIGHT - 4, rr);
       ctx.fill();
@@ -378,13 +404,29 @@ export default function Timeline({ compact = false, onSeek, onItemSelect, onSubt
           ctx.rect(0, cy, canvasW, TRACK_HEIGHT);
           ctx.clip();
 
+          // Precompute next-segment start times so min-width clamping doesn't
+          // cause adjacent crop segments to visually overlap each other.
+          const cropsSorted = [...cropSegments].sort((a, b) => a.startTime - b.startTime);
+          const nextCropStartById = {};
+          for (let i = 0; i < cropsSorted.length; i++) {
+            nextCropStartById[cropsSorted[i].id] = i + 1 < cropsSorted.length
+              ? cropsSorted[i + 1].startTime
+              : Infinity;
+          }
+
           cropSegments.forEach((seg) => {
             const cx1 = contentLeft + seg.startTime * pps - sx;
             const cx2 = contentLeft + seg.endTime * pps - sx;
             const cw = cx2 - cx1;
             if (cx2 < contentLeft || cx1 > canvasW) return;
             const clipCX = Math.max(cx1, contentLeft);
-            const clipCW = Math.max(Math.min(cw, canvasW - clipCX), 6);
+            const nextStart = nextCropStartById[seg.id];
+            const maxRightCX = nextStart !== undefined && nextStart !== Infinity
+              ? contentLeft + nextStart * pps - sx
+              : canvasW;
+            const availableCW = Math.max(0, maxRightCX - clipCX);
+            const actualCW = Math.min(cw, canvasW - clipCX);
+            const clipCW = Math.min(Math.max(actualCW, 4), availableCW || actualCW);
 
             // Color by cluster or manual override
             const clrIdx = seg.isManualOverride ? 4 : Math.max(0, seg.clusterId);

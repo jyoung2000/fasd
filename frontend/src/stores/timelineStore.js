@@ -274,10 +274,23 @@ function enforceNoOverlapsMiddleware(config) {
             if (itemsNeedFix) console.warn('[TimelineStore] Overlap detected in items — auto-fixing');
             if (cropsNeedFix) console.warn('[TimelineStore] Overlap detected in cropSegments — auto-fixing');
           }
-          set((s) => {
-            if (itemsNeedFix) resolveAllOverlaps(s.items);
-            if (cropsNeedFix) resolveAllCropOverlaps(s.cropSegments);
-          });
+          // IMPORTANT: `set` here is the outer (temporal) set, NOT the immer
+          // producer. A function that mutates in place and returns undefined
+          // is a no-op from Zustand's point of view and won't trigger
+          // re-renders. We must build NEW arrays and return them as a
+          // partial state update so Zustand detects the change.
+          const update = {};
+          if (itemsNeedFix) {
+            const newItems = state.items.map((it) => ({ ...it }));
+            resolveAllOverlaps(newItems);
+            update.items = newItems;
+          }
+          if (cropsNeedFix) {
+            const newCrops = state.cropSegments.map((c) => ({ ...c }));
+            resolveAllCropOverlaps(newCrops);
+            update.cropSegments = newCrops;
+          }
+          set(update);
         }
       },
       get,
