@@ -11,6 +11,13 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# Set to True by _verify_faces_in_results when the human-verifier
+# rejection rate exceeds 50% (anime/cartoon signature). The content
+# classifier reads this to force is_animated=True on the ContentProfile
+# so downstream routing can pick ANIMATION_DIALOGUE. Reset to False at
+# the start of each detect_faces_batch call.
+ANIME_MODE_DETECTED = False
+
 
 @dataclass
 class FaceInfo:
@@ -647,6 +654,7 @@ def _verify_faces_in_results(results: list, frame_paths: list) -> list:
     _allow_anim_auto = _os.environ.get(
         "ALLOW_ANIMATED_AUTO_DETECT", "true",
     ).lower() in ("true", "1", "yes")
+    global ANIME_MODE_DETECTED
     if _allow_anim_auto and verified > 0 and (non_human / verified) > 0.5:
         _restored = 0
         for fr in results:
@@ -655,11 +663,14 @@ def _verify_faces_in_results(results: list, frame_paths: list) -> list:
                     face.is_human = True
                     face.pose_confidence = 1.0
                     _restored += 1
+        ANIME_MODE_DETECTED = True
         logger.info(
             "[AnimeMode] skipping human verifier, kept %d faces at weight=1.0 "
             "(rejection rate %.0f%% > 50%% — presumed animated content)",
             verified, non_human / verified * 100,
         )
+    else:
+        ANIME_MODE_DETECTED = False
 
     return results
 

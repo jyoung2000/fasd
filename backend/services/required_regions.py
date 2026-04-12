@@ -115,6 +115,67 @@ def _is_animated_mode(content_type) -> bool:
     return val in ("animation", "animation_dialogue")
 
 
+@dataclass
+class _FrameSaliencyAdapter:
+    """FrameSaliency-compatible wrapper built from a group of
+    SaliencyRegion objects sharing a timestamp.
+
+    `blobs` is a list of (x, y, w, h) tuples in normalized 0-1
+    coordinates with top-left origin — exactly the shape
+    build_required_regions expects from saliency_detector's
+    FrameSaliency output.
+    """
+    timestamp: float
+    blobs: List[tuple]
+    mean_score: float
+
+
+def _saliency_regions_to_frame_saliency(saliency_regions: list) -> list:
+    """Group a flat list of SaliencyRegion objects (from
+    saliency_tracker.track_saliency_in_frames) into per-frame
+    FrameSaliency-compatible adapters.
+
+    SaliencyRegion coordinates are percentages (0-100) centered on the
+    bbox. FrameSaliency consumers expect normalized 0-1 top-left
+    (x, y, w, h). We convert and keep the top-3 regions per frame by
+    saliency_score to cap per-frame saliency noise.
+
+    Returns an empty list if the input isn't the expected shape —
+    callers can then treat it as a no-op fallback.
+    """
+    if not saliency_regions:
+        return []
+    # Duck-type: SaliencyRegion has .x/.y/.w/.h/.saliency_score attrs.
+    first = saliency_regions[0]
+    if not all(hasattr(first, a) for a in ("x", "y", "w", "h", "saliency_score")):
+        return []
+
+    by_ts: dict = {}
+    for sr in saliency_regions:
+        key = round(float(sr.timestamp), 2)
+        by_ts.setdefault(key, []).append(sr)
+
+    adapters: list = []
+    for ts, regs in by_ts.items():
+        regs.sort(key=lambda r: float(r.saliency_score), reverse=True)
+        top = regs[:3]
+        blobs = []
+        score_sum = 0.0
+        for r in top:
+            # Center-origin percent → top-left-origin normalized 0-1.
+            w_norm = float(r.w) / 100.0
+            h_norm = float(r.h) / 100.0
+            x_norm = max(0.0, float(r.x) / 100.0 - w_norm / 2.0)
+            y_norm = max(0.0, float(r.y) / 100.0 - h_norm / 2.0)
+            blobs.append((x_norm, y_norm, w_norm, h_norm))
+            score_sum += float(r.saliency_score)
+        mean_score = score_sum / max(len(top), 1)
+        adapters.append(_FrameSaliencyAdapter(
+            timestamp=ts, blobs=blobs, mean_score=mean_score,
+        ))
+    return adapters
+
+
 def _saliency_weight_for_content(content_type, sal_score: float):
     """Return (weight, min_area) tuple for saliency regions, per content type.
 
@@ -139,6 +200,7 @@ def build_required_regions(
     frame_objects: list = None,
     frame_saliency: list = None,
     content_type=None,
+    shot_cuts: list = None,
 ) -> List[List[RequiredRegion]]:
     """Return per-frame lists of required regions.
 
@@ -151,9 +213,15 @@ def build_required_regions(
         active_speaker_events: active speaker timeline
         frame_objects: list[list[ObjectDetection]] — one list per frame,
             or flat list indexed by timestamp
-        frame_saliency: list[FrameSaliency] from saliency_detector
+        frame_saliency: list[FrameSaliency] from saliency_detector OR a
+            flat list[SaliencyRegion] from saliency_tracker (both shapes
+            are accepted; SaliencyRegion lists are auto-converted to
+            FrameSaliency-compatible adapters).
         content_type: ClipContentType for per-type weighting / saliency
             downrank / lead-room bias.
+        shot_cuts: optional list of shot-cut timestamps. When provided
+            the dense AttentionAnchor stream (dialogue modes) uses them
+            to break the boxcar smoother at cut boundaries.
 
     Returns:
         list of lists — one inner list per frame.
@@ -173,14 +241,60 @@ def build_required_regions(
             key = round(getattr(obj, 'timestamp', 0), 2)
             obj_by_time.setdefault(key, []).append(obj)
 
-    # Index saliency by rounded timestamp
+    # Index saliency by rounded timestamp.
+    #
+    # `frame_saliency` may arrive as:
+    #   (a) a flat list[SaliencyRegion] from saliency_tracker
+    #       (.x/.y/.w/.h/.saliency_score in 0-100 percent), or
+    #   (b) a list of FrameSaliency-like objects from saliency_detector
+    #       (already have .blobs as 0-1 top-left tuples and .mean_score).
+    #
+    # When we receive (a) we convert to (b) so the existing .blobs
+    # consumer below just works. Without this conversion the sal_by_time
+    # index silently produces zero saliency regions.
     sal_by_time = {}
-    if frame_saliency:
-        for sf in frame_saliency:
+    _fs_used = frame_saliency
+    if _fs_used:
+        _first = _fs_used[0] if len(_fs_used) > 0 else None
+        _has_blobs = _first is not None and hasattr(_first, "blobs")
+        if not _has_blobs:
+            _converted = _saliency_regions_to_frame_saliency(_fs_used)
+            if _converted:
+                _fs_used = _converted
+                logger.info(
+                    "[SaliencyFallback] generated %d frame_saliency entries "
+                    "from saliency_regions",
+                    len(_converted),
+                )
+    if _fs_used:
+        for sf in _fs_used:
             sal_by_time[round(sf.timestamp, 2)] = sf
 
     dialogue_mode = _is_dialogue_mode(content_type)
     animated_mode = _is_animated_mode(content_type)
+
+    # ── Attention anchor stream ──
+    # For dialogue modes (live-action and animated), build a dense
+    # per-frame AttentionAnchor timeline so frames with no face
+    # RequiredRegion still have *something* for the camera solver to
+    # anchor on. This is the Opus-level fallback: bridge faces across
+    # 1.5s gaps, fall back to saliency peaks, and never leave a frame
+    # without an anchor in the long run.
+    anchor_by_time: dict = {}
+    if dialogue_mode and frame_faces:
+        try:
+            from backend.services.attention_anchor import build_attention_anchors
+            _anchors = build_attention_anchors(
+                frame_faces=frame_faces,
+                active_speaker_events=active_speaker_events,
+                frame_saliency=_fs_used,
+                shot_cuts=shot_cuts,
+            )
+            for a in _anchors:
+                anchor_by_time[round(a.timestamp, 2)] = a
+        except Exception as _ae:
+            logger.info("[AnchorStream] build failed (non-fatal): %s", _ae)
+            anchor_by_time = {}
 
     # ── Lip-aperture promotion threshold ──
     # Live-action neutral faces have lip_aperture ~0-0.03. Anime neutral
@@ -407,6 +521,26 @@ def build_required_regions(
                 if ar.weight < floor:
                     ar.weight = floor
                     _hard_floor_boosts += 1
+
+        # ── Attention anchor fallback (dialogue modes) ──
+        # If no face RequiredRegion survived for this frame, promote the
+        # dense AttentionAnchor to a required region so the camera
+        # solver always has something to lock onto. Without this the
+        # crop drifts onto background motion during faceless action
+        # beats (the primary symptom from the K S01E12 sanity run).
+        if dialogue_mode and not any(r.source == "face" for r in frame_regions):
+            anchor = anchor_by_time.get(ts_key)
+            if anchor is not None:
+                frame_regions.append(RequiredRegion(
+                    timestamp=ff.timestamp,
+                    cx=anchor.cx, cy=anchor.cy,
+                    half_width=anchor.half_width, half_height=anchor.half_height,
+                    score=max(0.3, min(0.9, 0.3 + 0.5 * anchor.confidence)),
+                    tier="required",
+                    source="saliency" if anchor.source in ("saliency_peak",) else "face",
+                    weight=max(0.3, min(0.9, 0.3 + 0.5 * anchor.confidence)),
+                    is_active_speaker=False,
+                ))
 
         _pre_merge_total += len(frame_regions)
         frame_regions = _merge_overlapping_features(frame_regions)

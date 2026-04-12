@@ -307,16 +307,49 @@ def classify_content(
         signals["cumulative_speech_first_120s"] = round(cumulative_speech_seconds, 1)
 
     # ── Animation detection ──
-    # Set is_animated=True when ANIME was voted OR scene descriptions
-    # contain enough anime keywords to be confident. This drives
-    # ANIMATION_DIALOGUE routing downstream and tells the face pipeline
-    # to skip the human-proportions verifier (anime proportions fail it).
+    # Set is_animated=True when:
+    #   (a) face_detector.ANIME_MODE_DETECTED is already True (the
+    #       human-verifier rejection rate exceeded 50% — the most
+    #       reliable anime signal, computed at detection time), OR
+    #   (b) ContentType.ANIME was voted by the score heuristics, OR
+    #   (c) scene descriptions contain ≥3 anime keywords.
+    #
+    # Inheriting the face-detector signal prevents the regression where
+    # AnimeMode fires in face_detector but the classifier emits
+    # `unknown` (low confidence / no scene_desc_anime votes) and
+    # downstream saliency downranking stays disabled.
     is_animated = False
-    if profile.content_type == ContentType.ANIME.value:
+    anime_mode_inherited = False
+    try:
+        from backend.services.face_detector import ANIME_MODE_DETECTED
+        if ANIME_MODE_DETECTED:
+            is_animated = True
+            anime_mode_inherited = True
+            signals["anime_mode_from_detector"] = True
+    except Exception:
+        pass
+    if not is_animated and profile.content_type == ContentType.ANIME.value:
         is_animated = True
-    elif signals.get("scene_desc_anime", 0) >= 3:
+    elif not is_animated and signals.get("scene_desc_anime", 0) >= 3:
         is_animated = True
         signals["animated_by_scene_desc"] = True
+
+    # When AnimeMode was inherited from the detector but the content
+    # type heuristic bailed to UNKNOWN (low confidence, no keyword
+    # votes), promote UNKNOWN → NARRATIVE so downstream mapping takes
+    # the narrative branch and can land on ANIMATION_DIALOGUE in
+    # classify_clip(). We don't touch other classifications.
+    if (anime_mode_inherited
+            and profile.content_type == ContentType.UNKNOWN.value):
+        profile.content_type = ContentType.NARRATIVE.value
+        if profile.confidence < 0.25:
+            profile.confidence = 0.25
+        signals["anime_promoted_unknown_to_narrative"] = True
+        logger.info(
+            "[%s] ContentClassifier: anime_mode_inherited=True → NARRATIVE "
+            "(promoted from UNKNOWN for ANIMATION_DIALOGUE routing)",
+            job_id,
+        )
 
     profile.signals = signals
     profile.is_cinematic_dialogue = is_cinematic_dialogue
@@ -365,15 +398,23 @@ def classify_clip(
         if getattr(content_profile, "is_cinematic_dialogue", False):
             base_type = ClipContentType.CINEMATIC_DIALOGUE
         # Animated narrative → ANIMATION_DIALOGUE (talking anime characters).
-        # This takes priority over CINEMATIC_DIALOGUE and uses the same
-        # saliency downrank rules, since the dialogue framing conventions
-        # (don't drift onto background motion) apply identically.
+        # Applies the same saliency downrank + attention-anchor fallback
+        # rules as CINEMATIC_DIALOGUE since the framing conventions (don't
+        # drift onto background motion, hold on faces, bridge across gaps)
+        # apply identically. We route to ANIMATION_DIALOGUE whenever
+        # is_animated=True EXCEPT for legitimately non-narrative modes
+        # (GAMEPLAY, STREAM, MUSIC_VIDEO) where the animation signal is
+        # incidental and those layouts have their own rules.
         if getattr(content_profile, "is_animated", False):
-            if getattr(content_profile, "is_cinematic_dialogue", False):
+            if base_type in (
+                ClipContentType.GENERIC,
+                ClipContentType.CINEMATIC_DIALOGUE,
+                ClipContentType.TALKING_HEAD,
+            ):
                 base_type = ClipContentType.ANIMATION_DIALOGUE
-            elif base_type == ClipContentType.GENERIC:
-                # Raw anime without dialogue signals — standard animation.
-                base_type = ClipContentType.ANIMATION
+                logger.info(
+                    "[ContentClassifier] anime_mode_inherited=True → ANIMATION_DIALOGUE",
+                )
 
     # STREAM override: gameplay HUD + corner facecam
     if persistent_regions:

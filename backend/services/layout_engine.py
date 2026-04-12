@@ -404,12 +404,17 @@ def _plan_layout_impl(
     logger.info("[%s] plan_layout: %d shots detected (threshold=%.0f)",
                 job_id, len(shots), shot_threshold)
 
+    # Extract shot cut timestamps for the AttentionAnchor stream so the
+    # boxcar smoother breaks at each cut.
+    _shot_cut_times = [float(getattr(s, "start", 0.0)) for s in shots if getattr(s, "start", 0.0) > 0]
+
     # 2. Build required regions (with optional object/saliency fusion)
     regions = build_required_regions(
         frame_faces, active_speaker_events,
         frame_objects=frame_objects,
         frame_saliency=frame_saliency,
         content_type=content_type,
+        shot_cuts=_shot_cut_times,
     )
 
     # Promote preferred → required for frames with no faces

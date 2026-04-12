@@ -2576,6 +2576,9 @@ async def _run_analysis_inner(job_id: str):
     # ── Reframe Segmenter (replaces per-second synthesis when enabled) ──
     _reframe_segments_used = False
     _pacing_estimator = None
+    # Hoisted so both AUTOFLIP and REFRAME_SEGMENTER branches can reference it
+    # without UnboundLocalError when the AUTOFLIP path doesn't execute.
+    _interpolated_timeline = None
     _has_speaker_data = active_speaker_events or transcript_speaker_events
     USE_AUTOFLIP_REFRAME = os.environ.get("USE_AUTOFLIP_REFRAME", "false").lower() in ("true", "1", "yes")
     if dense_face_results and face_registry and scenes and _has_speaker_data:
@@ -2615,7 +2618,6 @@ async def _run_analysis_inner(job_id: str):
 
                 # ── Dense Propagation (optional, behind feature flag) ──
                 USE_DENSE_PROPAGATION = os.environ.get("USE_DENSE_PROPAGATION", "false").lower() in ("true", "1", "yes")
-                _interpolated_timeline = None
                 if USE_DENSE_PROPAGATION and dense_face_results and frames:
                     try:
                         from backend.services.dense_propagator import build_interpolated_timeline
