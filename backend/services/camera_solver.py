@@ -25,9 +25,37 @@ CROP_ASPECT = 9.0 / 16.0
 
 class CameraMode(str, Enum):
     STATIONARY = "stationary"
+    # v4: stationary crop with a discrete zoom-out (1.1× / 1.2× / 1.3×)
+    # so the union bbox of all required regions in the shot fits without
+    # falling back to PADDED. Solver still emits a constant-position
+    # crop, just at a wider width.
+    STATIONARY_ZOOMED = "stationary_zoomed"
     PANNING = "panning"
     TRACKING = "tracking"
     PADDED = "padded"
+
+
+# v4: discrete zoom-out steps for STATIONARY_ZOOMED. The crop stays
+# rectangular at 9:16, but we use 1.1×, 1.2×, or 1.3× the base crop
+# width to absorb wider unions. We never go beyond 1.3 because that's
+# where the framing stops looking intentional and starts looking like
+# we lost confidence in the subject.
+STATIONARY_ZOOM_STEPS = (1.1, 1.2, 1.3)
+STATIONARY_ZOOM_SAFETY = 0.95  # 5% safety margin inside crop width
+
+# v4: L1 path solver controls.
+# Held-still threshold: a frame counts as "held" when its cx differs
+# from the previous frame by less than this fraction of the crop width.
+# 0.005 of crop ≈ 1px on a 1920×1080 source — well below detectable
+# motion but above floating-point noise.
+L1_HELD_STILL_TOL = 0.005
+
+# Default content-aware sample rate for L1 timelines (frames per second).
+# Lower than the source 24/30 fps because the AttentionAnchor stream is
+# already smoothed and we don't need finer granularity than the underlying
+# anchor density. 6 fps gives smooth motion while keeping LP variable
+# count modest (~150 vars for a 25s shot).
+L1_TARGET_FPS = 6.0
 
 
 # ── Per-content-type solver tuning ──
@@ -116,6 +144,11 @@ class ShotCamera:
     keyframes: List[tuple] = field(default_factory=list)
     # Each keyframe: (timestamp, cx_normalized, cy_normalized)
     reason: str = ""  # why this mode was chosen
+    # v4: For STATIONARY_ZOOMED, the discrete zoom-out factor
+    # (1.0 = no zoom, 1.1/1.2/1.3 = wider crop). Other modes leave
+    # this at 1.0. The downstream renderer multiplies the base crop
+    # width by this to produce the actual crop rectangle.
+    zoom: float = 1.0
 
     def to_dict(self) -> dict:
         return {
@@ -126,7 +159,172 @@ class ShotCamera:
             "keyframes": [(round(t, 3), round(cx, 4), round(cy, 4))
                           for t, cx, cy in self.keyframes],
             "reason": self.reason,
+            "zoom": round(self.zoom, 3),
         }
+
+
+@dataclass
+class _UnionBBox:
+    """Normalized 1D union bbox of all required regions in a shot."""
+    left: float
+    right: float
+    cx: float
+    width: float
+    cy: float    # mean of region cy values
+    n_regions: int
+
+
+def compute_union_bbox(regions: list) -> _UnionBBox:
+    """Compute the union (min-left, max-right) bbox of a list of regions.
+
+    Each region is expected to expose .cx, .half_width, .cy.
+    Returns a _UnionBBox with normalized 0-1 coordinates.
+    """
+    if not regions:
+        return _UnionBBox(left=0.5, right=0.5, cx=0.5, width=0.0, cy=0.5, n_regions=0)
+    lefts = [float(r.cx) - float(r.half_width) for r in regions]
+    rights = [float(r.cx) + float(r.half_width) for r in regions]
+    cys = [float(getattr(r, "cy", 0.5)) for r in regions]
+    left = min(lefts)
+    right = max(rights)
+    cx = (left + right) / 2.0
+    return _UnionBBox(
+        left=left, right=right, cx=cx,
+        width=right - left,
+        cy=sum(cys) / len(cys),
+        n_regions=len(regions),
+    )
+
+
+def is_monotonic(timeline: list, tolerance: float = 0.05) -> bool:
+    """True if cx in `timeline` moves monotonically across the shot.
+
+    Args:
+        timeline: list of (timestamp, cx) pairs, normalized cx in 0-1.
+            Must be sorted by timestamp by the caller.
+        tolerance: max deviation from a least-squares linear fit. A
+            timeline that's mostly linear with small wobbles still
+            counts as monotonic.
+
+    Returns:
+        True if either (a) cx is non-decreasing or non-increasing
+        throughout, or (b) the residual from a linear fit stays within
+        `tolerance` everywhere.
+    """
+    if len(timeline) < 3:
+        return False
+    cxs = [float(c) for _, c in timeline]
+    # Strict monotonic check first — cheap and exact.
+    nondec = all(cxs[i] >= cxs[i - 1] - 1e-9 for i in range(1, len(cxs)))
+    nonincr = all(cxs[i] <= cxs[i - 1] + 1e-9 for i in range(1, len(cxs)))
+    if nondec or nonincr:
+        return True
+    # Soft check: linear fit residual within tolerance.
+    ts = np.array([float(t) for t, _ in timeline])
+    xs = np.array(cxs)
+    if ts[-1] == ts[0]:
+        return False
+    t_norm = (ts - ts[0]) / (ts[-1] - ts[0])
+    A = np.vstack([np.ones_like(t_norm), t_norm]).T
+    try:
+        coeffs, *_ = np.linalg.lstsq(A, xs, rcond=None)
+    except Exception:
+        return False
+    pred = A @ coeffs
+    max_dev = float(np.max(np.abs(xs - pred)))
+    return max_dev <= tolerance
+
+
+def _l1_track_keyframes(
+    per_frame_bounds: list,
+    crop_half_width: float,
+    job_id: str = "",
+    shot_index: int = -1,
+) -> tuple:
+    """Solve a piecewise-linear L1 camera path through per-frame bounds.
+
+    Reuses backend.services._autoflip_lp.solve_autoflip_lp (the existing
+    HiGHS-backed LP solver with velocity / accel / jerk penalties from
+    the AutoFlip paper), giving us the AutoFlip "hold still, snap, hold
+    still" path signature for free instead of the legacy exponential
+    smoother that produced continuous wiggle.
+
+    Args:
+        per_frame_bounds: list of dicts with keys t, left, right, center, cy.
+        crop_half_width: normalized 0-1 half-width of the output crop.
+        job_id: for telemetry.
+        shot_index: for telemetry.
+
+    Returns:
+        (keyframes, status, held_still_fraction)
+        - keyframes: list[(t, cx, cy)] with the solved path.
+        - status: "success" or "failed"
+        - held_still_fraction: fraction of inter-frame transitions where
+          |cx[i] - cx[i-1]| < L1_HELD_STILL_TOL. High = quasi-stationary.
+    """
+    n = len(per_frame_bounds)
+    if n == 0:
+        return [], "failed", 0.0
+
+    # Targets are the per-frame union centers, expressed as the LP's
+    # native variable space (we'll use normalized 0-1 throughout to keep
+    # the numbers small and stable). The LP solver doesn't care about
+    # absolute scale.
+    targets = [float(b["center"]) for b in per_frame_bounds]
+    # Per-frame hard bounds: cx must place the crop so that
+    #   left  >= cx - half_width   →   cx <= left + half_width
+    #   right <= cx + half_width   →   cx >= right - half_width
+    lo = []
+    hi = []
+    for b in per_frame_bounds:
+        lo_i = float(b["right"]) - crop_half_width
+        hi_i = float(b["left"]) + crop_half_width
+        # Clamp to valid frame range
+        lo_i = max(crop_half_width, lo_i)
+        hi_i = min(1.0 - crop_half_width, hi_i)
+        if lo_i > hi_i:
+            return [], "failed", 0.0
+        lo.append(lo_i)
+        hi.append(hi_i)
+
+    try:
+        from backend.services._autoflip_lp import solve_autoflip_lp
+        # lam2/lam3/lam4: bias toward holding still. The 0-1 normalized
+        # space is ~600× smaller than the pixel space the LP was tuned
+        # for, so we scale weights up to keep the velocity/accel terms
+        # competitive with the data fidelity term.
+        solved = solve_autoflip_lp(
+            targets, lo, hi,
+            lam1=1.0, lam2=20.0, lam3=100.0, lam4=100.0,
+        )
+    except Exception as exc:
+        logger.warning(
+            "[%s] [L1Path] shot %d: solver failed: %s",
+            job_id, shot_index, exc,
+        )
+        return [], "failed", 0.0
+
+    if not solved or len(solved) != n:
+        logger.warning(
+            "[%s] [L1Path] shot %d: solver returned wrong shape %s",
+            job_id, shot_index,
+            "None" if not solved else f"len={len(solved)} expected {n}",
+        )
+        return [], "failed", 0.0
+
+    # Final clamp + held-still measurement.
+    held = 0
+    keyframes = []
+    last_cx = None
+    for i, b in enumerate(per_frame_bounds):
+        cx = max(crop_half_width, min(1.0 - crop_half_width, float(solved[i])))
+        if last_cx is not None and abs(cx - last_cx) < L1_HELD_STILL_TOL:
+            held += 1
+        last_cx = cx
+        keyframes.append((float(b["t"]), cx, float(b["cy"])))
+
+    held_frac = held / max(n - 1, 1)
+    return keyframes, "success", held_frac
 
 
 def solve_shot(
@@ -134,14 +332,27 @@ def solve_shot(
     regions_per_frame: list,
     source_aspect: float,
     params: Optional[SolverParams] = None,
+    job_id: str = "",
 ) -> ShotCamera:
-    """Pick the simplest camera mode for a single shot.
+    """Pick the AutoFlip-style camera mode for a single shot.
+
+    v4 union-bbox flow:
+        TEST 1: union fits stationary crop                 → STATIONARY
+        TEST 2: trajectory is monotonic                    → TRACKING (L1)
+        TEST 3: union fits with discrete zoom-out 1.1-1.3  → STATIONARY_ZOOMED
+        TEST 4: any feasible smoothed trajectory            → PANNING (L1)
+        FALLBACK: zero required regions                    → PADDED
+
+    PADDED is now reserved for shots with literally no data — the v4
+    target is <5% of shots, down from ~18% in v3. Wider unions get
+    absorbed by STATIONARY_ZOOMED instead of letterboxing.
 
     Args:
         shot: Shot dataclass with .index, .start, .end
         regions_per_frame: list of list[RequiredRegion] from required_regions.py
         source_aspect: width/height of source video (e.g. 16/9 = 1.778)
         params: Content-type-specific solver parameters (None = generic defaults)
+        job_id: for telemetry.
 
     Returns:
         ShotCamera with mode and keyframes.
@@ -149,7 +360,7 @@ def solve_shot(
     if params is None:
         params = _DEFAULT_PARAMS
 
-    # Filter to just this shot's frames — use only "required" tier regions
+    # Filter to this shot's frames; prefer "required" tier, fall back to all.
     shot_frames = []
     for regs in regions_per_frame:
         if not regs or not (shot.start <= regs[0].timestamp <= shot.end):
@@ -158,46 +369,49 @@ def solve_shot(
         if required:
             shot_frames.append(required)
         elif regs:
-            # No required regions — use all (preferred gets a chance)
             shot_frames.append(regs)
 
     if not shot_frames:
+        # PADDED: literally no signal. Should be rare with v4 wiring.
         return ShotCamera(
             shot_index=shot.index, start=shot.start, end=shot.end,
-            mode=CameraMode.STATIONARY,
-            keyframes=[(shot.start, 0.5, 0.5), (shot.end, 0.5, 0.5)],
-            reason="no_face_data_center_default",
+            mode=CameraMode.PADDED,
+            keyframes=[],
+            reason="no_required_regions_in_shot",
         )
 
-    # Max crop half-width in normalized source coords.
+    # Max crop half-width in normalized 0-1 source coords.
     # At 16:9 source, a 9:16 crop taking full source height:
-    #   width = (9/16) / (16/9) = 0.316
+    #   width = (9/16) / (16/9) ≈ 0.316
     crop_half_width = (CROP_ASPECT / source_aspect) / 2.0
+    crop_w_needed = crop_half_width * 2.0
 
-    # Per-frame required-region union bbox (just x-axis)
+    # Per-frame x-axis bounds + the shot-wide union bbox.
     per_frame_bounds = []
+    all_regions: list = []
     for regs in shot_frames:
-        lefts = [r.cx - r.half_width for r in regs]
-        rights = [r.cx + r.half_width for r in regs]
+        lefts = [float(r.cx) - float(r.half_width) for r in regs]
+        rights = [float(r.cx) + float(r.half_width) for r in regs]
         per_frame_bounds.append({
             "t": regs[0].timestamp,
             "left": min(lefts),
             "right": max(rights),
             "center": (min(lefts) + max(rights)) / 2,
             "width": max(rights) - min(lefts),
-            "cy": sum(r.cy for r in regs) / len(regs),
+            "cy": sum(float(r.cy) for r in regs) / len(regs),
         })
+        all_regions.extend(regs)
 
-    # ── Attempt 1: STATIONARY ──
-    shot_left = min(b["left"] for b in per_frame_bounds)
-    shot_right = max(b["right"] for b in per_frame_bounds)
-    shot_union_width = shot_right - shot_left
-    shot_union_center = (shot_left + shot_right) / 2
+    union = compute_union_bbox(all_regions)
+    cy_mean = float(np.mean([b["cy"] for b in per_frame_bounds]))
 
-    if shot_union_width <= crop_half_width * 2 + params.stationary_slack:
-        cx = float(np.clip(shot_union_center, crop_half_width, 1 - crop_half_width))
-        cy = float(np.mean([b["cy"] for b in per_frame_bounds]))
-        # Verify every frame's required bbox fits
+    # ── TEST 1: STATIONARY (union fits with safety margin) ──
+    # Add the per-content-type stationary_slack on top of the safety
+    # margin so dialogue / podcast modes can absorb tiny drift without
+    # going to TRACKING.
+    if union.width <= crop_w_needed * STATIONARY_ZOOM_SAFETY + params.stationary_slack:
+        cx = float(np.clip(union.cx, crop_half_width, 1 - crop_half_width))
+        # Sanity-check every frame's per-frame union still fits
         all_fit = all(
             b["left"] >= cx - crop_half_width - 0.01
             and b["right"] <= cx + crop_half_width + 0.01
@@ -207,83 +421,81 @@ def solve_shot(
             return ShotCamera(
                 shot_index=shot.index, start=shot.start, end=shot.end,
                 mode=CameraMode.STATIONARY,
-                keyframes=[(shot.start, cx, cy), (shot.end, cx, cy)],
-                reason=f"union_width_{shot_union_width:.3f}_fits",
+                keyframes=[(shot.start, cx, cy_mean), (shot.end, cx, cy_mean)],
+                reason=f"union_width_{union.width:.3f}_fits_stationary",
+                zoom=1.0,
             )
 
-    # ── Attempt 2: PANNING ──
-    if len(per_frame_bounds) >= 3:
-        times = np.array([b["t"] for b in per_frame_bounds])
-        centers = np.array([b["center"] for b in per_frame_bounds])
-        t_norm = (times - times[0]) / max(times[-1] - times[0], 1e-6)
-        # Least-squares line: center(t) = a + b*t
-        A = np.vstack([np.ones_like(t_norm), t_norm]).T
-        coeffs, _, _, _ = np.linalg.lstsq(A, centers, rcond=None)
-        predicted = A @ coeffs
-
-        covered = all(
-            (p - crop_half_width) <= b["left"] + 0.01
-            and (p + crop_half_width) >= b["right"] - 0.01
-            for p, b in zip(predicted, per_frame_bounds)
+    # ── TEST 2: TRACKING (monotonic trajectory, L1-solved path) ──
+    cx_timeline = [(b["t"], b["center"]) for b in per_frame_bounds]
+    cx_timeline.sort()
+    if len(cx_timeline) >= 3 and is_monotonic(cx_timeline, tolerance=0.05):
+        keyframes, status, held = _l1_track_keyframes(
+            per_frame_bounds, crop_half_width,
+            job_id=job_id, shot_index=shot.index,
         )
-        if covered:
-            start_cx = float(np.clip(coeffs[0], crop_half_width, 1 - crop_half_width))
-            end_cx = float(np.clip(coeffs[0] + coeffs[1], crop_half_width, 1 - crop_half_width))
-            cy = float(np.mean([b["cy"] for b in per_frame_bounds]))
+        if status == "success":
+            logger.info(
+                "[%s] [L1Path] shot %d: T=%d frames, solver status=success, "
+                "mode=tracking, held-still fraction=%.2f",
+                job_id, shot.index, len(per_frame_bounds), held,
+            )
+            return ShotCamera(
+                shot_index=shot.index, start=shot.start, end=shot.end,
+                mode=CameraMode.TRACKING,
+                keyframes=keyframes,
+                reason=f"monotonic_l1_held={held:.2f}",
+                zoom=1.0,
+            )
+        # L1 failed for tracking — fall through to zoom / panning attempts.
+
+    # ── TEST 3: STATIONARY_ZOOMED (union fits with discrete zoom-out) ──
+    for zoom in STATIONARY_ZOOM_STEPS:
+        zoomed_w = crop_w_needed * zoom * STATIONARY_ZOOM_SAFETY
+        if union.width <= zoomed_w:
+            zoom_half = (crop_w_needed * zoom) / 2.0
+            cx = float(np.clip(union.cx, zoom_half, 1 - zoom_half))
+            return ShotCamera(
+                shot_index=shot.index, start=shot.start, end=shot.end,
+                mode=CameraMode.STATIONARY_ZOOMED,
+                keyframes=[(shot.start, cx, cy_mean), (shot.end, cx, cy_mean)],
+                reason=f"union_width_{union.width:.3f}_zoom_{zoom:.1f}",
+                zoom=float(zoom),
+            )
+
+    # ── TEST 4: PANNING (smoothed L1 trajectory) ──
+    # Use the L1 solver here too — same call, no monotonicity gate. The
+    # LP's velocity penalty handles non-monotonic motion gracefully.
+    if len(per_frame_bounds) >= 3:
+        keyframes, status, held = _l1_track_keyframes(
+            per_frame_bounds, crop_half_width,
+            job_id=job_id, shot_index=shot.index,
+        )
+        if status == "success":
+            logger.info(
+                "[%s] [L1Path] shot %d: T=%d frames, solver status=success, "
+                "mode=panning, held-still fraction=%.2f",
+                job_id, shot.index, len(per_frame_bounds), held,
+            )
             return ShotCamera(
                 shot_index=shot.index, start=shot.start, end=shot.end,
                 mode=CameraMode.PANNING,
-                keyframes=[(shot.start, start_cx, cy), (shot.end, end_cx, cy)],
-                reason="linear_sweep_covers_all_frames",
+                keyframes=keyframes,
+                reason=f"l1_panning_held={held:.2f}",
+                zoom=1.0,
             )
 
-    # ── Attempt 3: TRACKING ──
-    centers = np.array([b["center"] for b in per_frame_bounds])
-    alpha = params.smoothing_alpha
-    smoothed = np.zeros_like(centers)
-    smoothed[0] = centers[0]
-    for i in range(1, len(centers)):
-        smoothed[i] = alpha * centers[i] + (1 - alpha) * smoothed[i - 1]
-
-    # Project: clamp smoothed[i] so the crop covers the required bounds
-    can_track = True
-    for i, b in enumerate(per_frame_bounds):
-        min_cx = b["right"] - crop_half_width
-        max_cx = b["left"] + crop_half_width
-        if min_cx > max_cx + 0.01:
-            can_track = False
-            break
-        smoothed[i] = float(np.clip(smoothed[i], min_cx, max_cx))
-
-    if can_track:
-        # Re-smooth after projection with a tighter pass to kill clamp jitter
-        for _ in range(2):
-            for i in range(1, len(smoothed) - 1):
-                avg = (smoothed[i - 1] + smoothed[i] + smoothed[i + 1]) / 3
-                b = per_frame_bounds[i]
-                min_cx = b["right"] - crop_half_width
-                max_cx = b["left"] + crop_half_width
-                smoothed[i] = float(np.clip(avg, min_cx, max_cx))
-
-        keyframes = [
-            (float(b["t"]),
-             float(np.clip(cx, crop_half_width, 1 - crop_half_width)),
-             float(b["cy"]))
-            for b, cx in zip(per_frame_bounds, smoothed)
-        ]
-        return ShotCamera(
-            shot_index=shot.index, start=shot.start, end=shot.end,
-            mode=CameraMode.TRACKING,
-            keyframes=keyframes,
-            reason="smoothed_track_feasible",
-        )
-
-    # ── Fallback: PADDED ──
+    # ── FALLBACK: PADDED (truly infeasible) ──
+    logger.info(
+        "[%s] [L1Path] shot %d: T=%d frames, solver status=failed, "
+        "all paths infeasible — PADDED fallback",
+        job_id, shot.index, len(per_frame_bounds),
+    )
     return ShotCamera(
         shot_index=shot.index, start=shot.start, end=shot.end,
         mode=CameraMode.PADDED,
         keyframes=[],
-        reason="required_bounds_exceed_crop_width",
+        reason="all_modes_infeasible",
     )
 
 
@@ -311,13 +523,34 @@ def solve_all_shots(
     params = get_params_for_content_type(content_type) if content_type else _DEFAULT_PARAMS
 
     results = []
-    mode_counts = {}
+    mode_counts = {
+        CameraMode.STATIONARY.value: 0,
+        CameraMode.STATIONARY_ZOOMED.value: 0,
+        CameraMode.TRACKING.value: 0,
+        CameraMode.PANNING.value: 0,
+        CameraMode.PADDED.value: 0,
+    }
     for shot in shots:
-        camera = solve_shot(shot, regions_per_frame, source_aspect, params)
+        camera = solve_shot(
+            shot, regions_per_frame, source_aspect, params, job_id=job_id,
+        )
         results.append(camera)
         mode_counts[camera.mode.value] = mode_counts.get(camera.mode.value, 0) + 1
 
-    logger.info("[%s] CameraSolver (%s): %d shots → %s",
-                job_id, content_type.value if content_type else "generic",
-                len(results), mode_counts)
+    total = max(len(results), 1)
+    padded_pct = 100.0 * mode_counts[CameraMode.PADDED.value] / total
+    logger.info(
+        "[%s] [CameraSolver] shot modes: stationary=%d, stationary_zoomed=%d, "
+        "tracking=%d, panning=%d, padded=%d",
+        job_id,
+        mode_counts[CameraMode.STATIONARY.value],
+        mode_counts[CameraMode.STATIONARY_ZOOMED.value],
+        mode_counts[CameraMode.TRACKING.value],
+        mode_counts[CameraMode.PANNING.value],
+        mode_counts[CameraMode.PADDED.value],
+    )
+    logger.info(
+        "[%s] [CameraSolver] padded-fallback rate: %.1f%% (target <5%%)",
+        job_id, padded_pct,
+    )
     return results

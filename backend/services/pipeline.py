@@ -3140,6 +3140,7 @@ async def _run_analysis_inner(job_id: str):
                     _clip_content_type = None
                     _solver_objects = None
                     _solver_saliency = None
+                    _solver_persons = None
                     _content_routing = os.environ.get("CLIPAI_CONTENT_ROUTING", "off").lower()
                     _enabled_types = os.environ.get("CLIPAI_CONTENT_TYPES_ENABLED", "").lower().split(",")
                     _enabled_types = [t.strip() for t in _enabled_types if t.strip()]
@@ -3213,6 +3214,37 @@ async def _run_analysis_inner(job_id: str):
                                 except Exception as _se:
                                     logger.warning("[%s] Content-routed saliency detection failed: %s", job_id, _se)
 
+                            # ── v4: Person body detection ──
+                            # Faceless action beats and back-turned characters
+                            # need a real subject for the camera solver to
+                            # anchor on. PersonDetector reuses the existing
+                            # YOLOv8n / MobileNet-SSD pipeline (no extra
+                            # model load) and emits typed PersonRegion
+                            # objects with has_face flagged for
+                            # de-prioritization in the AttentionAnchor chain.
+                            # Run unconditionally for animation modes
+                            # (anime / cartoon dialogue) where the win is
+                            # largest. Other types still respect the env-
+                            # var gate when CLIPAI_CONTENT_ROUTING=on.
+                            _persons_for_animation = _clip_content_type in _animation_modes
+                            _persons_routed = _content_routing == "on" and _clip_content_type in (
+                                ClipContentType.ANIMATION,
+                                ClipContentType.ANIMATION_DIALOGUE,
+                                ClipContentType.CINEMATIC_DIALOGUE,
+                                ClipContentType.GENERIC,
+                            )
+                            if _persons_for_animation or _persons_routed:
+                                try:
+                                    from backend.services.person_detector import detect_persons_in_frames
+                                    _frame_list_per = [(f.timestamp, f.path) for f in frames]
+                                    _solver_persons = detect_persons_in_frames(
+                                        _frame_list_per,
+                                        face_results=face_results,
+                                        job_id=job_id,
+                                    )
+                                except Exception as _pe:
+                                    logger.warning("[%s] PersonDetector failed (non-fatal): %s", job_id, _pe)
+
                         except Exception as _ct_err:
                             logger.warning("[%s] Content classification for solver failed: %s", job_id, _ct_err)
 
@@ -3230,6 +3262,7 @@ async def _run_analysis_inner(job_id: str):
                         persistent_regions=_persistent_regions,
                         frame_objects=_solver_objects,
                         frame_saliency=_solver_saliency,
+                        frame_persons=_solver_persons,
                     )
                     default_layout_mode = layout_timeline.default_mode
                     logger.info(

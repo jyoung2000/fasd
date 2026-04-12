@@ -201,6 +201,7 @@ def build_required_regions(
     frame_saliency: list = None,
     content_type=None,
     shot_cuts: list = None,
+    frame_persons: list = None,
 ) -> List[List[RequiredRegion]]:
     """Return per-frame lists of required regions.
 
@@ -289,6 +290,7 @@ def build_required_regions(
                 active_speaker_events=active_speaker_events,
                 frame_saliency=_fs_used,
                 shot_cuts=shot_cuts,
+                frame_persons=frame_persons,
             )
             for a in _anchors:
                 anchor_by_time[round(a.timestamp, 2)] = a

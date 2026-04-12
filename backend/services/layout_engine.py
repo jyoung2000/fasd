@@ -349,6 +349,7 @@ def plan_layout(
     persistent_regions=None,
     frame_objects: list = None,
     frame_saliency: list = None,
+    frame_persons: list = None,
 ) -> LayoutTimeline:
     """Solver-first layout planner with content-type-aware routing.
 
@@ -365,7 +366,7 @@ def plan_layout(
             video_path, frame_faces, face_registry, active_speaker_events,
             source_width, source_height, scene_descriptions, video_duration,
             job_id, content_type, persistent_regions, frame_objects,
-            frame_saliency,
+            frame_saliency, frame_persons,
         )
     except Exception as e:
         logger.warning("[%s] plan_layout failed (%s) — falling back to legacy layout", job_id, e)
@@ -384,6 +385,7 @@ def _plan_layout_impl(
     video_path, frame_faces, face_registry, active_speaker_events,
     source_width, source_height, scene_descriptions, video_duration, job_id,
     content_type, persistent_regions, frame_objects, frame_saliency,
+    frame_persons=None,
 ):
     from backend.models import LayoutMode
     from backend.services.shot_detector import detect_shots
@@ -408,13 +410,17 @@ def _plan_layout_impl(
     # boxcar smoother breaks at each cut.
     _shot_cut_times = [float(getattr(s, "start", 0.0)) for s in shots if getattr(s, "start", 0.0) > 0]
 
-    # 2. Build required regions (with optional object/saliency fusion)
+    # 2. Build required regions (with optional object/saliency/person fusion)
+    # v4: frame_persons feeds the AttentionAnchor person_body fallback for
+    # faceless dialogue/action frames so the camera anchors on a real
+    # subject instead of decay or background saliency.
     regions = build_required_regions(
         frame_faces, active_speaker_events,
         frame_objects=frame_objects,
         frame_saliency=frame_saliency,
         content_type=content_type,
         shot_cuts=_shot_cut_times,
+        frame_persons=frame_persons,
     )
 
     # Promote preferred → required for frames with no faces
@@ -437,14 +443,22 @@ def _plan_layout_impl(
     padded_count = 0
 
     for sc in shot_cameras:
-        if sc.mode in (CameraMode.STATIONARY, CameraMode.PANNING, CameraMode.TRACKING):
-            # Solver output → SINGLE layout with keyframes
+        if sc.mode in (
+            CameraMode.STATIONARY,
+            CameraMode.STATIONARY_ZOOMED,  # v4: discrete-zoom variant of STATIONARY
+            CameraMode.PANNING,
+            CameraMode.TRACKING,
+        ):
+            # Solver output → SINGLE layout with keyframes. v4: STATIONARY_ZOOMED
+            # carries an extra .zoom factor (1.1/1.2/1.3) that the renderer
+            # multiplies by the base crop width.
             kf_positions = [
                 {
                     "timestamp": float(t),
                     "x": float(cx * 100),
                     "y": float(cy * 100),
                     "solver_mode": sc.mode.value,
+                    "solver_zoom": float(getattr(sc, "zoom", 1.0)),
                 }
                 for t, cx, cy in sc.keyframes
             ]

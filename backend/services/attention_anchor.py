@@ -38,6 +38,18 @@ SALIENCY_PEAK_MIN_SCORE = 0.25
 SMOOTHER_WINDOW_SECONDS = 0.6
 
 
+# v4: confidence assigned to person_body anchors. Sits below face/active_face
+# (0.9/1.0) and above last_face_decay (0.85→0.40) so dialogue scenes prefer
+# real face detections, but faceless action beats latch onto a person body
+# rather than dropping into decay.
+PERSON_BODY_CONFIDENCE = 0.65
+
+# v4: cy is biased upward inside the person bbox so the resulting crop sits
+# where a face would be if one had been detected — head-and-shoulders, not
+# torso-centered.
+PERSON_HEAD_CY_BIAS = 0.35
+
+
 @dataclass
 class AttentionAnchor:
     """Single per-frame attention anchor for the camera solver."""
@@ -47,8 +59,9 @@ class AttentionAnchor:
     half_width: float
     half_height: float
     confidence: float   # 0-1, lower → more extrapolation
-    source: str         # "face" | "active_face" | "saliency_peak"
-                        # | "last_face_decay" | "motion_centroid"
+    source: str         # "active_face" | "face" | "person_body"
+                        # | "last_face_decay" | "saliency_peak"
+                        # | "motion_centroid"
 
 
 def _active_slot_at(active_speaker_events, timestamp: float) -> int:
@@ -93,6 +106,43 @@ def _best_face_in_frame(ff, active_slot: int) -> tuple:
     # Otherwise pick the largest face — it's the most likely subject.
     largest = max(humans, key=lambda f: f.width * f.height)
     return (largest, 0.9, "face")
+
+
+def _person_body_anchor(
+    persons_at_t: list, timestamp: float,
+) -> Optional[AttentionAnchor]:
+    """Build a person-body anchor for a frame with no face detection.
+
+    v4 priority chain rule:
+      - Only persons with has_face=False are eligible. has_face=True means
+        the face anchor (a higher-priority source) already covers this
+        person and we'd be doubling up.
+      - Among eligible persons we pick the one with the largest bbox area
+        (closest to camera, most likely the subject).
+      - cy is biased upward by PERSON_HEAD_CY_BIAS × height so the crop
+        framing lands on the head/shoulders region instead of the torso
+        center, matching where a face anchor would have been.
+
+    Returns None if no eligible person was found.
+    """
+    if not persons_at_t:
+        return None
+    eligible = [p for p in persons_at_t if not getattr(p, "has_face", False)]
+    if not eligible:
+        return None
+    # Largest bbox wins (closest to camera).
+    best = max(eligible, key=lambda p: float(p.width) * float(p.height))
+    biased_cy = float(best.cy) - PERSON_HEAD_CY_BIAS * float(best.height)
+    biased_cy = max(0.0, min(1.0, biased_cy))
+    return AttentionAnchor(
+        timestamp=timestamp,
+        cx=float(best.cx),
+        cy=biased_cy,
+        half_width=float(best.width) / 2.0,
+        half_height=float(best.height) / 2.0,
+        confidence=PERSON_BODY_CONFIDENCE,
+        source="person_body",
+    )
 
 
 def _saliency_peak_anchor(sal_frame, timestamp: float) -> Optional[AttentionAnchor]:
@@ -151,6 +201,7 @@ def build_attention_anchors(
     active_speaker_events: Optional[list] = None,
     frame_saliency: Optional[list] = None,
     shot_cuts: Optional[list] = None,
+    frame_persons: Optional[list] = None,
 ) -> list:
     """Build a dense per-frame AttentionAnchor timeline.
 
@@ -161,6 +212,10 @@ def build_attention_anchors(
             and .mean_score). May be None.
         shot_cuts: list of timestamps at which shot cuts occur; the
             temporal smoother does not blend across these.
+        frame_persons: optional flat list[PersonRegion] from
+            person_detector.py. v4: when present, person bodies fill in
+            faceless frames between the "face" and "last_face_decay"
+            priority slots so the camera has a real subject to lock onto.
 
     Returns:
         list[AttentionAnchor], one per input frame, in timestamp order.
@@ -174,9 +229,19 @@ def build_attention_anchors(
         for sf in frame_saliency:
             sal_by_time[round(getattr(sf, "timestamp", 0.0), 2)] = sf
 
-    # First pass — attach a "direct" anchor per frame if a face or
-    # saliency signal is present. Leave the slot as None when nothing
-    # applies; the second pass fills gaps with decay / bridging.
+    # Index persons by rounded timestamp (multiple per frame allowed).
+    person_by_time: dict = {}
+    if frame_persons:
+        for p in frame_persons:
+            key = round(float(getattr(p, "timestamp", 0.0)), 2)
+            person_by_time.setdefault(key, []).append(p)
+
+    # First pass — attach a "direct" anchor per frame in priority order:
+    #   1. active_face / face         (handled by _best_face_in_frame)
+    #   2. person_body (v4)           — eligible person bbox with no face inside
+    #   3. saliency_peak              — score·area-ranked saliency blob
+    # Frames that get nothing here are filled in the second pass by
+    # last_face_decay or motion_centroid fallback.
     direct_anchors: list = [None] * len(frame_faces)
     for i, ff in enumerate(frame_faces):
         t = float(ff.timestamp)
@@ -184,6 +249,15 @@ def build_attention_anchors(
         face, conf, source = _best_face_in_frame(ff, active_slot)
         if face is not None:
             direct_anchors[i] = _face_anchor(face, t, conf, source)
+            continue
+        # v4: person body wins over saliency_peak when a faceless person
+        # is visible. Pulls anchors away from background motion onto the
+        # actual subject. _person_body_anchor enforces has_face=False so
+        # we never double-anchor a covered face.
+        persons_at_t = person_by_time.get(round(t, 2), [])
+        pa = _person_body_anchor(persons_at_t, t)
+        if pa is not None:
+            direct_anchors[i] = pa
             continue
         sal_frame = sal_by_time.get(round(t, 2))
         sp = _saliency_peak_anchor(sal_frame, t)
@@ -366,5 +440,33 @@ def build_attention_anchors(
             "[AnchorStream] %d anchors, %d shot-cut breaks",
             len(anchors), len(cuts),
         )
+
+    # v4: per-source breakdown so the verifier can confirm person_body
+    # is actually pulling its weight on faceless-frame heavy clips. The
+    # six counters cover every value AttentionAnchor.source can take.
+    src_counts = {
+        "active_face": 0,
+        "face": 0,
+        "person_body": 0,
+        "last_face_decay": 0,
+        "saliency_peak": 0,
+        "motion_centroid": 0,
+    }
+    for a in anchors:
+        if a.source in src_counts:
+            src_counts[a.source] += 1
+        else:
+            src_counts.setdefault(a.source, 0)
+            src_counts[a.source] += 1
+    logger.info(
+        "[AttentionAnchor] source breakdown: active_speaker=%d, face=%d, "
+        "person_body=%d, last_face_decay=%d, saliency_peak=%d, motion_centroid=%d",
+        src_counts.get("active_face", 0),
+        src_counts.get("face", 0),
+        src_counts.get("person_body", 0),
+        src_counts.get("last_face_decay", 0),
+        src_counts.get("saliency_peak", 0),
+        src_counts.get("motion_centroid", 0),
+    )
 
     return anchors
