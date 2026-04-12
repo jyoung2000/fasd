@@ -2,3 +2,5 @@ __pycache__/
 node_modules/
 frontend/dist/
 data/
+# Downloaded model weights (YuNet face detector, etc.)
+backend/models/*.onnx
