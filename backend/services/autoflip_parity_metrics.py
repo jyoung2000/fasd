@@ -67,6 +67,39 @@ def extract_switch_times(
     return switches
 
 
+def extract_segment_boundaries(
+    segments: Iterable,
+    *,
+    start_attr: str = "start",
+    skip_zero: bool = True,
+) -> list[float]:
+    """Extract every segment ``start`` time (excluding t=0 by default).
+
+    Distinct from ``extract_switch_times`` in that it counts EVERY
+    segment boundary as a "cut", regardless of whether the active
+    slot changed. Phase 5's pulse cuts produce new segments with
+    the SAME active speaker — they're visual cuts (re-anchors)
+    that ``extract_switch_times`` would miss.
+
+    Used by the ``downbeat_snap_error`` metric so a music video
+    fixture that pulse-cuts on every downbeat scores
+    ``snap_rate == 1.0`` even though no speaker change occurred.
+    """
+    out: list[float] = []
+    for seg in segments:
+        raw = getattr(seg, start_attr, None)
+        if raw is None:
+            continue
+        try:
+            t = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if skip_zero and t <= 0.0:
+            continue
+        out.append(t)
+    return out
+
+
 _SENTINEL = object()  # used by extract_switch_times to distinguish first iteration
 
 
@@ -339,6 +372,7 @@ def score_fixture(
     metrics_to_run: list[str],
     expected_switches: Optional[list[float]] = None,
     actual_switches: Optional[list[float]] = None,
+    actual_segment_boundaries: Optional[list[float]] = None,
     segment_spans: Optional[list[tuple[float, float]]] = None,
     crop_centers: Optional[list[float]] = None,
     required_regions_per_frame: Optional[list[list[tuple[float, float]]]] = None,
@@ -380,8 +414,17 @@ def score_fixture(
                     crop_width_pct=crop_width_pct,
                 )
         elif metric == "downbeat_snap_error":
+            # Prefer the segment-boundary list (Phase 5: pulse cuts
+            # are visual cuts that don't change the active slot, so
+            # actual_switches misses them; actual_segment_boundaries
+            # captures every cut).
+            cut_times = (
+                actual_segment_boundaries
+                if actual_segment_boundaries is not None
+                else actual_switches
+            ) or []
             out[metric] = downbeat_snap_error(
-                actual_switches or [],
+                cut_times,
                 beat_grid or [],
                 snap_tolerance_ms=downbeat_snap_tolerance_ms,
             )

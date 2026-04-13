@@ -220,6 +220,21 @@ running `python -m backend.scripts.measure_autoflip_parity`):
 | `3speaker_panel` | 1.0 | 0 | 60.0 | 120.0 | 0.75 |
 | `vlog_walk_and_talk` (Phase 3 OFF) | — | 0 | 0.0 | ≈0 | 0.60 |
 | `vlog_walk_and_talk` (Phase 4 ON, V2 lead-room + thirds bias) | — | 0 | 0.0 | ≈0 | **0.43** |
+| `music_video_beat` (Phase 5 OFF) | 1.0 | 0 | 47.1 | 94.3 | — |
+| `music_video_beat` (Phase 5 ON, beat snap + pulse cuts) | 1.0 | 0 | 47.1 | 94.3 | — |
+
+Plus the music-video-only Phase 5 metric (`downbeat_snap_error`):
+
+| Fixture | Mode | snap_rate | mean_error_ms | max_error_ms | count |
+|---|---|---|---|---|---|
+| `music_video_beat` | OFF | 0.40 | 200.0 | 200.0 | 5 |
+| `music_video_beat` | ON | **1.00** | **0.0** | **0.0** | 8 (5 + 3 pulse cuts) |
+
+The Phase 5 ON row hits the spec exit criterion exactly: every cut
+lands at 0 ms from a downbeat — well under the spec's ±40 ms
+target. The 3 pulse cuts are visual re-anchors inserted at internal
+downbeats (the active speaker doesn't change but ``subject_x`` is
+re-derived from the slot center, producing a "fresh anchor" pulse).
 
 The vlog row demonstrates Phase 4's intended improvement: the
 required-region miss rate drops from 0.60 → 0.43 (−28 %) when

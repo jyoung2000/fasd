@@ -61,6 +61,12 @@ class _FaceRegistry:
     slots: list = field(default_factory=list)
     total_frames: int = 100
     frames_with_faces: int = 100
+    # ``is_continuous_motion`` is read by classify_content's Signal 3
+    # branch when the fixture has a single-slot vlog-style face. The
+    # parity fixtures don't have actual motion data, so we default
+    # to False (consistent with stationary panels / podcasts) and
+    # let the vlog fixture override per its build callable.
+    is_continuous_motion: bool = False
 
     @property
     def multi_speaker(self) -> bool:

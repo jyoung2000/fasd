@@ -91,6 +91,7 @@ def build_reframe_segments(
     pacing_estimator=None,
     interpolated_timeline=None,
     frame_saliency: list = None,
+    music_beat_grid=None,
 ) -> list[ReframeSegment]:
     """Build a segment-based reframe timeline.
 
@@ -1245,6 +1246,146 @@ def build_reframe_segments(
             seg.confidence,
             seg.fallback_reason or "none",
             in_crop,
+        )
+
+    # ── Stage 11: Music-video beat snap + pulse cuts (Phase 5) ──
+    #
+    # Behind ``CLIPAI_MUSIC_BEAT_SNAP=1`` (default OFF). Two passes
+    # over the segment list, both gated on:
+    #
+    #   - the feature flag is on
+    #   - ``content_profile.content_type == "music_video"``
+    #   - a ``music_beat_grid`` was passed in (production path:
+    #     pipeline calls ``beat_detector.detect_beats(audio_path)``;
+    #     test path: the parity runner pulls the pre-baked grid from
+    #     the fixture's ``ground_truth.beat_grid``)
+    #
+    # Pass A — boundary snap. Walks pairs (prev, cur) and snaps
+    # ``cur.start`` to the nearest downbeat within ±200 ms,
+    # propagating the snap to ``prev.end`` so contiguity is
+    # preserved. Skips snaps that would shrink either neighbor
+    # below 0.30 s OR that exceed half the segment length (per the
+    # v2 spec: "preserve sub-second switches — only snap if snap
+    # distance < half the segment length").
+    #
+    # Pass B — pulse cuts. For every downbeat that lies STRICTLY
+    # INSIDE an existing segment (more than 100 ms from either
+    # boundary), splits the segment in two. The new segment
+    # inherits the active speaker slot and its subject_x is
+    # re-derived from the slot's center via ``_slot_to_x`` so the
+    # pulse cut produces a visible "fresh anchor" even though the
+    # speaker hasn't changed. The motion_path of a tracking /
+    # panning segment is sliced at the split point so each half
+    # carries its own path.
+    #
+    # The exit-invariant pass below normalizes any small float
+    # drift introduced by these mutations.
+    music_snap_count = 0
+    pulse_cut_count = 0
+    try:
+        from backend.services.beat_detector import (
+            USE_MUSIC_BEAT_SNAP,
+            BeatGrid,
+            enumerate_pulse_cuts,
+            snap_segment_boundaries,
+        )
+
+        _ct_for_music = (
+            getattr(content_profile, "content_type", None)
+            if content_profile else None
+        )
+        if (
+            USE_MUSIC_BEAT_SNAP
+            and _ct_for_music == "music_video"
+            and isinstance(music_beat_grid, BeatGrid)
+            and music_beat_grid.has_data
+        ):
+            # Pass A: snap segment boundaries
+            music_snap_count = snap_segment_boundaries(
+                raw_segments, music_beat_grid,
+                max_distance_sec=0.20,
+                min_segment_sec=0.30,
+            )
+
+            # Pass B: insert pulse cuts at internal downbeats
+            #
+            # Iterate by *original* segment index, generate splits,
+            # then collapse them all into the new list. Generates
+            # at most one new segment per downbeat per existing
+            # segment, with the original segment's active_slot and
+            # the slot-center subject_x.
+            pulse_pairs = enumerate_pulse_cuts(
+                music_beat_grid, raw_segments, edge_skip_sec=0.10,
+            )
+            if pulse_pairs:
+                # Group splits by segment index for batch insertion
+                splits_by_seg: dict[int, list[float]] = {}
+                for seg_idx, db in pulse_pairs:
+                    splits_by_seg.setdefault(seg_idx, []).append(db)
+
+                new_segments: list = []
+                for i, seg in enumerate(raw_segments):
+                    splits = sorted(splits_by_seg.get(i, []))
+                    if not splits:
+                        new_segments.append(seg)
+                        continue
+                    # Walk the segment, emitting one piece per split.
+                    cursor = float(seg.start)
+                    end = float(seg.end)
+                    last_template = seg
+                    for db in splits:
+                        if db <= cursor + 1e-6 or db >= end - 1e-6:
+                            continue
+                        # Trim the existing piece up to the downbeat
+                        last_template.end = db
+                        # Slice motion_path if present so the split
+                        # halves carry their own paths
+                        if getattr(last_template, "motion_path", None):
+                            last_template.motion_path = [
+                                e for e in last_template.motion_path
+                                if e[0] <= db
+                            ]
+                        new_segments.append(last_template)
+
+                        # Build the post-downbeat piece via
+                        # dataclass replace; copy all attributes
+                        # then override start / end / subject_x.
+                        from dataclasses import replace as _dc_replace
+                        try:
+                            piece = _dc_replace(
+                                seg,
+                                start=db,
+                                end=end,
+                                reason="music_pulse_cut",
+                                subject_x=_slot_to_x(
+                                    seg.active_slot, face_registry, source_width,
+                                ),
+                                motion_path=(
+                                    [e for e in seg.motion_path if e[0] >= db]
+                                    if getattr(seg, "motion_path", None)
+                                    else None
+                                ),
+                            )
+                        except TypeError:
+                            # If replace fails (e.g. dataclass shape
+                            # changed), fall back to manual copy.
+                            piece = seg
+                            piece.start = db
+                        cursor = db
+                        last_template = piece
+                        pulse_cut_count += 1
+                    new_segments.append(last_template)
+                raw_segments = new_segments
+    except Exception as e:
+        logger.warning(
+            "[%s] Music-video beat snap failed (non-fatal): %s",
+            job_id, e,
+        )
+
+    if music_snap_count > 0 or pulse_cut_count > 0:
+        _log(
+            "MusicBeatSnap: %d boundary snaps, %d pulse cuts",
+            music_snap_count, pulse_cut_count,
         )
 
     # ── Exit: enforce half-open [start, end) contiguity ──

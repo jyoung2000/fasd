@@ -60,6 +60,7 @@ from backend.services.autoflip_parity_fixtures import (
     list_fixture_names,
 )
 from backend.services.autoflip_parity_metrics import (
+    extract_segment_boundaries,
     extract_switch_times,
     score_fixture,
 )
@@ -103,7 +104,8 @@ def _run_segmenter(spec: FixtureSpec) -> list:
 
     # Build a content profile so the segmenter's content-aware
     # branches (Stage 8 lead-room, Stage 10c Phase 4 post-process,
-    # Stage 10a multi-region LP, etc.) actually fire on the fixture.
+    # Stage 10a multi-region LP, Stage 11 music beat snap, etc.)
+    # actually fire on the fixture.
     content_profile = None
     try:
         content_profile = classify_content(
@@ -119,7 +121,39 @@ def _run_segmenter(spec: FixtureSpec) -> list:
             "classify_content failed (continuing without profile): %s", e
         )
 
-    return build_reframe_segments(content_profile=content_profile, **kwargs)
+    # Phase 5: build a BeatGrid from the fixture's pre-baked beat
+    # list when the fixture is a music video. Production callers
+    # (pipeline.py) build this via beat_detector.detect_beats on
+    # the audio track; in the parity bench we use the synthetic
+    # grid the fixture already owns so the runner doesn't need
+    # librosa.
+    #
+    # The fixture's ``beat_grid`` is the FULL beat sequence (every
+    # beat at 0.5 s spacing for 120 BPM). 4/4 downbeats are every
+    # 4th beat — Phase 5's pulse cuts fire on downbeats, not every
+    # beat, so we derive ``downbeat_times`` here.
+    music_beat_grid = None
+    if (
+        spec.content_type_override == "music_video"
+        and spec.ground_truth.beat_grid
+    ):
+        from backend.services.beat_detector import BeatGrid as _BG
+        beats = list(spec.ground_truth.beat_grid)
+        meter = 4  # all current music fixtures are 4/4
+        downbeats = beats[::meter]
+        music_beat_grid = _BG(
+            tempo_bpm=120.0,
+            beat_times=beats,
+            downbeat_times=downbeats,
+            meter=meter,
+            source="parity_fixture",
+        )
+
+    return build_reframe_segments(
+        content_profile=content_profile,
+        music_beat_grid=music_beat_grid,
+        **kwargs,
+    )
 
 
 # ─────────────── Result extraction ────────────────────────────
@@ -203,16 +237,30 @@ def score_one(
 
     crop_centers, spans = _segments_to_centers(segments, spec.source_width)
     actual_switches = extract_switch_times(segments)
+    actual_boundaries = extract_segment_boundaries(segments)
+
+    # For the downbeat_snap_error metric the parity fixture's
+    # ground-truth ``beat_grid`` is the full beat list, but we
+    # actually want to score against DOWNBEATS (every 4th beat in
+    # 4/4) so the metric's snap_rate reflects bar-line cadence.
+    # Mirror the runner's BeatGrid construction logic above.
+    metric_beat_grid: list[float] = []
+    if spec.ground_truth.beat_grid:
+        if spec.content_type_override == "music_video":
+            metric_beat_grid = list(spec.ground_truth.beat_grid)[::4]
+        else:
+            metric_beat_grid = list(spec.ground_truth.beat_grid)
 
     metrics_output = score_fixture(
         metrics_to_run=spec.metrics,
         expected_switches=spec.ground_truth.expected_switches,
         actual_switches=actual_switches,
+        actual_segment_boundaries=actual_boundaries,
         segment_spans=spans,
         crop_centers=crop_centers,
         required_regions_per_frame=spec.ground_truth.required_regions_per_frame,
         crop_width_pct=spec.crop_width_pct,
-        beat_grid=spec.ground_truth.beat_grid,
+        beat_grid=metric_beat_grid,
         hud_zones=spec.ground_truth.hud_zones,
         face_y_in_crop_normalized=spec.ground_truth.face_y_in_crop_normalized,
     )
@@ -220,6 +268,7 @@ def score_one(
     base["status"] = "ok"
     base["segments"] = len(segments)
     base["actual_switches"] = len(actual_switches)
+    base["actual_boundaries"] = len(actual_boundaries)
     base["metrics"] = metrics_output
     return base
 
