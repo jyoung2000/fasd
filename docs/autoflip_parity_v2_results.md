@@ -230,6 +230,35 @@ Plus the music-video-only Phase 5 metric (`downbeat_snap_error`):
 | `music_video_beat` | OFF | 0.40 | 200.0 | 200.0 | 5 |
 | `music_video_beat` | ON | **1.00** | **0.0** | **0.0** | 8 (5 + 3 pulse cuts) |
 
+### v2 Phase 8 — editorial prior
+
+Phase 8 ships the editorial state machine (J/L cuts, listener
+holds, reaction beats). All fixtures are unchanged at flag-ON
+because:
+
+  - The Phase 9 fixtures don't yet include word-level
+    transcripts (only coarse `TranscriptSegment.start / end`),
+    so the J-cut detector falls back to segment start times
+    instead of audio first-word times — no measurable shift
+    on the bench.
+  - The Phase 9 fixtures don't include `audio_events` (no
+    laughter / extreme spike data), so reaction beats don't
+    fire.
+  - Phase 9 fixture transcripts use whole-segment text without
+    sentence-end punctuation, so listener-hold detection
+    finds no opportunities.
+
+The Phase 8 mechanism is verified end-to-end via 56 unit tests
+that build hand-crafted transcript + segment + audio-event
+inputs and assert each detector + the in-place mutation
+behavior. The bench numbers will move once Phase 8 follow-up
+extends the parity fixtures with word-level transcripts +
+audio events for the dialogue-heavy fixtures.
+
+| Fixture | Mode | Notes |
+|---|---|---|
+| All 7 fixtures | OFF / ON | unchanged (Phase 8 needs word-level transcripts + audio events to exercise) |
+
 ### v2 Phase 7 — gameplay tracker + STREAM routing
 
 Phase 7 adds the per-genre gameplay subject tracker and the

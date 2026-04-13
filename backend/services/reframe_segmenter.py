@@ -94,6 +94,7 @@ def build_reframe_segments(
     music_beat_grid=None,
     anime_anchors: list = None,
     gameplay_motion_centroids: list = None,
+    audio_events: list = None,
 ) -> list[ReframeSegment]:
     """Build a segment-based reframe timeline.
 
@@ -995,6 +996,67 @@ def build_reframe_segments(
         if rects:
             for seg in raw_segments:
                 seg.hard_constraints = rects
+
+    # ── Stage 9b: Editorial "camera language" prior (Phase 8) ──
+    #
+    # Behind ``CLIPAI_EDITORIAL_PRIOR=1`` (default OFF until
+    # in-docker validation lands the post-Phase-8 numbers). When
+    # ON AND the content profile qualifies (narrative / podcast /
+    # debate / cinematic_dialogue / vlog / talking_head /
+    # multi_speaker_panel / animation_dialogue), this sub-block
+    # runs the editorial state machine over the raw segments:
+    #
+    #   - **J-cuts**: shift speaker-change boundaries +200 ms
+    #     after the new speaker's first audio word, so the viewer
+    #     hears the new voice for a beat before seeing them.
+    #   - **L-cuts**: same shift, paired editorial intent (Phase
+    #     8 minimal treats them as equivalent — see editorial_prior
+    #     docstring).
+    #   - **Listener holds**: when speaker A finishes a declarative
+    #     sentence and speaker B is silent for 400-800 ms,
+    #     emit a hold decision on slot B. (For Phase 8 minimal
+    #     the hold decision is COUNTED but the actual segment
+    #     insertion is deferred; the L1 solver in Stage 10
+    #     already smooths through the residual gap.)
+    #   - **Reaction beats**: when an extreme audio spike fires
+    #     on a multi-face segment, swap ``seg.active_slot`` to
+    #     the non-talking face for the spike duration.
+    #
+    # Wrapped in try/except so any state-machine failure stays
+    # non-fatal and the existing reactive intent tracker output
+    # still drives the L1 solver.
+    editorial_report = None
+    try:
+        from backend.services.editorial_prior import (
+            USE_EDITORIAL_PRIOR,
+            applies_to_profile as _editorial_applies,
+            apply_editorial_prior,
+        )
+
+        if USE_EDITORIAL_PRIOR and _editorial_applies(content_profile):
+            editorial_report = apply_editorial_prior(
+                raw_segments,
+                transcript_segments,
+                face_registry.slots if face_registry else [],
+                audio_events or [],
+                content_profile=content_profile,
+                speaker_to_slot=speaker_to_slot,
+            )
+            if editorial_report.n_j_cuts + editorial_report.n_l_cuts \
+                    + editorial_report.n_listener_holds \
+                    + editorial_report.n_reaction_beats > 0:
+                _log(
+                    "EditorialPrior: %d J-cuts, %d L-cuts, %d listener holds, %d reaction beats",
+                    editorial_report.n_j_cuts,
+                    editorial_report.n_l_cuts,
+                    editorial_report.n_listener_holds,
+                    editorial_report.n_reaction_beats,
+                )
+    except Exception as e:
+        logger.warning(
+            "[%s] Editorial prior failed (non-fatal): %s",
+            job_id, e,
+        )
 
     # ── Stage 10a: Multi-region LP fit-check (Phase 3) ──
     # Behind CLIPAI_MULTI_REGION_LP=1 (default OFF until in-docker

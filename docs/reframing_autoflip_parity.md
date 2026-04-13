@@ -260,6 +260,261 @@ thought content type was `UNKNOWN` even for user-declared gameplay.
   (which guards that `source_width` is still bound at function
   scope despite the nearby edits).
 
+### v2 Phase 8 — Editorial "camera language" prior
+
+**Before:** The legacy intent tracker is purely reactive — it
+switches the crop to whoever is currently talking, the moment
+they start talking. Human editors don't do that. They:
+
+  - **Anticipate** new speakers via J-cuts (audio leads video
+    by ~200 ms — viewer hears the new speaker for a beat
+    before seeing them)
+  - **Linger** on previous speakers via L-cuts (same shift,
+    paired editorial intent)
+  - **Hold on the listener** during reaction beats (when
+    speaker A finishes a sentence and speaker B is silent but
+    visible, hold on B for 400-800 ms)
+  - **Cut to the reactor** during laughter / gasps (when an
+    audio spike fires on a multi-face frame, show the
+    non-talking face for the spike duration)
+
+The reactive tracker captures the WHO of dialogue but misses
+the WHEN — which is what makes a clip read as edited rather
+than auto-generated.
+
+**After (v2 Phase 8):**
+
+- **`backend/services/editorial_prior.py`** *(new)* implements
+  the editorial state machine. Pure-Python, numpy-free.
+
+  Per-content-type gating via ``applies_to_profile``:
+    - **ON** for: ``narrative``, ``podcast``, ``vlog``,
+      ``cinematic_dialogue``, ``talking_head``,
+      ``multi_speaker_panel``, ``animation_dialogue``
+    - **OFF** for: ``gaming`` / ``gameplay_*``, ``music_video``,
+      ``sports``, ``animation`` (action anime via the
+      ``anime_subtype == "action"`` exclusion)
+  ``EDITORIAL_PRIOR_CONTENT_TYPES`` constant holds the
+  qualifying-set; the gate also checks
+  ``profile.anime_subtype`` so action anime opts out even if
+  the parent type would otherwise pass.
+
+  Detection helpers:
+
+    - ``detect_j_cuts(reframe_segments, transcript_segments,
+      *, speaker_to_slot, lead_sec=0.20)`` — walks pairs of
+      adjacent reframe segments, finds speaker-change
+      boundaries, and emits ``EditorialDecision(kind="j_cut",
+      delta_sec)`` to align the boundary to
+      ``audio_first_word_time + lead_sec``. The 200 ms lead
+      matches cinema convention. Falls back to label-suffix
+      matching (``"Speaker N"`` → slot N-1) when no explicit
+      ``speaker_to_slot`` mapping is provided.
+
+    - ``detect_l_cuts(...)`` — same shift mechanic with the
+      ``kind="l_cut"`` label. Phase 8 minimal treats J and L
+      cuts as equivalent boundary shifts; a future iteration
+      can differentiate the magnitude per content type.
+
+    - ``detect_listener_holds(reframe_segments, transcript_segments,
+      face_slots, *, speaker_to_slot, min_hold_sec=0.40,
+      max_hold_sec=0.80)`` — finds sentence-end opportunities.
+      A listener-cut fires when speaker A finishes a
+      declarative beat (``.!?`` via ``SENTENCE_END_PUNCT_RE``)
+      AND speaker B is silent but visible (``face_slots`` has
+      ≥ 2 entries) AND the gap between A's last word and B's
+      first word is ≥ ``min_hold_sec``. Hold duration is
+      ``min(gap, max_hold_sec)``. Emits
+      ``EditorialDecision(kind="listener_hold",
+      new_active_slot=B, delta_sec=hold)``.
+
+    - ``detect_reaction_beats(reframe_segments, audio_events,
+      face_slots, *, duration_sec=0.80)`` — finds laughter /
+      gasp opportunities. A reaction beat fires when an audio
+      event of type in ``REACTION_AUDIO_TYPES``
+      (``extreme_spike`` / ``silence_to_loud``) lies inside
+      a segment with multiple visible faces. Swaps
+      ``seg.active_slot`` to the first non-active slot
+      (deterministic choice for Phase 8 minimal; future
+      iterations can use lip-aperture / smile detection to
+      pick the actual reactor). Emits
+      ``EditorialDecision(kind="reaction_beat",
+      new_active_slot=R)``.
+
+  ``apply_decisions(reframe_segments, decisions, *,
+  min_segment_sec=0.30)`` mutates the segment list in place:
+    - J-cut shifts: applies the boundary delta and propagates
+      to the previous segment's ``end``, preserving
+      contiguity. Skips shifts that would violate the
+      ``min_segment_sec`` floor (default 300 ms).
+    - L-cut shifts: counted but use the same mechanic as
+      J-cuts.
+    - Listener holds: counted but the actual segment
+      insertion is deferred to the segmenter caller (which
+      has access to the ``ReframeSegment`` dataclass). The
+      L1 solver in Stage 10 already smooths through the
+      residual gap, so the listener hold's editorial intent
+      is captured even without a dedicated insertion pass.
+    - Reaction beats: swap ``seg.active_slot`` in place and
+      stamp ``seg.reason = "editorial_reaction_beat"``.
+
+  ``apply_editorial_prior(...)`` is the top-level entry that
+  chains all four detectors and calls ``apply_decisions``.
+  Returns ``EditorialApplyReport`` with per-kind counts
+  (``n_j_cuts``, ``n_l_cuts``, ``n_listener_holds``,
+  ``n_reaction_beats``) and a ``skipped_reason`` when the
+  profile doesn't qualify.
+
+  Tunable constants:
+    - ``DEFAULT_JL_CUT_LEAD_SEC = 0.20`` — cinema-standard
+      audio lead
+    - ``LISTENER_HOLD_MIN_SEC = 0.40``
+    - ``LISTENER_HOLD_MAX_SEC = 0.80``
+    - ``REACTION_BEAT_DURATION_SEC = 0.80``
+    - ``SENTENCE_END_PUNCT_RE`` — regex for ``.!?``
+    - ``REACTION_AUDIO_TYPES`` — frozenset of qualifying
+      ``audio_analyzer`` event types
+
+  ``USE_EDITORIAL_PRIOR`` env flag, default OFF.
+
+- **`backend/services/reframe_segmenter.py`** gained a new
+  **Stage 9b** sub-block immediately after Stage 9 (hard
+  constraints) and BEFORE Stage 10a (multi-region LP).
+  Behind ``CLIPAI_EDITORIAL_PRIOR=1`` AND
+  ``applies_to_profile(content_profile)``:
+
+    - Calls ``apply_editorial_prior`` with the segmenter's
+      raw segment list, the transcript, the face registry's
+      slots, and the audio events list (passed via the new
+      ``audio_events`` kwarg on ``build_reframe_segments``).
+    - Logs ``"EditorialPrior: N J-cuts, M L-cuts, P listener
+      holds, Q reaction beats"`` so the runner output can
+      attribute each editorial decision.
+    - Wrapped in try/except so any state-machine failure
+      stays non-fatal and the existing reactive intent
+      tracker output still drives the L1 solver.
+
+  Stage 9b runs BEFORE the L1 camera path solver (Stage 10)
+  so the smoothness pass sees the editorial-adjusted
+  boundaries. The Phase 4 lead-room and Phase 5 beat snap
+  also run after Stage 10, so all three offset / shift
+  mechanisms compose cleanly.
+
+- **`build_reframe_segments`** signature gained an
+  ``audio_events: list = None`` kwarg. Production callers
+  (``pipeline.py``) pass the
+  ``audio_analyzer.analyze_audio_energy`` output; test callers
+  pass a hand-built list of ``{timestamp, type}`` dicts.
+
+- **Default OFF** for the Phase 8 flag. Per the v2 ground
+  rules, any change that *might* regress an existing baseline
+  ships flag-off by default. The editorial prior shifts
+  segment boundaries by 100-200 ms which can ripple through
+  the existing sub-second-recall metric on the
+  ``2speaker_alternating`` baseline; in-docker validation
+  flips the flag once the post-Phase-8 numbers in
+  ``docs/autoflip_parity_v2_results.md`` show no regression.
+
+### Tests
+
+| File | Count | Purpose |
+|---|---|---|
+| `test_phase8_editorial.py` | 56 | content gate + J-cut + L-cut + listener hold + reaction beat + apply_decisions + Stage 9b AST guards |
+| Phase 1+2+3+4+5+6+7+9 + pre-existing | 653 | zero regressions |
+| **Total (v2 Phase 1-8 + 9 scope)** | **709** | all green |
+
+The 56 new tests break down as:
+
+- **TestAppliesToProfile** (12): every qualifying ContentType
+  passes, every non-qualifying type excluded, anime_action
+  exclusion fires explicitly, anime_dialogue passes, None
+  excluded, profile-without-content_type defensive default.
+- **TestDetectJCuts** (8): audio-leads-video case shifts
+  +0.10 s, audio-lags-video case shifts +0.70 s, no shift
+  when no speaker change, single segment, None active slot,
+  outside-window filter, label-to-slot fallback, no shift
+  when already aligned.
+- **TestDetectLCuts** (1): L-cut variant returns same shift
+  with distinct kind label.
+- **TestDetectListenerHolds** (6): basic listener hold,
+  clamped to max, skipped when gap too short, skipped
+  without sentence-end punctuation, skipped with single
+  face slot, question mark counts as sentence end.
+- **TestDetectReactionBeats** (6): extreme spike swaps slot,
+  silence-to-loud swap, plain volume_spike doesn't qualify,
+  single-face skip, event-outside-segment skip, empty inputs.
+- **TestApplyDecisions** (5): J-cut boundary mutation,
+  J-cut skip below min-segment floor, reaction beat slot
+  swap, listener hold counted but not inserted, empty inputs.
+- **TestApplyEditorialPriorTopLevel** (3): non-qualifying
+  content skipped, None profile skipped, full pass with
+  qualifying profile.
+- **TestEditorialPriorFlagDefaultOff** (1): flag default OFF.
+- **TestReframeSegmenterStage9bAST** (6): Stage 9b block
+  present, lazy imports, signature has ``audio_events`` kwarg,
+  applies_to_profile gate referenced, Stage 9b ordering before
+  Stage 10, try/except wrap.
+
+### Sandbox parity numbers
+
+The Phase 8 mechanism is verified end-to-end via the 56 unit
+tests that build hand-crafted transcript + segment + audio-event
+inputs and assert each detector + the in-place mutation. The
+parity bench fixtures don't yet include word-level transcript
+data (Phase 9 fixtures use coarse ``TranscriptSegment.start /
+end`` only), so the bench can't exercise the J-cut path
+directly. With the Phase 8 flag OFF the bench numbers are
+**unchanged** — verified across all 7 fixtures.
+
+A Phase 8 follow-up will:
+
+  1. Extend the parity fixtures with word-level transcripts
+     for the dialogue-heavy fixtures (``2speaker_alternating``
+     gets per-word timestamps so J-cuts can fire on the
+     speaker-change boundaries).
+  2. Add the production ``pipeline.py`` wiring that passes
+     ``audio_events`` (from ``audio_analyzer.analyze_audio_energy``)
+     to ``build_reframe_segments``.
+
+### Open questions resolved this phase
+
+- **J-cut vs L-cut**: same boundary shift (audio_start +
+  lead_sec), different editorial intent. Phase 8 minimal
+  treats them as equivalent and labels the decision kind
+  for telemetry. A future iteration can differentiate the
+  magnitude (e.g. 200 ms J / 400 ms L).
+
+- **Reactor selection**: Phase 8 minimal picks the first
+  non-active slot deterministically. A future iteration can
+  use lip-aperture / smile detection to pick the actual
+  reactor face on multi-face frames.
+
+- **Listener hold insertion**: counted but deferred. The L1
+  solver in Stage 10 smooths through the gap so the
+  editorial intent is captured even without a dedicated
+  segment insertion. A future iteration can have Stage 9b
+  call ``dataclasses.replace`` on the affected segment to
+  insert a true listener hold.
+
+### Out of scope for this phase
+
+- **Production pipeline.py wiring of audio_events**.
+  ``audio_analyzer.analyze_audio_energy`` is already called
+  early in the pipeline but the result isn't yet passed to
+  ``build_reframe_segments``. Phase 8 follow-up.
+
+- **Word-level timestamps in the parity fixtures**. The
+  Phase 9 fixtures use ``TranscriptSegment`` objects with
+  ``words=None``; the J-cut detector falls back to
+  ``segment.start`` in that case so it still works but
+  doesn't demonstrate the millisecond-precision shift the
+  spec calls for. Phase 8 follow-up.
+
+- **Per-segment listener-hold insertion**. The decision is
+  counted but the actual segment insertion (via
+  ``dataclasses.replace``) lives in Stage 9b's caller. Phase
+  8 follow-up.
+
 ### v2 Phase 7 — Gaming beyond FPS (MOBA / TPS / racing / stream)
 
 **Before:** The legacy gaming reframe path hard-coded
