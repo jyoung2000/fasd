@@ -160,8 +160,24 @@ class JobResult(BaseModel):
     default_layout_mode: str = "single"         # Overall recommended layout for the video
     dense_tracking_summary: Optional[dict] = None  # {total_frames, frames_with_faces, sample_rate, ...}
     tracking_mode: str = ""  # "continuous" | "multi_cluster" | "gameplay" — set by pipeline after face analysis
-    content_type_override: str = ""  # "auto" | "gameplay" | "podcast" | "movie" — user override from upload UI
-    game_type: str = ""  # "overwatch" | "valorant" | "apex_legends" | "marvel_rivals" | "fortnite" | "generic_fps" | "auto"
+    # Phase 1 + 2 — content-type override pipeline.
+    # ``content_type_override`` accepts every UI dropdown value: the
+    # legacy ones (gameplay / podcast / movie) PLUS the Phase 2
+    # additions (debate / panel / interview / vlog / narrative /
+    # cinematic / anime / cartoon / music_video / gameplay_fps /
+    # gameplay_moba / gameplay_tps / gameplay_racing / stream / sports).
+    # Normalized via backend.services.content_type_strings.
+    content_type_override: str = ""
+    # Free-form game key from the Phase 2 game sub-dropdown. Now spans
+    # FPS / MOBA / TPS / racing / sandbox — see backend.services.game_layouts.
+    game_type: str = ""
+    # Phase 2 anime sub-dropdown: "action" | "dialogue" | "slice_of_life" | "" (auto).
+    # Drives classify_clip ANIMATION vs ANIMATION_DIALOGUE routing,
+    # and Phase 6's anime shot detector + lead-room multiplier.
+    anime_subtype: str = ""
+    # Phase 2 music-video sub-dropdown: "performance" | "narrative" | "lyric" | "" (auto).
+    # Phase 5 reads this to set beat-snap aggressiveness.
+    music_subtype: str = ""
     filler_events: list[dict] = []  # [{start, end, type, text}] from filler word detection
     emphasis_keywords: list[str] = []  # Words to highlight in captions
     thumbnail_path: Optional[str] = None  # Absolute path to OG preview thumbnail JPG

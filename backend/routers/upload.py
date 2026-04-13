@@ -67,7 +67,7 @@ async def _stream_multipart_to_disk(
       - A 1 MB write buffer batches small safe-flushes into fewer syscalls.
 
     Returns (total_bytes_written, original_filename, language, subtitle_language,
-             content_type_override, game_type).
+             content_type_override, game_type, anime_subtype, music_subtype).
     """
     boundary_bytes = f"--{boundary}".encode()
     crlf = b"\r\n"
@@ -78,6 +78,8 @@ async def _stream_multipart_to_disk(
     subtitle_language = ""
     content_type_override = ""
     game_type = ""
+    anime_subtype = ""
+    music_subtype = ""
     total_bytes = 0
     out_file = None
     write_buf = bytearray()
@@ -171,6 +173,10 @@ async def _stream_multipart_to_disk(
                                 content_type_override = field_data.decode("utf-8", errors="replace").strip()
                             if field_name == "game_type":
                                 game_type = field_data.decode("utf-8", errors="replace").strip()
+                            if field_name == "anime_subtype":
+                                anime_subtype = field_data.decode("utf-8", errors="replace").strip()
+                            if field_name == "music_subtype":
+                                music_subtype = field_data.decode("utf-8", errors="replace").strip()
                             in_field_part = False
 
                         del buf[:next_bnd]
@@ -196,7 +202,16 @@ async def _stream_multipart_to_disk(
         if out_file:
             await out_file.close()
 
-    return total_bytes, filename, language, subtitle_language, content_type_override, game_type
+    return (
+        total_bytes,
+        filename,
+        language,
+        subtitle_language,
+        content_type_override,
+        game_type,
+        anime_subtype,
+        music_subtype,
+    )
 
 
 def _cleanup(path: str):
@@ -238,7 +253,16 @@ async def upload_video(
     tmp_path = os.path.join(job_dir, "video.tmp")
 
     try:
-        total_bytes, filename, language, subtitle_language, content_type_override, game_type = await _stream_multipart_to_disk(
+        (
+            total_bytes,
+            filename,
+            language,
+            subtitle_language,
+            content_type_override,
+            game_type,
+            anime_subtype,
+            music_subtype,
+        ) = await _stream_multipart_to_disk(
             request, boundary, tmp_path,
         )
     except OSError as exc:
@@ -282,6 +306,8 @@ async def upload_video(
     sub_lang = subtitle_language.strip().lower() if subtitle_language else ""
     ct_override = content_type_override.strip().lower() if content_type_override else ""
     gt = game_type.strip().lower() if game_type else ""
+    anime_sub = anime_subtype.strip().lower() if anime_subtype else ""
+    music_sub = music_subtype.strip().lower() if music_subtype else ""
 
     now = datetime.now(timezone.utc).isoformat()
     job = JobResult(
@@ -293,6 +319,8 @@ async def upload_video(
         subtitle_language=sub_lang,
         content_type_override=ct_override,
         game_type=gt,
+        anime_subtype=anime_sub,
+        music_subtype=music_sub,
         status=JobStatus.QUEUED,
         progress=0,
         progress_message="Uploaded, waiting for analysis",

@@ -259,3 +259,164 @@ thought content type was `UNKNOWN` even for user-declared gameplay.
   tests; no regression on `test_pipeline_source_width_hoisted.py`
   (which guards that `source_width` is still bound at function
   scope despite the nearby edits).
+
+### v2 Phase 2 — Editorially-meaningful upload dropdown
+
+**Before:** The Upload.jsx dropdown had three rows
+(`Auto-detect / Gameplay / Podcast / Movie`) and a single FPS-only
+sub-dropdown when "Gameplay" was selected. There was no way for the
+user to declare debate / vlog / anime / music video / sports, and no
+way to tell the pipeline that gameplay footage is MOBA / TPS /
+racing / stream rather than FPS. Even if a future contributor added
+those rows, classify_clip would still route every gameplay variant
+through `ClipContentType.GAMEPLAY` and silently apply FPS-style
+center-crop tuning.
+
+**After (v2 Phase 2):**
+
+- **Upload.jsx dropdown** restructured into 5 optgroups
+  (People / Animation / Music / Gaming / Sports) with **14 distinct
+  tokens**:
+
+      Auto-detect            (heuristic)
+      ─── People / Dialogue ───
+      Podcast / Interview         → "podcast"
+      Debate / Panel              → "debate"
+      Vlog / Single-subject       → "vlog"
+      Movie / TV / Cinematic      → "narrative"
+      ─── Animation ───
+      Anime / Cartoon             → "anime"     + anime sub-dropdown
+      ─── Music / Performance ───
+      Music Video / Performance   → "music_video" + music sub-dropdown
+      ─── Gaming ───
+      Gameplay — FPS              → "gameplay"        (legacy alias)
+      Gameplay — MOBA             → "gameplay_moba"
+      Gameplay — TPS              → "gameplay_tps"
+      Gameplay — Racing           → "gameplay_racing"
+      Stream / Facecam + Gameplay → "stream"
+      ─── Sports ───
+      Sports broadcast            → "sports"
+
+- **Anime sub-dropdown** (`Auto / Action / Dialogue-heavy / Slice of life`)
+  — feeds `anime_subtype` into `ContentProfile`. classify_clip now
+  routes:
+    - `anime_subtype="action"` → `ClipContentType.ANIMATION`
+    - `anime_subtype in ("dialogue", "slice_of_life")` →
+      `ClipContentType.ANIMATION_DIALOGUE`
+    - `anime_subtype` unset → legacy heuristic (talking-head /
+      cinematic-dialogue / generic bases promote to ANIMATION_DIALOGUE,
+      otherwise stay ANIMATION).
+  Phase 6 will read `profile.anime_subtype` to drive lead-room
+  multipliers and the anime shot detector.
+
+- **Music sub-dropdown** (`Auto / Performance / Narrative / Lyric`)
+  — feeds `music_subtype`. Phase 5 reads it to set beat-snap
+  aggressiveness.
+
+- **Game sub-dropdown** now expands beyond the FPS list. The
+  options shown depend on the selected gameplay variant:
+    - `gameplay` / `stream` → FPS games + Minecraft (sandbox)
+    - `gameplay_moba` → League of Legends, Dota 2, Generic MOBA
+    - `gameplay_tps` → GTA V, Elden Ring, Generic TPS
+    - `gameplay_racing` → Rocket League, Generic Racing
+
+- **`ClipContentType` extended** with `GAMEPLAY_MOBA`, `GAMEPLAY_TPS`,
+  `GAMEPLAY_RACING`. `GAMEPLAY` remains the FPS / hero-shooter
+  default. classify_clip now uses `profile.gameplay_subtype`
+  (encoded by the normalizer from the parent token) to route
+  directly to the right ClipContentType *before* the
+  MULTI_SPEAKER_PANEL / CINEMATIC_DIALOGUE / animation branches
+  fire — so a gameplay clip can never accidentally inherit
+  talking-head tuning.
+
+- **`ContentProfile` extended** with `anime_subtype: Optional[str]`,
+  `music_subtype: Optional[str]`, `gameplay_subtype: Optional[str]`,
+  and `game_type: str`. The classifier user-override branch
+  populates them from the metadata dict.
+
+- **`game_layouts.GAME_HUD_LAYOUTS` extended** from 6 entries (all
+  FPS) to **15 entries** spanning FPS / MOBA / TPS / racing /
+  sandbox. Each layout now has:
+    - `genre`: `"fps"` | `"moba"` | `"tps"` | `"racing"` | `"sandbox"`
+    - `action_center_pct`: `(x, y)` — the on-screen anchor for the
+      vertical crop. FPS = `(50, 50)`, TPS = `(50, 45)` (head/
+      shoulders above center), Racing = `(50, 65)` (car in lower
+      third), MOBA = `(50, 50)` with wider safe-zone, Sandbox =
+      `(50, 50)`. Phase 7 reads this to override the legacy
+      hard-coded `subject_x = 50`.
+  New helper functions: `get_action_center(game_key)`,
+  `games_for_genre(genre)`, plus `DEFAULT_GAME_BY_GENRE` and
+  `GAME_GENRE` lookup tables.
+
+- **Backend models + upload routers extended** with `anime_subtype`
+  and `music_subtype` fields on `JobResult`, the chunked-upload
+  `InitRequest`, and the legacy multipart `_stream_multipart_to_disk`
+  parser. The pipeline reads them off the job and injects them into
+  `_classifier_metadata` alongside `content_type_override` and
+  `game_type` so the classifier user-override branch can populate
+  the new profile fields.
+
+### Tests
+
+| File | Count | Purpose |
+|---|---|---|
+| `test_content_routing_matrix.py` | 46 | parametrized row-per-token matrix + game-layout coverage + AST guards on pipeline.py subtype injection |
+| Phase 1 + pre-existing classifier suites | 132 | zero regressions |
+| **Total (v2 Phase 1+2 scope)** | **178** | all green |
+
+The 46 new tests break down as:
+
+- **24** `test_routing_matrix_row` rows — one per
+  (token × anime_subtype × music_subtype) combination from the spec
+  table. Each row asserts: normalizer parent + flags + subtypes,
+  `is_gameplay_override`, `classify_content` profile fields, and
+  `classify_clip` final `ClipContentType`.
+- **16** `TestGameLayoutsExpansion` tests — every new game has the
+  right genre and action-center, plus the helper functions
+  (`get_action_center` / `games_for_genre` / `DEFAULT_GAME_BY_GENRE`
+  / `GAME_GENRE`) behave correctly.
+- **2** `TestEndToEndCoverage` tests — the matrix covers every
+  Upload.jsx token; every matrix token normalizes.
+- **3** `TestPipelineSubtypeInjection` AST guards — pipeline.py
+  injects `anime_subtype`, `music_subtype`, and `game_type` into
+  `_classifier_metadata` (the Phase 1 AST guard already covered
+  `content_type_override`).
+
+### Frontend build
+
+`npm run build` emits the same chunk count as before — the dropdown
+restructure is a pure JSX change with no new imports. The Upload.jsx
+state grew by 2 fields (`animeSubtype`, `musicSubtype`) and the
+init-POST body grew by the same 2 fields.
+
+### Open questions resolved this phase
+
+- **Debate vs. Podcast as a separate enum**: not worth a new
+  `ContentType.DEBATE` member — `debate` and `panel` both map to
+  `ContentType.PODCAST` with `is_multi_speaker_panel=True`, and the
+  existing `MULTI_SPEAKER_PANEL` `ClipContentType` route already
+  carries the right tuning (Fix 3).
+- **Stream gameplay fast-path**: deliberately NOT a
+  `is_gameplay_fastpath` candidate. Stream still needs the face
+  pipeline for the facecam overlay. Phase 7 will route `stream` to
+  `STACKED_GAMEPLAY` layout downstream.
+
+### Exit criteria met
+
+- ✅ Every dropdown value renders the correct sub-select (game /
+  anime / music) per the JSX conditions.
+- ✅ Every dropdown value round-trips through init →
+  `JobResult.content_type_override` (+ subtype fields) → pipeline →
+  `classify_content` with `confidence=1.0` and the right
+  `ContentProfile` fields populated.
+- ✅ Every dropdown value lands on the correct `ClipContentType` per
+  the Phase 2 spec.
+- ✅ `test_content_routing_matrix.py` (46 tests) green; all 132
+  Phase 1 / pre-existing tests green (178 total).
+- ✅ `npm run build` clean.
+- ✅ Sub-type values from a previous selection cannot leak into a
+  later upload — the normalizer gates each subtype to its parent
+  type, the Upload.jsx onChange clears stale state, and the
+  classifier validates anime/music tokens via
+  `normalize_anime_subtype` / `normalize_music_subtype` (which
+  return `None` for unknown values).

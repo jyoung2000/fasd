@@ -1237,6 +1237,12 @@ async def _run_analysis_inner(job_id: str):
     _job_data = await database.load_job(job_id)
     _content_override = getattr(_job_data, "content_type_override", "") if _job_data else ""
     _game_type = getattr(_job_data, "game_type", "") if _job_data else ""
+    # Phase 2: anime / music sub-dropdown values plumbed end-to-end so
+    # the classifier's user-override branch can populate
+    # profile.anime_subtype / profile.music_subtype, and Phase 6 / Phase 5
+    # downstream tuning can read them off the profile.
+    _anime_subtype = getattr(_job_data, "anime_subtype", "") if _job_data else ""
+    _music_subtype = getattr(_job_data, "music_subtype", "") if _job_data else ""
     _normalized_override = normalize_ui_content_type(_content_override)
 
     if is_gameplay_override(_content_override):
@@ -2634,10 +2640,24 @@ async def _run_analysis_inner(job_id: str):
             # all, so the classifier's user-override branch only fired
             # by accident for "podcast" (whose spelling happened to
             # match the enum value) and silently never fired for
-            # "gameplay" or "movie". This line is the plumbing fix.
+            # "gameplay" or "movie". This is the Phase 1 plumbing fix.
+            #
+            # Phase 2 also injects the anime / music sub-dropdown values
+            # plus the game key so the classifier can populate the new
+            # profile.anime_subtype / profile.music_subtype /
+            # profile.game_type fields. classify_content gates each
+            # sub-type to the matching parent (anime_subtype is ignored
+            # if the user picked a non-anime parent type) so a stale
+            # selection from a previous job can't leak through.
             _classifier_metadata = dict(metadata) if metadata else {}
             if _content_override:
                 _classifier_metadata["content_type_override"] = _content_override
+            if _anime_subtype:
+                _classifier_metadata["anime_subtype"] = _anime_subtype
+            if _music_subtype:
+                _classifier_metadata["music_subtype"] = _music_subtype
+            if _game_type:
+                _classifier_metadata["game_type"] = _game_type
             _content_profile = classify_content(
                 shot_cuts=_shot_cuts,
                 face_registry=face_registry,

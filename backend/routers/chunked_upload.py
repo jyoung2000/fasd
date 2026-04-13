@@ -52,8 +52,16 @@ class InitRequest(BaseModel):
     file_size: int
     language: str = ""
     subtitle_language: str = ""  # Target language for subtitles
-    content_type_override: str = ""  # "auto" | "gameplay" | "podcast" | "movie"
-    game_type: str = ""  # "overwatch" | "valorant" | "apex_legends" | "marvel_rivals" | "fortnite" | "generic_fps"
+    # Phase 1+2: content-type override token. Accepts every UI dropdown
+    # value — see backend.services.content_type_strings._UI_TO_ENUM.
+    content_type_override: str = ""
+    # Free-form game key from the game sub-dropdown — see
+    # backend.services.game_layouts.GAME_HUD_LAYOUTS for the full set.
+    game_type: str = ""
+    # Phase 2 anime / music sub-dropdown values. Empty string means
+    # "auto" — let the heuristic classifier decide.
+    anime_subtype: str = ""
+    music_subtype: str = ""
     chunk_size: Optional[int] = None
 
 
@@ -189,6 +197,8 @@ async def init_upload(req: InitRequest):
         "subtitle_language": req.subtitle_language,
         "content_type_override": req.content_type_override,
         "game_type": req.game_type,
+        "anime_subtype": req.anime_subtype,
+        "music_subtype": req.music_subtype,
         "ext": ext,
         "chunk_size": chunk_size,
         "total_chunks": total_chunks,
@@ -524,6 +534,8 @@ async def _assemble_and_finalize(upload_id: str, job_id: str, file_hash: str):
     subtitle_lang = info.get("subtitle_language", "").strip().lower()
     ct_override = info.get("content_type_override", "").strip().lower()
     gt = info.get("game_type", "").strip().lower()
+    anime_sub = info.get("anime_subtype", "").strip().lower()
+    music_sub = info.get("music_subtype", "").strip().lower()
 
     logger.info("[%s] Upload complete: %s → %s (%.1f MB, QA: %s)",
                 upload_id, filename, video_path, file_size_mb,
@@ -539,6 +551,8 @@ async def _assemble_and_finalize(upload_id: str, job_id: str, file_hash: str):
         subtitle_language=subtitle_lang,
         content_type_override=ct_override,
         game_type=gt,
+        anime_subtype=anime_sub,
+        music_subtype=music_sub,
         status=JobStatus.QUEUED,
         progress=0,
         progress_message="Uploaded, waiting for analysis",

@@ -40,7 +40,17 @@ class ClipContentType(str, Enum):
     ANIMATION = "animation"            # anime, cartoons
     ANIMATION_DIALOGUE = "animation_dialogue"   # talking anime characters
     MUSIC_VIDEO = "music_video"
-    GAMEPLAY = "gameplay"              # pure game footage
+    # ── Phase 2: gameplay sub-categories ──
+    # GAMEPLAY remains the FPS / hero-shooter default (the legacy
+    # behavior). The new variants allow Phase 7's gameplay subject
+    # tracker to use the right per-genre action-center anchor:
+    #   - MOBA / top-down: center-anchor with wider safe-zone
+    #   - TPS: character is offset down+right of frame center
+    #   - RACING: car is in lower-third, crop should anchor low
+    GAMEPLAY = "gameplay"              # FPS / hero shooter (legacy default)
+    GAMEPLAY_MOBA = "gameplay_moba"    # MOBA / top-down (LoL, Dota 2)
+    GAMEPLAY_TPS = "gameplay_tps"      # third-person action (GTA, Elden Ring)
+    GAMEPLAY_RACING = "gameplay_racing"  # racing / driving
     STREAM = "stream"                  # facecam + gameplay
     GENERIC = "generic"
 
@@ -84,6 +94,23 @@ class ContentProfile:
     # x-stdev small). Drives ClipContentType.MULTI_SPEAKER_PANEL routing
     # in classify_clip — overrides talking_head / vlog / generic.
     is_multi_speaker_panel: bool = False
+    # ── Phase 2 sub-type fields (populated by user override) ──
+    # anime_subtype: "action" | "dialogue" | "slice_of_life" | None.
+    # Phase 6 reads this to pick the anime shot detector + lead-room
+    # multiplier. None = heuristic fallback.
+    anime_subtype: Optional[str] = None
+    # music_subtype: "performance" | "narrative" | "lyric" | None.
+    # Phase 5 reads this to set beat-snap aggressiveness. None =
+    # heuristic fallback.
+    music_subtype: Optional[str] = None
+    # gameplay_subtype: "fps" | "moba" | "tps" | "racing" | "stream" | None.
+    # Drives ClipContentType.GAMEPLAY_* routing in classify_clip. Phase
+    # 7 uses this to pick per-genre action centers.
+    gameplay_subtype: Optional[str] = None
+    # game_type: free-form game key from the existing game sub-dropdown
+    # (e.g. "valorant", "league_of_legends"). Plumbed end-to-end so
+    # Phase 7 can look up GAME_HUD_LAYOUTS without re-reading the job.
+    game_type: str = ""
 
 
 def classify_content(
@@ -139,7 +166,11 @@ def classify_content(
     # Also still accepts the legacy ``content_type`` and ``reframe_style``
     # metadata keys for callers that haven't been updated.
     if metadata:
-        from backend.services.content_type_strings import normalize_ui_content_type
+        from backend.services.content_type_strings import (
+            normalize_anime_subtype,
+            normalize_music_subtype,
+            normalize_ui_content_type,
+        )
 
         user_type = (
             metadata.get("content_type_override")
@@ -152,18 +183,45 @@ def classify_content(
             profile.confidence = 1.0
             profile.is_multi_speaker_panel = normalized.is_multi_speaker_panel
             profile.is_animated = normalized.is_animated
+            # Phase 2: populate sub-type fields from the secondary UI
+            # dropdowns. The classifier only honors the sub-type when
+            # it matches the parent (e.g. anime_subtype is ignored if
+            # the user picked a non-anime parent type) — otherwise a
+            # stale sub-type from a previous selection would leak.
+            if normalized.is_animated:
+                profile.anime_subtype = normalize_anime_subtype(
+                    metadata.get("anime_subtype")
+                )
+            if normalized.content_type == ContentType.MUSIC_VIDEO:
+                profile.music_subtype = normalize_music_subtype(
+                    metadata.get("music_subtype")
+                )
+            # Gameplay subtype is encoded directly in the parent token
+            # (gameplay_moba → "moba"); always trust the normalized
+            # value rather than a separate metadata field.
+            profile.gameplay_subtype = normalized.gameplay_subtype
+            profile.game_type = (metadata.get("game_type") or "").strip().lower()
             profile.signals = {
                 "user_override": normalized.raw,
                 "normalized": normalized.content_type.value,
                 "panel": normalized.is_multi_speaker_panel,
                 "animated": normalized.is_animated,
+                "anime_subtype": profile.anime_subtype,
+                "music_subtype": profile.music_subtype,
+                "gameplay_subtype": profile.gameplay_subtype,
+                "game_type": profile.game_type or None,
             }
             _log(
-                "user override %r → %s (conf=1.00, panel=%s, animated=%s)",
+                "user override %r → %s (conf=1.00, panel=%s, animated=%s, "
+                "anime_sub=%s, music_sub=%s, gameplay_sub=%s, game=%s)",
                 normalized.raw,
                 normalized.content_type.value,
                 normalized.is_multi_speaker_panel,
                 normalized.is_animated,
+                profile.anime_subtype,
+                profile.music_subtype,
+                profile.gameplay_subtype,
+                profile.game_type or None,
             )
             return profile
 
@@ -552,6 +610,23 @@ def classify_clip(
         base_type = _CONTENT_TYPE_MAP.get(
             content_profile.content_type, ClipContentType.GENERIC
         )
+        # ── Phase 2: gameplay sub-type routing ──
+        # When the user picked a specific gameplay variant (or stream)
+        # the normalizer encodes it on profile.gameplay_subtype. Route
+        # to the matching ClipContentType.GAMEPLAY_* before the
+        # MULTI_SPEAKER_PANEL / CINEMATIC_DIALOGUE branches so a
+        # gameplay clip never accidentally gets talking-head tuning.
+        gameplay_sub = getattr(content_profile, "gameplay_subtype", None)
+        if gameplay_sub == "moba":
+            base_type = ClipContentType.GAMEPLAY_MOBA
+        elif gameplay_sub == "tps":
+            base_type = ClipContentType.GAMEPLAY_TPS
+        elif gameplay_sub == "racing":
+            base_type = ClipContentType.GAMEPLAY_RACING
+        elif gameplay_sub == "stream":
+            base_type = ClipContentType.STREAM
+        elif gameplay_sub == "fps":
+            base_type = ClipContentType.GAMEPLAY
         # Fix 3: MULTI_SPEAKER_PANEL promotion takes precedence over
         # CINEMATIC_DIALOGUE and the animation branch below — a seated
         # panel is a panel regardless of whether the raw classifier
@@ -576,9 +651,29 @@ def classify_clip(
         # (GAMEPLAY, STREAM, MUSIC_VIDEO) where the animation signal is
         # incidental and those layouts have their own rules.
         if getattr(content_profile, "is_animated", False):
-            # MULTI_SPEAKER_PANEL shouldn't flip to ANIMATION_DIALOGUE —
-            # a seated anime panel is still panel framing.
-            if base_type in (
+            # Phase 2: anime_subtype overrides the heuristic. Action
+            # anime stays on ANIMATION (Phase 6 will tune snappier intent
+            # + bigger lead-room there); dialogue / slice-of-life route
+            # to ANIMATION_DIALOGUE so the speaker-following framing
+            # rules apply.
+            anime_sub = getattr(content_profile, "anime_subtype", None)
+            if anime_sub == "action":
+                base_type = ClipContentType.ANIMATION
+                logger.info(
+                    "[ContentClassifier] anime_subtype=action → ANIMATION",
+                )
+            elif anime_sub in ("dialogue", "slice_of_life"):
+                base_type = ClipContentType.ANIMATION_DIALOGUE
+                logger.info(
+                    "[ContentClassifier] anime_subtype=%s → ANIMATION_DIALOGUE",
+                    anime_sub,
+                )
+            elif base_type in (
+                # No explicit subtype — fall back to the legacy heuristic:
+                # promote talking-head / cinematic-dialogue / generic
+                # bases to ANIMATION_DIALOGUE; leave ANIMATION (anime
+                # parent type's default mapping), MULTI_SPEAKER_PANEL,
+                # MUSIC_VIDEO, and GAMEPLAY_* alone.
                 ClipContentType.GENERIC,
                 ClipContentType.CINEMATIC_DIALOGUE,
                 ClipContentType.TALKING_HEAD,

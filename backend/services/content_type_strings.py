@@ -61,9 +61,15 @@ class NormalizedContentType:
         is_animated: True when the UI picked anime/cartoon. Routes to
             ``ClipContentType.ANIMATION`` / ``ANIMATION_DIALOGUE`` downstream.
         anime_subtype: "action" | "dialogue" | "slice_of_life" | None.
-            Reserved for the Phase 2 UI sub-dropdown.
+            Populated by the Phase 2 UI sub-dropdown via
+            ``apply_subtypes_to_metadata`` (read from
+            ``metadata['anime_subtype']`` by the classifier).
         music_subtype: "performance" | "narrative" | "lyric" | None.
-            Reserved for the Phase 2 UI sub-dropdown.
+            Populated by the Phase 2 UI sub-dropdown.
+        gameplay_subtype: "fps" | "moba" | "tps" | "racing" | "stream" | None.
+            Encoded directly in the UI token (``gameplay_moba`` →
+            ``"moba"``) so ``classify_clip`` can route to the right
+            ``ClipContentType.GAMEPLAY_*`` value.
         is_gameplay_fastpath: True when the pipeline should skip face
             tracking entirely (pure gameplay). False for ``stream``,
             which is gaming-layout but still needs the face pipeline.
@@ -76,6 +82,7 @@ class NormalizedContentType:
     is_animated: bool = False
     anime_subtype: Optional[str] = None
     music_subtype: Optional[str] = None
+    gameplay_subtype: Optional[str] = None
     is_gameplay_fastpath: bool = False
     raw: str = ""
 
@@ -83,18 +90,22 @@ class NormalizedContentType:
 # Every dropdown value in Upload.jsx MUST appear here. The legacy
 # tokens ("gameplay", "movie", "podcast") are kept forever as aliases
 # so old jobs and old UI builds still route correctly.
+#
+# ``gameplay_subtype`` encodes which gameplay variant the user picked
+# so ``classify_clip`` can route to the right ``ClipContentType.GAMEPLAY_*``
+# value without needing to re-parse the UI token. The bare ``gameplay``
+# legacy token defaults to FPS (matching the legacy pipeline behavior).
 _UI_TO_ENUM: dict[str, dict] = {
     # ── Legacy aliases (must work forever) ──
     "gameplay": {
         "content_type": ContentType.GAMING,
         "gameplay_fastpath": True,
+        "gameplay_subtype": "fps",
     },
     "movie": {"content_type": ContentType.NARRATIVE},
     "podcast": {"content_type": ContentType.PODCAST},
 
-    # ── Phase 2 forward-compat entries ──
-    # The actual dropdown options land in Phase 2, but the normalizer
-    # contract is stable from Phase 1 onward.
+    # ── Phase 2 dropdown entries ──
     "debate": {
         "content_type": ContentType.PODCAST,
         "panel": True,
@@ -119,18 +130,22 @@ _UI_TO_ENUM: dict[str, dict] = {
     "gameplay_fps": {
         "content_type": ContentType.GAMING,
         "gameplay_fastpath": True,
+        "gameplay_subtype": "fps",
     },
     "gameplay_moba": {
         "content_type": ContentType.GAMING,
         "gameplay_fastpath": True,
+        "gameplay_subtype": "moba",
     },
     "gameplay_tps": {
         "content_type": ContentType.GAMING,
         "gameplay_fastpath": True,
+        "gameplay_subtype": "tps",
     },
     "gameplay_racing": {
         "content_type": ContentType.GAMING,
         "gameplay_fastpath": True,
+        "gameplay_subtype": "racing",
     },
     # Stream is GAMING + facecam. It must NOT take the face-skipping
     # fast path — Phase 7 handles the STACKED_GAMEPLAY layout routing
@@ -138,6 +153,7 @@ _UI_TO_ENUM: dict[str, dict] = {
     "stream": {
         "content_type": ContentType.GAMING,
         "gameplay_fastpath": False,
+        "gameplay_subtype": "stream",
     },
     "sports": {"content_type": ContentType.SPORTS},
 
@@ -146,6 +162,55 @@ _UI_TO_ENUM: dict[str, dict] = {
     "auto": None,
     "unknown": None,
 }
+
+
+# Allowed sub-type values per parent — the classifier rejects garbage
+# from the UI rather than passing it through unchecked. Phase 6 (anime)
+# and Phase 5 (music) wire these to actual tuning behavior.
+_VALID_ANIME_SUBTYPES: frozenset[str] = frozenset({
+    "action", "dialogue", "slice_of_life", "auto",
+})
+_VALID_MUSIC_SUBTYPES: frozenset[str] = frozenset({
+    "performance", "narrative", "lyric", "auto",
+})
+
+
+def normalize_anime_subtype(value: Optional[str]) -> Optional[str]:
+    """Validate an ``anime_subtype`` UI value.
+
+    Returns the lowercased token if valid, ``None`` otherwise (which
+    also means "auto" / unset / invalid). The classifier treats
+    ``None`` as "no subtype hint" and falls back to heuristic anime
+    classification (Phase 6).
+    """
+    if not value:
+        return None
+    key = str(value).strip().lower()
+    if not key or key == "auto":
+        return None
+    if key not in _VALID_ANIME_SUBTYPES:
+        logger.debug(
+            "content_type_strings: unknown anime_subtype %r — ignoring",
+            value,
+        )
+        return None
+    return key
+
+
+def normalize_music_subtype(value: Optional[str]) -> Optional[str]:
+    """Validate a ``music_subtype`` UI value. See ``normalize_anime_subtype``."""
+    if not value:
+        return None
+    key = str(value).strip().lower()
+    if not key or key == "auto":
+        return None
+    if key not in _VALID_MUSIC_SUBTYPES:
+        logger.debug(
+            "content_type_strings: unknown music_subtype %r — ignoring",
+            value,
+        )
+        return None
+    return key
 
 
 def normalize_ui_content_type(token: Optional[str]) -> Optional[NormalizedContentType]:
@@ -181,6 +246,7 @@ def normalize_ui_content_type(token: Optional[str]) -> Optional[NormalizedConten
         is_animated=bool(spec.get("animated", False)),
         anime_subtype=spec.get("anime_subtype"),
         music_subtype=spec.get("music_subtype"),
+        gameplay_subtype=spec.get("gameplay_subtype"),
         is_gameplay_fastpath=bool(spec.get("gameplay_fastpath", False)),
         raw=key,
     )

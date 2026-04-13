@@ -308,6 +308,11 @@ export default function Upload() {
   const [subtitleLanguage, setSubtitleLanguage] = useState('');
   const [contentTypeOverride, setContentTypeOverride] = useState('');
   const [gameType, setGameType] = useState('');
+  // Phase 2 sub-dropdown values. Empty string = "auto" (let the
+  // heuristic classifier decide). The normalizer rejects unknown
+  // values server-side via normalize_anime_subtype / normalize_music_subtype.
+  const [animeSubtype, setAnimeSubtype] = useState('');
+  const [musicSubtype, setMusicSubtype] = useState('');
   const [uploading, setUploading] = useState(false);
   const [uploadDone, setUploadDone] = useState(false);
   const [progress, setProgress] = useState(0);
@@ -495,6 +500,8 @@ export default function Upload() {
             subtitle_language: subtitleLanguage,
             content_type_override: contentTypeOverride,
             game_type: gameType,
+            anime_subtype: animeSubtype,
+            music_subtype: musicSubtype,
             chunk_size: CHUNK_SIZE,
           }),
         });
@@ -1109,8 +1116,14 @@ export default function Upload() {
             id="content-type-select"
             value={contentTypeOverride}
             onChange={(e) => {
-              setContentTypeOverride(e.target.value);
-              if (e.target.value !== 'gameplay') setGameType('');
+              const next = e.target.value;
+              setContentTypeOverride(next);
+              // Clear sub-dropdown state when leaving its parent so a
+              // stale selection from a previous content-type pick can't
+              // accidentally ride along to the upload init payload.
+              if (!next.startsWith('gameplay') && next !== 'stream') setGameType('');
+              if (next !== 'anime') setAnimeSubtype('');
+              if (next !== 'music_video') setMusicSubtype('');
             }}
             style={{
               width: '100%',
@@ -1124,15 +1137,106 @@ export default function Upload() {
             }}
           >
             <option value="">Auto-detect</option>
-            <option value="gameplay">Gameplay (FPS / Hero Shooter)</option>
-            <option value="podcast">Interview / Podcast</option>
-            <option value="movie">Movie / TV</option>
+            <optgroup label="People / Dialogue">
+              <option value="podcast">Podcast / Interview (2+ seated)</option>
+              <option value="debate">Debate / Panel (3+ seats)</option>
+              <option value="vlog">Vlog / Single-subject handheld</option>
+              <option value="narrative">Movie / TV / Cinematic dialogue</option>
+            </optgroup>
+            <optgroup label="Animation">
+              <option value="anime">Anime / Cartoon</option>
+            </optgroup>
+            <optgroup label="Music / Performance">
+              <option value="music_video">Music Video / Performance</option>
+            </optgroup>
+            <optgroup label="Gaming">
+              <option value="gameplay">Gameplay — FPS / Hero Shooter</option>
+              <option value="gameplay_moba">Gameplay — MOBA / Top-down</option>
+              <option value="gameplay_tps">Gameplay — Third-person / Action</option>
+              <option value="gameplay_racing">Gameplay — Racing / Driving</option>
+              <option value="stream">Stream / Facecam + Gameplay</option>
+            </optgroup>
+            <optgroup label="Sports">
+              <option value="sports">Sports broadcast</option>
+            </optgroup>
           </select>
         </div>
       )}
 
-      {/* Game selector (shown when Gameplay is selected) */}
-      {selectedFile && !uploading && contentTypeOverride === 'gameplay' && (
+      {/* Anime sub-type selector */}
+      {selectedFile && !uploading && contentTypeOverride === 'anime' && (
+        <div style={{ marginTop: 12 }}>
+          <label
+            htmlFor="anime-subtype-select"
+            style={{ display: 'block', fontSize: 13, color: 'var(--text-secondary)', marginBottom: 6 }}
+          >
+            Anime sub-style
+          </label>
+          <select
+            id="anime-subtype-select"
+            value={animeSubtype}
+            onChange={(e) => setAnimeSubtype(e.target.value)}
+            style={{
+              width: '100%',
+              padding: '10px 12px',
+              background: 'var(--bg-panel)',
+              color: 'var(--text-primary)',
+              border: '1px solid var(--border)',
+              fontSize: 14,
+              borderRadius: 'var(--radius-sm)',
+              outline: 'none',
+            }}
+          >
+            <option value="">Auto</option>
+            <option value="action">Action / Fight</option>
+            <option value="dialogue">Dialogue-heavy</option>
+            <option value="slice_of_life">Slice of life</option>
+          </select>
+          <p style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 4 }}>
+            Action picks faster intent + bigger lead-room; Dialogue follows speakers like cinematic dialogue.
+          </p>
+        </div>
+      )}
+
+      {/* Music-video sub-type selector */}
+      {selectedFile && !uploading && contentTypeOverride === 'music_video' && (
+        <div style={{ marginTop: 12 }}>
+          <label
+            htmlFor="music-subtype-select"
+            style={{ display: 'block', fontSize: 13, color: 'var(--text-secondary)', marginBottom: 6 }}
+          >
+            Music-video sub-style
+          </label>
+          <select
+            id="music-subtype-select"
+            value={musicSubtype}
+            onChange={(e) => setMusicSubtype(e.target.value)}
+            style={{
+              width: '100%',
+              padding: '10px 12px',
+              background: 'var(--bg-panel)',
+              color: 'var(--text-primary)',
+              border: '1px solid var(--border)',
+              fontSize: 14,
+              borderRadius: 'var(--radius-sm)',
+              outline: 'none',
+            }}
+          >
+            <option value="">Auto</option>
+            <option value="performance">Performance / On-stage</option>
+            <option value="narrative">Narrative / Story</option>
+            <option value="lyric">Lyric / Static</option>
+          </select>
+          <p style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 4 }}>
+            Performance and narrative use beat-snapped pulse cuts; Lyric stays static.
+          </p>
+        </div>
+      )}
+
+      {/* Game selector (shown for any gameplay variant or stream) */}
+      {selectedFile && !uploading && (
+        contentTypeOverride.startsWith('gameplay') || contentTypeOverride === 'stream'
+      ) && (
         <div style={{ marginTop: 12 }}>
           <label
             htmlFor="game-type-select"
@@ -1155,13 +1259,49 @@ export default function Upload() {
               outline: 'none',
             }}
           >
-            <option value="">Auto / Generic FPS</option>
-            <option value="overwatch">Overwatch / Overwatch 2</option>
-            <option value="marvel_rivals">Marvel Rivals</option>
-            <option value="valorant">Valorant</option>
-            <option value="apex_legends">Apex Legends</option>
-            <option value="fortnite">Fortnite</option>
-            <option value="generic_fps">Other FPS</option>
+            <option value="">Auto / Generic for this genre</option>
+            {/* FPS / hero shooters */}
+            {(contentTypeOverride === 'gameplay'
+              || contentTypeOverride === 'stream') && (
+              <optgroup label="FPS / Hero Shooter">
+                <option value="overwatch">Overwatch / Overwatch 2</option>
+                <option value="marvel_rivals">Marvel Rivals</option>
+                <option value="valorant">Valorant</option>
+                <option value="apex_legends">Apex Legends</option>
+                <option value="fortnite">Fortnite</option>
+                <option value="generic_fps">Other FPS</option>
+              </optgroup>
+            )}
+            {/* MOBA */}
+            {contentTypeOverride === 'gameplay_moba' && (
+              <optgroup label="MOBA / Top-down">
+                <option value="league_of_legends">League of Legends</option>
+                <option value="dota2">Dota 2</option>
+                <option value="generic_moba">Other MOBA</option>
+              </optgroup>
+            )}
+            {/* TPS / action */}
+            {contentTypeOverride === 'gameplay_tps' && (
+              <optgroup label="Third-person Action">
+                <option value="gta_v">Grand Theft Auto V</option>
+                <option value="elden_ring">Elden Ring</option>
+                <option value="generic_tps">Other Third-Person Action</option>
+              </optgroup>
+            )}
+            {/* Racing */}
+            {contentTypeOverride === 'gameplay_racing' && (
+              <optgroup label="Racing / Driving">
+                <option value="rocket_league">Rocket League</option>
+                <option value="generic_racing">Other Racing / Driving</option>
+              </optgroup>
+            )}
+            {/* Always-available sandbox option (Minecraft is the dominant case) */}
+            {(contentTypeOverride === 'gameplay'
+              || contentTypeOverride === 'stream') && (
+              <optgroup label="Sandbox">
+                <option value="minecraft">Minecraft</option>
+              </optgroup>
+            )}
           </select>
           <p style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 4 }}>
             Selecting the game enables HUD-aware vertical cropping (killfeed, health, abilities preserved in 9:16)
