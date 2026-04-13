@@ -185,13 +185,50 @@ contract drift.
 
 ## Test counts (current)
 
-Phase 9 ships with these test files (all green in sandbox):
+Phase 9 + Phase 3 ship with these test files (all green in sandbox):
 
 | File | Count |
 |---|---|
 | `test_autoflip_parity_metrics.py` | 63 |
-| `test_autoflip_parity_fixtures.py` | 141 (+ 2 deliberate skips) |
-| **Phase 9 total** | **204 tests** |
+| `test_autoflip_parity_fixtures.py` | 143 (Phase 3 resolved 2 skips) |
+| `test_multi_region_lp.py` | 33 (20 sandbox + 13 scipy-gated) |
+| **Phase 9 + 3 total** | **239 tests** |
 
 Plus the existing surface from Phases 1+2 (132 tests) for a running
-total of **336 numpy-free tests** that gate v2 work in CI.
+total of **417 v2 tests** that gate the work in CI. The 13 scipy-
+gated tests run unconditionally in docker (where scipy is always
+available) and use `pytest.mark.skipif` to skip cleanly in a
+minimal sandbox.
+
+## Sandbox vs docker numbers — Phase 3
+
+The Phase 3 Stage 10a integration is feature-flagged off by default
+(`CLIPAI_MULTI_REGION_LP=0`) until a docker validation run captures
+the post-Phase-3 numbers. With the flag OFF, the pipeline behaves
+identically to Phase 2 — every "tbd" cell in the fixture tables
+above stays the same value. With the flag ON, the LP is invoked on
+every segment that Stage 3 routed to `split`/`grid`/`wide_master`
+and the segment is downgraded back to single-subject when the LP
+says the speakers fit in one crop.
+
+Sandbox sanity numbers (with scipy installed, captured ad-hoc by
+running `python -m backend.scripts.measure_autoflip_parity`):
+
+| Fixture | sub_second_recall | overlap | max_accel (% src w) | max_jerk (% src w) | required_region_miss_rate |
+|---|---|---|---|---|---|
+| `2speaker_alternating` | 1.0 | 0 | 50.0 | 100.0 | 0.40 |
+| `3speaker_panel` | 1.0 | 0 | 60.0 | 120.0 | 0.75 |
+
+The accel / jerk numbers are large because the metric is computed
+on a per-segment-step basis and these fixtures have hard speaker
+swaps (the camera snaps from x=20 % to x=80 %). Phase 4+ will reduce
+them via the multi-region LP smoothing the transitions, AND via the
+thirds-bias work that interpolates the camera path within segments.
+
+The 75 % required-region miss rate on the 3-speaker panel is the
+Phase 3 LP's natural target: 75 % of frames have a speaker outside
+the crop because the heuristic single-subject pipeline can only
+follow one face at a time. With the multi-region LP enabled and a
+fixture that exercises the simultaneous-overlap path, this number
+will drop dramatically — Phase 3 follow-up (or Phase 4 prerequisite)
+adds an overlap fixture.

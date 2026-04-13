@@ -683,6 +683,167 @@ def build_reframe_segments(
             for seg in raw_segments:
                 seg.hard_constraints = rects
 
+    # ── Stage 10a: Multi-region LP fit-check (Phase 3) ──
+    # Behind CLIPAI_MULTI_REGION_LP=1 (default OFF until in-docker
+    # validation lands the post-phase-3 numbers in
+    # docs/autoflip_parity_v2_results.md). When ON, this sweep
+    # re-evaluates every segment that Stage 3 routed to split / grid
+    # / wide_master via the heuristic active-slot count: it builds
+    # per-frame required + optional bboxes from the active speaker
+    # events and runs solve_multi_region_camera_path. If the LP says
+    # "all required regions fit in one crop", the segment is
+    # downgraded back to single-subject (with subject_x = LP center)
+    # so the existing Stage 10 single-subject loop produces the
+    # smooth path. If the LP says "infeasible", the per-content
+    # fallback (split_screen for podcast/debate, wide_master for
+    # narrative) is honored — same decision the heuristic would have
+    # made, but driven by actual geometry instead of face-count
+    # rules.
+    multi_region_count = 0
+    multi_region_split = 0
+    multi_region_wide = 0
+    try:
+        from backend.services.multi_region_layout import (
+            USE_MULTI_REGION_LP,
+            decide_multi_region_layout,
+            promote_required_regions_for_segment,
+            slot_to_pixel_bbox,
+        )
+
+        if USE_MULTI_REGION_LP and face_registry and face_registry.slots:
+            # The crop window for 16:9 → 9:16 is source_height *
+            # crop_aspect = 1080 * 9/16 = 607 px wide on a 1920-wide
+            # source. Match the value used by l1_camera_path so the
+            # fit decision is comparable to the single-subject solver.
+            crop_aspect = 9.0 / 16.0
+            crop_width_px = float(source_height) * crop_aspect
+            if crop_width_px > source_width:
+                crop_width_px = float(source_width)
+
+            for seg_idx, seg in enumerate(raw_segments):
+                # Only re-examine segments that the heuristic Stage 3
+                # routed to a multi-subject layout. Single-subject
+                # segments already get the right treatment from the
+                # existing single-subject L1 solver.
+                if seg.layout not in ("split", "grid", "wide_master"):
+                    continue
+                req_ids, opt_ids = promote_required_regions_for_segment(
+                    seg_start=seg.start,
+                    seg_end=seg.end,
+                    face_slots=face_registry.slots,
+                    active_speaker_events=active_speaker_events,
+                )
+                if not req_ids and not opt_ids:
+                    continue
+                # Snapshot per-frame regions: for the segment-level
+                # fit check we sample at the segment endpoints (the
+                # face slots are stationary across the segment so
+                # one sample suffices). When we wire per-frame
+                # tracks in Phase 4 this becomes the dense-faces
+                # walk. n_samples > 1 keeps the LP smoothness terms
+                # well-defined.
+                n_samples = 4
+                required_per_frame: list = []
+                optional_per_frame: list = []
+                slot_by_id = {int(s.slot_id): s for s in face_registry.slots}
+                for _ in range(n_samples):
+                    req_bboxes = [
+                        slot_to_pixel_bbox(slot_by_id[sid], source_width=source_width)
+                        for sid in req_ids
+                        if sid in slot_by_id
+                    ]
+                    opt_bboxes = [
+                        (*slot_to_pixel_bbox(slot_by_id[sid], source_width=source_width), 0.5)
+                        for sid in opt_ids
+                        if sid in slot_by_id
+                    ]
+                    required_per_frame.append(req_bboxes)
+                    optional_per_frame.append(opt_bboxes)
+
+                # ContentType for fallback choice. We use the clip-
+                # level value when available; reframe_segmenter
+                # doesn't currently know it directly so we look at
+                # content_profile.content_type as a proxy.
+                _ct = getattr(content_profile, "content_type", None) if content_profile else None
+                decision = decide_multi_region_layout(
+                    required_per_frame,
+                    optional_per_frame,
+                    crop_width_px=crop_width_px,
+                    source_width_px=float(source_width),
+                    content_type=_ct,
+                )
+                logger.info(
+                    "[%s] MultiRegionLP seg %.2f-%.2fs layout=%s decision=%s "
+                    "ratio=%.2f reason=%s n_req=%d n_opt=%d",
+                    job_id, seg.start, seg.end, seg.layout, decision.decision,
+                    decision.infeasibility_ratio, decision.reason,
+                    decision.n_required, decision.n_optional,
+                )
+                if decision.decision == "fit" and decision.camera_path:
+                    # Downgrade to single-subject with the LP center.
+                    seg.layout = "single"
+                    # Pick the active speaker as the slot for the
+                    # downstream Stage 10 single-subject path. If
+                    # there are multiple required slots, prefer the
+                    # one whose pixel position is closest to the
+                    # LP-solved camera center.
+                    cam_center = float(decision.camera_path[0])
+                    best_slot = None
+                    best_dist = float("inf")
+                    for sid in req_ids:
+                        slot = slot_by_id.get(sid)
+                        if slot is None:
+                            continue
+                        slot_px = float(slot.x_center) / 100.0 * source_width
+                        d = abs(slot_px - cam_center)
+                        if d < best_dist:
+                            best_dist = d
+                            best_slot = sid
+                    if best_slot is None and req_ids:
+                        best_slot = req_ids[0]
+                    if best_slot is not None:
+                        seg.active_slot = best_slot
+                    seg.subject_x = cam_center
+                    seg.strategy = "tracking"
+                    seg.reason = "multi_region_lp_fit"
+                    seg.confidence = max(seg.confidence, 0.85)
+                    multi_region_count += 1
+                elif decision.decision in ("fit_with_pad",):
+                    # Same as fit for now — Phase 4+ may add the
+                    # actual padding logic. The LP ran cleanly on
+                    # ≥95% of frames so the camera path is usable.
+                    if decision.camera_path:
+                        seg.layout = "single"
+                        seg.subject_x = float(decision.camera_path[0])
+                        seg.strategy = "tracking"
+                        seg.reason = "multi_region_lp_fit_with_pad"
+                        seg.confidence = max(seg.confidence, 0.75)
+                        multi_region_count += 1
+                elif decision.decision == "split":
+                    seg.layout = "split"
+                    seg.strategy = "split_screen"
+                    seg.reason = "multi_region_lp_split"
+                    multi_region_split += 1
+                elif decision.decision == "wide":
+                    seg.layout = "wide_master"
+                    seg.strategy = "wide_master"
+                    seg.subject_x = source_width / 2.0
+                    seg.reason = "multi_region_lp_wide"
+                    multi_region_wide += 1
+                # decision == "lp_failed" → leave the segment alone;
+                # the existing heuristic decision stands.
+    except Exception as e:
+        logger.warning(
+            "[%s] Multi-region LP sweep failed (non-fatal): %s",
+            job_id, e,
+        )
+
+    if multi_region_count + multi_region_split + multi_region_wide > 0:
+        _log(
+            "MultiRegionLP: %d fit-downgrade, %d split, %d wide",
+            multi_region_count, multi_region_split, multi_region_wide,
+        )
+
     # ── Stage 10: L1 camera path — shot-level solving with lookahead ──
     # Group segments by shot (using shot_cuts), then solve the TV-denoised
     # camera path ONCE per shot instead of per segment. This eliminates

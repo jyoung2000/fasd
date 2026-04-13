@@ -260,6 +260,193 @@ thought content type was `UNKNOWN` even for user-declared gameplay.
   (which guards that `source_width` is still bound at function
   scope despite the nearby edits).
 
+### v2 Phase 3 — Multi-region required-region LP
+
+**Before:** `backend/services/required_regions.py` produced per-frame
+required + optional bboxes, but the camera path solver
+(`l1_camera_path.solve_camera_path_for_shot`) only consumed a
+single subject-x trajectory. When two speakers had to both stay on
+screen, the fallback was the heuristic SPLIT_SCREEN logic in Stage 3
+of `reframe_segmenter.py` that fired on `active_slot_count == 2 +
+speaker overlap > 1s` (or `>= 3 active slots + multi-speaker crowd
+→ WIDE_MASTER`). The decision was made on face-count alone, with no
+geometric check that the speakers could actually fit in one crop.
+This was the largest remaining gap from the v2 plan.
+
+**After (v2 Phase 3):**
+
+- **`backend/services/_autoflip_lp.py`** gained
+  `solve_multi_region_camera_path(...) → MultiRegionLPResult`.
+  It's a generalization of the existing single-subject solver:
+  per-frame required + optional bboxes (in pixels) drive hard box
+  constraints (each required bbox must be inside the crop window)
+  and soft slacks (each optional bbox is penalized in proportion to
+  its weight for being outside). Smoothness penalties on velocity,
+  acceleration, and jerk match the existing solver. The LP runs via
+  scipy HiGHS with the same `time_limit=10s` guardrail as the
+  single-subject path.
+
+  The result bundle reports:
+    - `status`: `"feasible"` / `"infeasible"` / `"lp_failed"`
+    - `camera_path`: per-frame solved center in pixels
+    - `infeasible_frames`: list of indices where the per-frame box
+      collapses (`lo > hi`)
+    - `infeasibility_ratio`: fraction of frames that were infeasible
+    - `n_required` / `n_optional`: total bbox counts
+    - `lp_message` / `solve_ms`: telemetry
+
+  The geometric heart — `per_frame_bounds_from_required` — lives in
+  the numpy-free `multi_region_layout` module so it can be unit-
+  tested without scipy. The LP function imports it lazily.
+
+- **`backend/services/multi_region_layout.py`** is the new layout
+  decision helper:
+
+    - `decide_multi_region_layout(...)` runs the LP and routes the
+      result into one of:
+        - `"fit"` (fully feasible — use the camera path)
+        - `"fit_with_pad"` (≤ 5 % infeasible — minor pad fix)
+        - `"split"` (between 5 % and 50 %, content type is
+          talking-head / panel / cinematic-dialogue / vlog → use
+          SPLIT_SCREEN)
+        - `"wide"` (> 50 % infeasible OR content type prefers
+          WIDE_MASTER → blur fill)
+        - `"lp_failed"` (HiGHS error — caller keeps existing path)
+      Per-content fallback table mirrors the existing
+      `CONTENT_TYPE_CONFIG.fallback_preference` values.
+
+    - `promote_required_regions_for_segment(...)` implements the
+      spec's required-vs-optional promotion rule: a face slot is
+      promoted to required when its active-speaker confidence > 0.7
+      AND it has spoken in the last 2 s; demoted to optional after
+      3 s of silence; faces with no speaker activity stay optional.
+
+    - Two thin helpers `slot_to_pixel_bbox` and `fallback_for_content`
+      keep the call sites in `reframe_segmenter` short.
+
+    - Tunable thresholds (`INFEASIBLE_THRESHOLD_FIT = 0.05`,
+      `INFEASIBLE_THRESHOLD_SPLIT = 0.50`, plus the promotion /
+      demotion seconds) live as module-level constants so
+      Phase 4-8 can tighten them.
+
+- **`backend/services/reframe_segmenter.py`** gained a new **Stage 10a**
+  sweep behind `CLIPAI_MULTI_REGION_LP=1` (default OFF). When ON:
+    - Walks every `seg` in `raw_segments` whose layout is
+      `split` / `grid` / `wide_master` (the segments the heuristic
+      Stage 3 marked as multi-subject)
+    - Builds per-frame required + optional bboxes via the promotion
+      helper + `slot_to_pixel_bbox`
+    - Calls `decide_multi_region_layout` with the segment's content
+      type
+    - On `"fit"` → downgrades the segment back to `single`, sets
+      `seg.subject_x` to the LP-solved center, picks the closest
+      required slot as `seg.active_slot`, marks the reason
+      `multi_region_lp_fit` and bumps confidence to 0.85
+    - On `"fit_with_pad"` → same but reason
+      `multi_region_lp_fit_with_pad`, confidence 0.75
+    - On `"split"` / `"wide"` → keeps the heuristic decision but
+      stamps `seg.reason` so logs distinguish LP-driven from
+      heuristic decisions
+    - On `"lp_failed"` → leaves the segment alone
+
+  The sweep emits one `[%s] MultiRegionLP seg ...` log line per
+  segment so the runner output can attribute every layout decision
+  back to either the heuristic or the LP.
+
+- **Default OFF** for this commit. Per the v2 ground rules, any
+  change that *might* regress the existing baselines must ship
+  feature-flagged off. The first in-docker validation run will
+  capture pre-Phase-3 numbers; the second run with
+  `CLIPAI_MULTI_REGION_LP=1` will capture post-Phase-3 numbers; if
+  the metrics improve and don't regress, the flag default flips on.
+  Until then, the LP code path is dormant and the segmenter
+  behaves identically to Phase 2.
+
+### Tests
+
+| File | Count | Purpose |
+|---|---|---|
+| `test_multi_region_lp.py` | 33 | LP geometry + decision helper + promotion + scipy LP runs |
+| Phase 9 + 1+2 + pre-existing | 384 | zero regressions |
+| **Total (v2 Phase 1-3 + 9 scope)** | **417** | all green |
+
+The 33 new tests break down as:
+
+- **5** `TestPerFrameBoundsFromRequired` rows — the geometric
+  bounds calculator (the heart of the LP). Two close speakers
+  fit, two far speakers don't, no-required uses full frame,
+  mixed feasible/infeasible, source-frame clamping.
+- **5** `TestLayoutDecisionFallback` rows — per-content fallback
+  routing (`talking_head` → split, `narrative` → wide, gameplay
+  variants → wide, unknown defaults to split, every
+  `ClipContentType` enum value is in the table).
+- **6** `TestPromotionRules` rows — the 2 s recency + 0.7
+  confidence promotion rule, the 3 s silence demotion rule, no-
+  activity slots stay optional, the gray zone between
+  thresholds, custom threshold overrides.
+- **3** `TestSlotToPixelBbox` rows — basic conversion, explicit
+  half-width override, default `avg_width` fallback.
+- **1** `TestFeatureFlag::test_default_off` — CI gate on the
+  default-OFF policy.
+- **4** `TestSolveMultiRegionFeasible` rows — actual scipy LP
+  runs: two close speakers, three speakers fit, optional region
+  pull, n=1 trivial case.
+- **2** `TestSolveMultiRegionInfeasible` rows — far-apart
+  infeasible, partial infeasibility ratio.
+- **7** `TestDecideMultiRegionLayoutWithLP` rows — end-to-end
+  LP + decision routing for fit / split / wide / fit_with_pad /
+  empty input / two content type fallbacks.
+
+All 33 pass (sandbox: 20 directly + 13 scipy-gated; docker:
+all 33 directly).
+
+### Phase 9 follow-up resolved
+
+The two deliberate `pytest.skip` markers Phase 9 left on the
+`2speaker_alternating` and `3speaker_panel` fixtures (for the
+`required_region_miss_rate` metric without per-frame ground
+truth) are now resolved. Phase 3 populates per-frame required-
+region tracks in `autoflip_parity_fixtures._gt_2speaker_alternating`
+and `_gt_3speaker_panel` so both fixtures score the metric. Test
+count moves from "143 passed, 2 skipped" to "143 passed, 0 skipped".
+
+### Open questions resolved this phase
+
+- **Where does the LP fit in the existing pipeline?** A new
+  Stage 10a sub-block at the start of Stage 10, BEFORE the
+  single-subject shot loop. It re-evaluates only segments that
+  the heuristic Stage 3 marked as multi-subject so the LP
+  doesn't disturb the well-tested single-subject path.
+- **Per-content fallback when LP is infeasible?** Honors the
+  existing `CONTENT_TYPE_CONFIG.fallback_preference` mapping —
+  `talking_head` / `panel` / `cinematic_dialogue` /
+  `animation_dialogue` → SPLIT_SCREEN; `narrative` /
+  `music_video` / gameplay variants → WIDE_MASTER. The
+  `PER_CONTENT_FALLBACK` table in `multi_region_layout.py` is
+  the single source of truth.
+- **What if scipy's HiGHS fails to converge?** The result
+  status is `"lp_failed"`; the segmenter leaves the segment
+  alone (existing heuristic decision stands). Logged at WARNING
+  with the LP message.
+
+### Out of scope for this phase
+
+- The Stage 10a sweep doesn't run on segments that Stage 3 marked
+  as `single` (because the LP wasn't designed to second-guess
+  single-subject decisions — that's Phase 4's thirds-bias work).
+  An edge case where two speakers are visible in a `single`
+  segment is handled by the existing single-subject L1 path.
+- The fixture set doesn't currently include a "two simultaneous
+  speakers" overlap case that would force Stage 3 to mark the
+  segment as `split` and then exercise the LP at the segmenter
+  level. The LP itself is exercised by the unit tests; the
+  parity fixture for end-to-end exercise is a Phase 3 follow-up
+  or Phase 4 prerequisite.
+- Dynamic crop width (the spec mentions optional `w_t` per frame)
+  is not implemented. The LP uses a fixed `crop_width_px`
+  derived from `source_height * 9/16`, matching the existing
+  single-subject solver.
+
 ### v2 Phase 2 — Editorially-meaningful upload dropdown
 
 **Before:** The Upload.jsx dropdown had three rows

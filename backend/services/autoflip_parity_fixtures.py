@@ -503,16 +503,56 @@ def _build_stream_corner_facecam() -> dict:
 # ── Ground-truth helpers ───────────────────────────────────────────
 
 def _gt_2speaker_alternating() -> GroundTruth:
+    """Per-frame ground truth for the 2-speaker fixture.
+
+    Phase 3 populates the per-frame required-region track so the
+    ``required_region_miss_rate`` metric scores against actual face
+    bbox positions instead of empty data. The two speakers sit at
+    x=25 % (slot 0) and x=75 % (slot 1) with a 10 % bbox width.
+    Only the ACTIVE speaker is required at each timestamp — the
+    passive speaker is implicitly optional (Phase 4+ will track
+    optionals separately if needed).
+    """
+    duration = 20.0
+    fps = 10.0  # matches _build_2speaker_alternating's step=0.1
+    n = int(duration * fps)
+    regions: list[list[tuple[float, float]]] = []
+    face_w = 10.0
+    half = face_w / 2.0
+    for i in range(n):
+        t = i / fps
+        # Speaker alternates every 2 s. Index 0 active for t<2, then
+        # index 1, etc.
+        slot_idx = int(t // 2.0) % 2
+        cx = 25.0 if slot_idx == 0 else 75.0
+        regions.append([(cx - half, cx + half)])
     return GroundTruth(
         expected_switches=[float(i) * 2.0 for i in range(1, 10)],
+        required_regions_per_frame=regions,
     )
 
 
 def _gt_3speaker_panel() -> GroundTruth:
-    # Speaker rotates every 1.5 s; ground truth is one switch at each
-    # boundary except t=0.
+    """Per-frame ground truth for the 3-seat panel fixture.
+
+    Speaker rotates every 1.5 s across slots 0 / 1 / 2 (x = 20, 50, 80).
+    The active speaker's bbox is the per-frame required region.
+    """
+    duration = 18.0
+    fps = 10.0
+    n = int(duration * fps)
+    regions: list[list[tuple[float, float]]] = []
+    face_w = 10.0
+    half = face_w / 2.0
+    centers_pct = [20.0, 50.0, 80.0]
+    for i in range(n):
+        t = i / fps
+        slot_idx = int(t / 1.5) % 3
+        cx = centers_pct[slot_idx]
+        regions.append([(cx - half, cx + half)])
     return GroundTruth(
         expected_switches=[i * 1.5 for i in range(1, 12)],
+        required_regions_per_frame=regions,
     )
 
 
