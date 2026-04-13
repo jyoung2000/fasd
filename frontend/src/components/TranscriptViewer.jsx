@@ -63,6 +63,11 @@ export default function TranscriptViewer({ transcript, onSeek, jobId, onSpeakerR
   const [addingSpeaker, setAddingSpeaker] = useState(false);
   const [newSpeakerName, setNewSpeakerName] = useState('');
 
+  // Delete speaker state
+  const [deletingSpeaker, setDeletingSpeaker] = useState(null);
+  const [deleteReassignTo, setDeleteReassignTo] = useState('');
+  const [deletingSpeakerInProgress, setDeletingSpeakerInProgress] = useState(false);
+
   // Insert segment state
   const [insertAfterIdx, setInsertAfterIdx] = useState(null);
   const [insertText, setInsertText] = useState('');
@@ -216,6 +221,39 @@ export default function TranscriptViewer({ transcript, onSeek, jobId, onSpeakerR
       submitRename();
     } else if (e.key === 'Escape') {
       cancelEditing();
+    }
+  };
+
+  // --- Delete speaker ---
+  const startDeletingSpeaker = (speaker) => {
+    setDeletingSpeaker(speaker);
+    setDeleteReassignTo('');
+  };
+
+  const cancelDeletingSpeaker = () => {
+    setDeletingSpeaker(null);
+    setDeleteReassignTo('');
+  };
+
+  const confirmDeleteSpeaker = async () => {
+    if (!jobId || !deletingSpeaker) return;
+    setDeletingSpeakerInProgress(true);
+    try {
+      const base = `/api/jobs/${jobId}/speakers/${encodeURIComponent(deletingSpeaker)}`;
+      const url = deleteReassignTo
+        ? `${base}?reassign_to=${encodeURIComponent(deleteReassignTo)}`
+        : base;
+      const res = await fetch(url, { method: 'DELETE' });
+      if (res.ok) {
+        cancelDeletingSpeaker();
+        if (onTranscriptUpdated) onTranscriptUpdated();
+      } else {
+        console.error('Delete speaker failed:', res.status, await res.text());
+      }
+    } catch (err) {
+      console.error('Delete speaker failed:', err);
+    } finally {
+      setDeletingSpeakerInProgress(false);
     }
   };
 
@@ -494,6 +532,90 @@ export default function TranscriptViewer({ transcript, onSeek, jobId, onSpeakerR
         {speakers.map((sp) => {
           const color = speakerColor(sp);
           const isEditing = editingSpeaker === sp;
+          const isDeleting = deletingSpeaker === sp;
+          const segmentCount = transcript.reduce(
+            (n, seg) => (seg.speaker === sp ? n + 1 : n),
+            0,
+          );
+          const otherSpeakers = speakers.filter((other) => other !== sp);
+          if (isDeleting) {
+            return (
+              <div
+                key={sp}
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 6,
+                  padding: '4px 8px',
+                  background: 'var(--bg-base)',
+                  border: `1px solid ${color}`,
+                  borderRadius: 'var(--radius-sm)',
+                  flexWrap: 'wrap',
+                }}
+              >
+                <span style={{ fontSize: 11, color: 'var(--text-secondary)' }}>
+                  Delete <strong style={{ color }}>{String(sp ?? '')}</strong>
+                  {' ('}
+                  {segmentCount}
+                  {' segment'}
+                  {segmentCount === 1 ? '' : 's'}
+                  {')'}?
+                </span>
+                {otherSpeakers.length > 0 && (
+                  <select
+                    value={deleteReassignTo}
+                    onChange={(e) => setDeleteReassignTo(e.target.value)}
+                    disabled={deletingSpeakerInProgress}
+                    style={{
+                      fontSize: 11,
+                      padding: '2px 4px',
+                      background: 'var(--bg-elevated)',
+                      border: '1px solid var(--border)',
+                      borderRadius: 'var(--radius-sm)',
+                      color: 'var(--text-primary)',
+                    }}
+                    title="Optionally reassign their segments to another speaker instead of deleting them"
+                  >
+                    <option value="">Delete segments</option>
+                    {otherSpeakers.map((o) => (
+                      <option key={o} value={o}>{`Reassign → ${o}`}</option>
+                    ))}
+                  </select>
+                )}
+                <button
+                  onClick={confirmDeleteSpeaker}
+                  disabled={deletingSpeakerInProgress}
+                  style={{
+                    padding: '2px 8px',
+                    fontSize: 11,
+                    background: deleteReassignTo ? 'var(--accent-cyan)' : '#EF4444',
+                    color: '#fff',
+                    border: 'none',
+                    borderRadius: 'var(--radius-sm)',
+                    cursor: deletingSpeakerInProgress ? 'wait' : 'pointer',
+                    fontWeight: 600,
+                  }}
+                >
+                  {deleteReassignTo ? 'Reassign' : 'Delete'}
+                </button>
+                <button
+                  onClick={cancelDeletingSpeaker}
+                  disabled={deletingSpeakerInProgress}
+                  style={{
+                    padding: '2px 8px',
+                    fontSize: 11,
+                    background: 'transparent',
+                    color: 'var(--text-secondary)',
+                    border: '1px solid var(--border)',
+                    borderRadius: 'var(--radius-sm)',
+                    cursor: 'pointer',
+                  }}
+                >
+                  Cancel
+                </button>
+              </div>
+            );
+          }
           return (
             <div key={sp} style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
               <div
@@ -526,21 +648,55 @@ export default function TranscriptViewer({ transcript, onSeek, jobId, onSpeakerR
                   }}
                 />
               ) : (
-                <span
-                  onClick={() => startEditing(sp)}
-                  title="Click to rename speaker"
-                  style={{
-                    fontSize: 12,
-                    color: color,
-                    cursor: 'pointer',
-                    borderBottom: '1px dashed transparent',
-                    transition: 'border-color 0.15s',
-                  }}
-                  onMouseEnter={(e) => (e.target.style.borderBottomColor = color)}
-                  onMouseLeave={(e) => (e.target.style.borderBottomColor = 'transparent')}
-                >
-                  {String(sp ?? '')}
-                </span>
+                <>
+                  <span
+                    onClick={() => startEditing(sp)}
+                    title="Click to rename speaker"
+                    style={{
+                      fontSize: 12,
+                      color: color,
+                      cursor: 'pointer',
+                      borderBottom: '1px dashed transparent',
+                      transition: 'border-color 0.15s',
+                    }}
+                    onMouseEnter={(e) => (e.target.style.borderBottomColor = color)}
+                    onMouseLeave={(e) => (e.target.style.borderBottomColor = 'transparent')}
+                  >
+                    {String(sp ?? '')}
+                  </span>
+                  {jobId && (
+                    <button
+                      onClick={() => startDeletingSpeaker(sp)}
+                      title={`Delete ${sp} (${segmentCount} segment${segmentCount === 1 ? '' : 's'})`}
+                      aria-label={`Delete speaker ${sp}`}
+                      style={{
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        width: 16,
+                        height: 16,
+                        padding: 0,
+                        background: 'transparent',
+                        color: 'var(--text-muted)',
+                        border: '1px solid transparent',
+                        borderRadius: '50%',
+                        cursor: 'pointer',
+                        fontSize: 13,
+                        lineHeight: 1,
+                      }}
+                      onMouseEnter={(e) => {
+                        e.currentTarget.style.color = '#EF4444';
+                        e.currentTarget.style.borderColor = '#EF4444';
+                      }}
+                      onMouseLeave={(e) => {
+                        e.currentTarget.style.color = 'var(--text-muted)';
+                        e.currentTarget.style.borderColor = 'transparent';
+                      }}
+                    >
+                      {'\u00D7'}
+                    </button>
+                  )}
+                </>
               )}
             </div>
           );

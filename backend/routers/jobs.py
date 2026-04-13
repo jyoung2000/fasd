@@ -163,6 +163,73 @@ async def download_srt(job_id: str, speakers: bool = True):
     )
 
 
+@router.delete("/jobs/{job_id}/speakers/{speaker}")
+async def delete_speaker(
+    job_id: str,
+    speaker: str,
+    reassign_to: str | None = None,
+):
+    """Remove a speaker from the transcript.
+
+    If ``reassign_to`` is provided, every transcript segment from
+    ``speaker`` is reassigned to ``reassign_to`` and the original name
+    is dropped from the speaker-name map. Otherwise every segment from
+    ``speaker`` is deleted outright.
+
+    Idempotent: if no segments match ``speaker`` the call still succeeds
+    (affected_segments=0) and the rename map is still cleaned up.
+    """
+    job = await database.load_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if not job.transcript:
+        raise HTTPException(status_code=400, detail="No transcript to edit")
+    if reassign_to is not None and reassign_to == speaker:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot reassign a speaker to itself",
+        )
+
+    kept: list = []
+    affected = 0
+    for seg in job.transcript:
+        s = TranscriptSegment(**seg) if isinstance(seg, dict) else seg
+        if s.speaker == speaker:
+            affected += 1
+            if reassign_to:
+                kept.append(s.model_copy(update={"speaker": reassign_to}))
+            # else: drop the segment entirely
+            continue
+        kept.append(s)
+
+    # Clean the rename map: drop both direct references (key == speaker)
+    # AND any rename whose current value points at the deleted speaker.
+    # When reassigning we do NOT remap value==speaker to reassign_to,
+    # since the map's purpose is auditing the original → current name
+    # transition, not the final destination.
+    name_map = {
+        k: v
+        for k, v in job.speaker_names.items()
+        if k != speaker and v != speaker
+    }
+
+    await database.update_job_status(
+        job_id,
+        transcript=[s.model_dump() for s in kept],
+        speaker_names=name_map,
+    )
+
+    return {
+        "job_id": job_id,
+        "speaker": speaker,
+        "action": "reassign" if reassign_to else "delete",
+        "reassign_to": reassign_to,
+        "affected_segments": affected,
+        "remaining_segments": len(kept),
+        "speaker_names": name_map,
+    }
+
+
 @router.put("/jobs/{job_id}/speakers")
 async def rename_speakers(job_id: str, req: SpeakerRenameRequest):
     """Rename speakers in the transcript.
