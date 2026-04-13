@@ -2814,6 +2814,7 @@ async def _run_analysis_inner(job_id: str):
                         from backend.services.render_plan import USE_RENDER_PLAN
                         if USE_RENDER_PLAN:
                             from backend.services.render_plan_builder import build_render_plan
+                            from backend.services.render_plan_debug import build_debug_payload
                             _rp = build_render_plan(
                                 segments=reframe_segments,
                                 source_width=metadata.get("width", 1920),
@@ -2821,8 +2822,20 @@ async def _run_analysis_inner(job_id: str):
                                 source_fps=metadata.get("fps", 30.0),
                                 target_aspect="9:16",
                             )
+                            # Phase 10: attach debug payload (content
+                            # routing + per-segment editorial + reason
+                            # tags) so the ReframeDebugOverlay chips
+                            # light up without any extra round-trip.
+                            _rp_dict = _rp.to_dict()
+                            _rp_dict["debug"] = build_debug_payload(
+                                job=await database.get_job(job_id),
+                                content_profile=_content_profile,
+                                reframe_segments=reframe_segments,
+                                editorial_report=None,
+                                pacing_estimator=_pacing_estimator,
+                            )
                             await database.update_job_status(
-                                job_id, render_plan=_rp.to_dict(),
+                                job_id, render_plan=_rp_dict,
                             )
                             logger.info(
                                 "[%s] AutoFlip RenderPlan: %d ops, %.1fs duration",
@@ -2968,6 +2981,12 @@ async def _run_analysis_inner(job_id: str):
                         job_id, _bs_e,
                     )
 
+                # Phase 10: give build_reframe_segments a sidecar
+                # dict so the Stage 9b editorial state-machine
+                # report is surfaced back to the caller without
+                # changing the return signature. Gets attached to
+                # the RenderPlan debug payload a few lines below.
+                _reframe_debug_out: dict = {}
                 reframe_segments = build_reframe_segments(
                     shot_cuts=_shot_cuts,
                     face_registry=face_registry,
@@ -2990,6 +3009,7 @@ async def _run_analysis_inner(job_id: str):
                     # Phase 5 + Phase 6 follow-up wiring
                     music_beat_grid=_music_beat_grid_for_seg,
                     anime_anchors=_anime_anchors_for_seg,
+                    debug_out=_reframe_debug_out,
                 )
                 if reframe_segments:
                     # Replace scenes with one scene per reframe segment
@@ -3032,6 +3052,7 @@ async def _run_analysis_inner(job_id: str):
                         from backend.services.render_plan import USE_RENDER_PLAN
                         if USE_RENDER_PLAN:
                             from backend.services.render_plan_builder import build_render_plan
+                            from backend.services.render_plan_debug import build_debug_payload
                             _rp = build_render_plan(
                                 segments=reframe_segments,
                                 source_width=metadata.get("width", 1920),
@@ -3039,8 +3060,20 @@ async def _run_analysis_inner(job_id: str):
                                 source_fps=metadata.get("fps", 30.0),
                                 target_aspect="9:16",
                             )
+                            # Phase 10: attach debug payload so the
+                            # ReframeDebugOverlay chip row + per-segment
+                            # editorial / reason tags light up with no
+                            # extra API round-trip.
+                            _rp_dict = _rp.to_dict()
+                            _rp_dict["debug"] = build_debug_payload(
+                                job=await database.get_job(job_id),
+                                content_profile=_content_profile,
+                                reframe_segments=reframe_segments,
+                                editorial_report=_reframe_debug_out.get("editorial_report"),
+                                pacing_estimator=_pacing_estimator,
+                            )
                             await database.update_job_status(
-                                job_id, render_plan=_rp.to_dict(),
+                                job_id, render_plan=_rp_dict,
                             )
                             logger.info(
                                 "[%s] RenderPlan built: %d ops, %.1fs duration",

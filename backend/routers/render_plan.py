@@ -183,31 +183,42 @@ class _SimpleSegment:
 def _build_debug_info(job, segments) -> dict:
     """Build debug visualization data from job and segments.
 
-    Includes pacing, min_hold, confidence, and fallback reasons.
-    """
-    debug = {
-        "pacing_per_sec": [],
-        "min_hold_per_sec": [],
-        "confidence_per_segment": [],
-        "fallback_reasons": [],
-    }
+    Merges the legacy pacing / confidence / fallback fields with the
+    Phase 10 content-routing chips + per-segment reason tags. The
+    heavy lifting lives in ``backend.services.render_plan_debug`` so
+    the pipeline's cached-plan path and this on-demand rebuild
+    path emit the same shape.
 
-    # Try to get pacing data from job metadata
+    Editorial prior decisions are only available when the pipeline
+    wrote them onto the cached ``render_plan["debug"]`` at job-run
+    time (on-demand rebuilds can't re-run the state machine here).
+    """
+    from backend.services.render_plan_debug import build_debug_payload
+
+    debug = build_debug_payload(
+        job=job,
+        content_profile=None,
+        reframe_segments=segments,
+        editorial_report=None,
+        pacing_estimator=None,
+    )
+
+    # Legacy compatibility: earlier overlay versions read
+    # ``pacing_per_sec`` / ``min_hold_per_sec`` from an older
+    # ``job.pacing_data`` attribute. Preserve that path for any
+    # jobs that still have it populated.
     pacing_data = getattr(job, "pacing_data", None)
     if pacing_data and isinstance(pacing_data, dict):
-        debug["pacing_per_sec"] = pacing_data.get("pacing", [])
-        debug["min_hold_per_sec"] = pacing_data.get("min_hold", [])
+        if "pacing" in pacing_data and "pacing_per_sec" not in debug:
+            debug["pacing_per_sec"] = pacing_data.get("pacing", [])
+        if "min_hold" in pacing_data and "min_hold_per_sec" not in debug:
+            debug["min_hold_per_sec"] = pacing_data.get("min_hold", [])
 
-    # Extract confidence and fallback reasons from segments
-    if segments:
-        for seg in segments:
-            conf = getattr(seg, "confidence", 1.0)
-            debug["confidence_per_segment"].append(round(conf, 3))
-
-            reason = getattr(seg, "reason", "") or ""
-            if "confidence" in reason or "fallback" in reason or "blur_fill" in reason or "wide_master" in reason:
-                debug["fallback_reasons"].append(reason)
-            else:
-                debug["fallback_reasons"].append(None)
+    # Guarantee the legacy keys exist (even if empty) so the
+    # overlay's `debug?.pacing_per_sec` checks stay truthy-safe.
+    debug.setdefault("pacing_per_sec", [])
+    debug.setdefault("min_hold_per_sec", [])
+    debug.setdefault("confidence_per_segment", [])
+    debug.setdefault("fallback_reasons", [])
 
     return debug

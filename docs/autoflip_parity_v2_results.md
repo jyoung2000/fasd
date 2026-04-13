@@ -345,3 +345,195 @@ follow one face at a time. With the multi-region LP enabled and a
 fixture that exercises the simultaneous-overlap path, this number
 will drop dramatically — Phase 3 follow-up (or Phase 4 prerequisite)
 adds an overlap fixture.
+
+---
+
+## Phase 10 — End-to-end roll-up across every v2 phase
+
+Phase 10 closes the loop: **one runner that exercises every flag
+combination on every fixture and asserts no regression against the
+Phase 0 baseline**. The runner is
+`backend/scripts/validate_v2_phases.py` — invoke it locally or
+inside the docker image:
+
+```bash
+# Sandbox / local python (numpy + scipy only)
+python -m backend.scripts.validate_v2_phases \
+    --json-out docs/autoflip_parity_v2_phase10.json \
+    --markdown-out docs/autoflip_parity_v2_phase10.md
+
+# Inside the production docker image (full cv2 / librosa / MediaPipe)
+docker compose exec backend python -m \
+    backend.scripts.validate_v2_phases \
+    --json-out /app/docs/autoflip_parity_v2_phase10.json \
+    --markdown-out /app/docs/autoflip_parity_v2_phase10.md
+```
+
+The runner exits 0 iff every combination passes the safety gate,
+2 on any regression, 1 on CLI error. The combination matrix is
+baseline → each phase individually → `all_on`; it's identical to
+the one the default-flip follow-up will flip.
+
+### Per-combo safety gate (sandbox run, 2026-04-13)
+
+| combo                       | safety | segments | status |
+|---|---|---|---|
+| `baseline`                  | PASS   | 37       | ok     |
+| `phase3_multi_region_lp`    | PASS   | 26       | ok     |
+| `phase4_lead_room_thirds`   | PASS   | 26       | ok     |
+| `phase5_music_beat_snap`    | PASS   | 26       | ok     |
+| `phase6_anime`              | PASS   | 26       | ok     |
+| `phase7_gameplay_tracker`   | PASS   | 26       | ok     |
+| `phase8_editorial_prior`    | PASS   | 26       | ok     |
+| `all_on`                    | PASS   | 26       | ok     |
+
+The segment count drops from 37 → 26 on every v2 combo (−11
+segments) because the `debate` content-type routing on
+`3speaker_panel` now uses `split_screen` for the entire 18 s clip
+instead of cutting to each of the 11 speaker turns. That's a
+deliberate Phase 2 editorial decision (seated panels stay on all
+faces at once) and it's tracked in the safety gate as a
+**known divergence** — the whitelist block in
+`validate_v2_phases._KNOWN_DIVERGENCES` skips
+`(3speaker_panel, sub_second_switch_recall)` so the gate doesn't
+block on a fixture whose ground truth pre-dates the panel
+behavior. Follow-up: author a `3speaker_panel_legacy` fixture
+with `content_type_override="podcast"` (no panel flag) to
+separately regression-test the per-speaker cutting path.
+
+### Metric deltas that actually moved (sandbox)
+
+| combo                       | fixture              | metric                        | baseline | combo | Δ        |
+|---|---|---|---|---|---|
+| `phase4_lead_room_thirds`   | `vlog_walk_and_talk` | `required_region_miss_rate`   | 0.60     | 0.43  | −0.170   |
+| `phase8_editorial_prior`    | `2speaker_alternating` | `required_region_miss_rate` | 0.40     | 0.39  | −0.010   |
+| `all_on`                    | `vlog_walk_and_talk` | `required_region_miss_rate`   | 0.60     | 0.43  | −0.170   |
+| `all_on`                    | `2speaker_alternating` | `required_region_miss_rate` | 0.40     | 0.39  | −0.010   |
+
+Two real, measurable improvements show up on the parity bench:
+
+1. **Phase 4 on `vlog_walk_and_talk`** — the `CLIPAI_THIRDS_BIAS`
+   and `CLIPAI_GAZE_LEAD_ROOM_V2` flags together drop the
+   required-region miss rate by 28 % relative on the walking
+   vlog fixture. The subject walks 35 → 65 % across a 10 s clip;
+   with thirds bias the crop center leads the walk direction
+   instead of chasing it, so the subject's face stays inside the
+   crop window for more frames.
+
+2. **Phase 8 on `2speaker_alternating`** — the
+   `CLIPAI_EDITORIAL_PRIOR` flag nudges the J-cut boundaries
+   after the new speaker's first audio word, which recovers a
+   small fraction of the "speaker first appears outside the
+   crop" frames. The delta is small because this fixture is
+   already at 60 % coverage under baseline, but it's in the
+   expected direction.
+
+The other phases don't show deltas on the sandbox fixture set
+for different reasons:
+
+- **Phase 3 multi-region LP** is designed to fire on
+  simultaneous-overlap frames (two faces visible at once). The
+  current 2- and 3-speaker fixtures alternate turns instead of
+  overlapping, so the LP has nothing to re-fit. A fixture with
+  explicit overlap windows is a Phase 3 follow-up.
+- **Phase 5 music beat snap** needs segment boundaries that are
+  OFF the beat grid to snap. The `music_video_beat` fixture's
+  synthetic boundaries already land on downbeats, so the snap
+  delta is zero — the snap rate is already 100 %.
+- **Phase 6 anime anchor** requires per-frame anime face / motion
+  / saturation features on the fixture input. The parity bench
+  builds are synthetic and don't populate those inputs, so
+  Stage 7b has nothing to re-anchor on. Verified end-to-end via
+  the 48 Phase 6 unit tests instead.
+- **Phase 7 gameplay tracker** requires per-frame motion
+  centroids. The `tps_character_offset` fixture doesn't
+  include them (it uses the HUD-zone path only), so Stage 7c
+  has no tracks to smooth. Verified end-to-end via the 34
+  Phase 7 unit tests instead.
+
+### What docker validation covers that sandbox doesn't
+
+The sandbox run above uses the pure-python segmenter path
+(numpy + scipy, no cv2 / librosa / MediaPipe). That's enough to
+exercise the **logic** of every Phase 3-8 tuning path but it
+**cannot** exercise:
+
+- Real image-pixel anime anchor scoring (Phase 6) — requires cv2.
+- Real beat detection from audio files (Phase 5) — requires
+  librosa.
+- Real dense face detection on video frames — requires MediaPipe
+  / OpenCV YuNet / SFace.
+- The Phase 10 debug payload on a RenderPlan (needs the
+  production pipeline.py write path).
+
+Running the same runner inside the production docker image picks
+up all four. The docker commands are in the **Docker validation
+playbook** section below.
+
+### Docker validation playbook
+
+The following commands should be run inside the production docker
+image to confirm every Phase 3-8 tuning path behaves the same as
+in the sandbox run above, AND that the Phase 10 debug payload
+lights up the `ReframeDebugOverlay` chips end-to-end on a real job.
+
+```bash
+# 1) Start the stack (from repo root)
+docker compose up -d backend
+
+# 2) Unit-test sweep — every Phase 3-8 test file passes.
+docker compose exec backend python -m pytest \
+    backend/tests/test_multi_region_lp.py \
+    backend/tests/test_phase4_gaze_thirds.py \
+    backend/tests/test_phase5_beat_snap.py \
+    backend/tests/test_phase6_anime.py \
+    backend/tests/test_phase6_followups.py \
+    backend/tests/test_phase7_gameplay.py \
+    backend/tests/test_phase8_editorial.py \
+    backend/tests/test_content_routing_matrix.py \
+    backend/tests/test_content_type_override_plumbing.py \
+    backend/tests/test_render_plan_debug.py \
+    -v
+
+# 3) Full parity matrix — runs every flag combo on every
+#    fixture and writes the roll-up to /app/docs.
+docker compose exec backend python -m \
+    backend.scripts.validate_v2_phases \
+    --json-out /app/docs/autoflip_parity_v2_phase10_docker.json \
+    --markdown-out /app/docs/autoflip_parity_v2_phase10_docker.md
+
+# 4) Single-fixture drill-down for a given phase (useful when
+#    a regression appears in the matrix output):
+docker compose exec backend \
+    -e CLIPAI_MULTI_REGION_LP=true \
+    -e CLIPAI_GAZE_LEAD_ROOM_V2=true \
+    -e CLIPAI_THIRDS_BIAS=true \
+    python -m backend.scripts.measure_autoflip_parity \
+        --fixture vlog_walk_and_talk
+
+# 5) End-to-end preview-overlay smoke test. Upload a short
+#    debate clip and hit the render_plan?debug=1 endpoint. The
+#    overlay chip row should show: content=podcast panel=yes
+#    plus per-segment reason tags.
+docker compose exec backend curl -s \
+    "http://localhost:8000/api/jobs/$JOB_ID/render_plan?debug=1" \
+    | python -c 'import json, sys; p=json.load(sys.stdin); \
+                  print(json.dumps(p.get("debug"), indent=2))'
+```
+
+Expected outputs:
+
+- Test sweep: **every** Phase 3-10 test file reports PASS (in
+  the sandbox there are 476 tests across 11 files — the same
+  set should pass in docker).
+- Matrix runner: `SAFETY GATE PASSED` with exit code 0.
+- Per-phase drill-down: matches the sandbox row in this doc.
+- Debug endpoint: returns a `debug` block with `content_type`,
+  `is_multi_speaker_panel`, `anime_subtype` / `music_subtype`
+  / `gameplay_subtype` / `game_type` fields set from the upload
+  dropdown plus `confidence_per_segment` + `reason_per_segment`
+  arrays.
+
+If any step fails, the roll-up markdown has enough context to
+pinpoint which phase introduced the regression without re-running
+the full matrix.

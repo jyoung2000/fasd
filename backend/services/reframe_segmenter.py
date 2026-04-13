@@ -95,6 +95,7 @@ def build_reframe_segments(
     anime_anchors: list = None,
     gameplay_motion_centroids: list = None,
     audio_events: list = None,
+    debug_out: Optional[dict] = None,
 ) -> list[ReframeSegment]:
     """Build a segment-based reframe timeline.
 
@@ -1052,6 +1053,13 @@ def build_reframe_segments(
                     editorial_report.n_listener_holds,
                     editorial_report.n_reaction_beats,
                 )
+            # Phase 10: surface the editorial report to the caller
+            # via the optional ``debug_out`` out-parameter so
+            # pipeline.py can attach per-segment j_cut / l_cut /
+            # listener_hold / reaction_beat tags onto the cached
+            # RenderPlan debug payload.
+            if debug_out is not None and editorial_report is not None:
+                debug_out["editorial_report"] = editorial_report
     except Exception as e:
         logger.warning(
             "[%s] Editorial prior failed (non-fatal): %s",
