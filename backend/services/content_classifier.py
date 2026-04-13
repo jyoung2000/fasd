@@ -22,7 +22,7 @@ from backend.services.content_type_config import ContentType
 logger = logging.getLogger(__name__)
 
 USE_CONTENT_AWARE_REFRAME = os.environ.get(
-    "USE_CONTENT_AWARE_REFRAME", "false"
+    "USE_CONTENT_AWARE_REFRAME", "true"
 ).lower() in ("true", "1", "yes")
 
 

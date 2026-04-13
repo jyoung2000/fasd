@@ -1109,6 +1109,37 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                     center_pct_log, center_count, len(all_sx),
                 )
 
+            # v2 Phase 11 (Fix 5): hard quality gate. When > 25% of scenes
+            # hedge to center, the vision model is guessing, not actually
+            # locating subjects. Feeding those subject_x values into
+            # subject tracking produces garbage crops that the existing
+            # "center-default inheritance" patch only partially recovers.
+            # Collapse all subject_x to the default (50) and clear any
+            # optional precise_x / active_speaker_x so the downstream
+            # dense-face-data override in pipeline.py fills every scene
+            # from face detection — strictly more reliable than a vision
+            # model that's center-hedging.
+            #
+            # SceneDescription.subject_x is a non-optional int (default 50),
+            # so we reset to 50 rather than None; precise_x IS Optional
+            # and gets explicitly cleared.
+            if center_pct_log > 25 and len(all_sx) > 5:
+                logger.warning(
+                    "Vision model quality too low (%d%% center defaults, "
+                    "threshold=25%%) — discarding vision-derived subject_x "
+                    "for all %d scenes. Pipeline will rely on dense face "
+                    "data + active speaker timeline.",
+                    int(center_pct_log), len(scenes),
+                )
+                for scene in scenes:
+                    scene.subject_x = 50
+                    scene.active_speaker_x = None
+                    try:
+                        scene.precise_x = None
+                        scene.precise_y = None
+                    except AttributeError:
+                        pass
+
         # ── Quality check: if most frames defaulted to center, re-analyze ──
         # Skip re-analysis if the initial analysis failed due to auth/billing errors —
         # re-trying the same dead API would just waste time.

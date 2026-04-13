@@ -857,21 +857,28 @@ def build_face_registry_with_embeddings(
     # >30 detected frames is almost certainly a cross-shot merge — one
     # "identity" that's actually several different people or the same
     # person appearing at wildly different positions in unrelated shots.
-    # When >25% of slots fail this check, the embedding registry is
-    # corrupted (typical for multi-character anime / TV drama) and we
-    # fall back to position-based clustering.
+    #
+    # v2 Phase 11 (Fix 2): ANY single slot failing this check is enough
+    # to poison the registry, because downstream speaker-to-slot mapping
+    # collapses onto that one merged slot. The previous "> 25% of slots"
+    # gate let the Verzuz/Tank-Tyrese clip through with Slot 8 spanning
+    # [14-98]% (1 of 9 slots) — that single slot made the entire
+    # embedding registry unusable. Lower the threshold to any-single-slot.
     if slots:
         wide_span_bad = [
             s for s in slots
             if (s.x_max - s.x_min) > 60 and s.frame_count > 30
         ]
-        bad_frac = len(wide_span_bad) / max(len(slots), 1)
-        if bad_frac > 0.25:
+        if wide_span_bad:
             pos_reg = build_face_registry(face_results, min_appearances)
             logger.warning(
-                "[FaceRegistry] embedding slots rejected: %d of %d had span>60%% "
-                "and frame_count>30, falling back to position-based (%d slots)",
-                len(wide_span_bad), len(slots), len(pos_reg.slots),
+                "[FaceRegistry] embedding registry rejected: %d of %d slot(s) "
+                "had span>60%% AND frame_count>30 (cross-shot merge). Using "
+                "position-based (%d slots) instead of embeddings (%d slots). "
+                "Offending slots: %s",
+                len(wide_span_bad), len(slots), len(pos_reg.slots), len(slots),
+                [f"slot{s.slot_id}:[{s.x_min:.0f}-{s.x_max:.0f}],{s.frame_count}f"
+                 for s in wide_span_bad],
             )
             return pos_reg
 
@@ -912,6 +919,22 @@ def build_face_registry_with_embeddings(
             len(pos_registry.slots), len(slots),
         )
         return pos_registry
+
+    # v2 Phase 11 (Fix 2): for multi-speaker panels, prefer the position-
+    # based registry whenever it produced a reasonable 2-6 slot layout,
+    # even if the embedding registry found more slots. Embeddings split
+    # on pose/lighting rather than identity on seated panel clips, so a
+    # higher embedding-slot count usually means fragmentation, not
+    # coverage. The legacy "max wins" rule is kept for non-panel content.
+    if panel_mode and 2 <= len(pos_registry.slots) <= 6:
+        if len(pos_registry.slots) <= len(slots):
+            logger.info(
+                "[FaceRegistry] panel_mode=True, pos=%d slots, emb=%d slots "
+                "— preferring position-based (panel seats are fixed; embedding "
+                "splits on pose/lighting, not identity)",
+                len(pos_registry.slots), len(slots),
+            )
+            return pos_registry
 
     if len(pos_registry.slots) > len(slots):
         logger.info(

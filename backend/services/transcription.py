@@ -112,6 +112,75 @@ def ensure_whisper_model_downloaded(model_name: str, timeout: float = 600) -> bo
         return False
 
 
+async def _evict_ollama_for_whisper() -> None:
+    """Unload any loaded Ollama models to free VRAM before launching Whisper.
+
+    v2 Phase 11 (Fix 6): Ollama's idle CUDA context (~1.6 GB) is enough
+    to evict Whisper off the GPU on a 4 GB 1650, forcing the ctranslate2
+    CPU int8 fallback which is 10-30x slower. Queries ``/api/ps`` and
+    posts ``keep_alive=0`` to each loaded model, then sleeps briefly so
+    the driver can reclaim the VRAM before the Whisper subprocess opens
+    its CUDA context.
+
+    Best-effort: any errors are logged and swallowed by the caller.
+    """
+    import asyncio as _aio
+    try:
+        import httpx  # noqa: WPS433 — local import keeps the hot-path slim
+    except ImportError:
+        logger.debug("httpx not available — skipping Ollama eviction")
+        return
+
+    ollama_url = (
+        os.environ.get("OLLAMA_HOST")
+        or getattr(settings, "OLLAMA_HOST", None)
+        or "http://ollama:11434"
+    ).rstrip("/")
+
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        try:
+            resp = await client.get(f"{ollama_url}/api/ps")
+        except Exception as e:
+            logger.debug("Ollama /api/ps unreachable (%s) — nothing to evict", e)
+            return
+        if resp.status_code != 200:
+            logger.debug(
+                "Ollama /api/ps returned %s — skipping eviction",
+                resp.status_code,
+            )
+            return
+        try:
+            models = resp.json().get("models", [])
+        except Exception:
+            models = []
+
+        if not models:
+            logger.debug("Ollama has no models loaded — no eviction needed")
+            return
+
+        evicted = 0
+        for m in models:
+            name = m.get("name") or m.get("model")
+            if not name:
+                continue
+            try:
+                await client.post(
+                    f"{ollama_url}/api/generate",
+                    json={"model": name, "keep_alive": 0},
+                )
+                evicted += 1
+            except Exception as e:
+                logger.debug("Failed to evict Ollama model %s: %s", name, e)
+
+        if evicted:
+            logger.info(
+                "Evicted %d Ollama model(s) from VRAM before Whisper CUDA",
+                evicted,
+            )
+            # Give the driver a beat to actually release the memory.
+            await _aio.sleep(2.0)
+
+
 async def preflight_whisper_check(timeout: float = 90) -> dict:
     """Quick pre-flight check that the Whisper model loads and CUDA works.
 
@@ -249,6 +318,23 @@ async def transcribe_audio_subprocess(
                 idx = int(gpu_idx)
                 if idx < cuda_count:
                     device_index = idx
+
+    # v2 Phase 11 (Fix 6): evict any Ollama models from VRAM BEFORE
+    # launching the Whisper subprocess. Ollama holds ~1.6GB in its
+    # CUDA context even when idle (the new pipeline only pings /api/tags
+    # for health checks), which is enough to evict Whisper off the GPU
+    # on a 4 GB 1650 and force the ctranslate2 CPU int8 fallback. CPU
+    # Whisper takes 10-30x longer. Eviction is best-effort — if Ollama
+    # isn't reachable or returns errors, Whisper will still try CUDA
+    # and fall back to CPU as before.
+    if device == "cuda":
+        try:
+            await _evict_ollama_for_whisper()
+        except Exception as _ollama_e:
+            logger.warning(
+                "Ollama VRAM eviction for Whisper failed (non-fatal): %s",
+                _ollama_e,
+            )
 
     # ── VRAM safety checks for subprocess (exclusive GPU access) ──
     # Since main process no longer preloads Whisper, the subprocess gets the

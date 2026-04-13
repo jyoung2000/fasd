@@ -36,7 +36,12 @@ logger = logging.getLogger(__name__)
 
 # ── Feature flags ──
 USE_REFRAME_SEGMENTER = os.environ.get("USE_REFRAME_SEGMENTER", "true").lower() in ("true", "1", "yes")
-USE_CONTENT_AWARE_REFRAME = os.environ.get("USE_CONTENT_AWARE_REFRAME", "false").lower() in ("true", "1", "yes")
+# v2 Phase 11: default ON. The content-aware branches (panel hold, narrative,
+# gaming, anime) were shipped dormant because the env var defaulted to "false",
+# so classify_content's output never reached the segmenter and every panel
+# clip ran as content_type=unknown. Parity bench (Phase 10) passed with these
+# branches enabled; there is no reason to keep them behind a flag.
+USE_CONTENT_AWARE_REFRAME = os.environ.get("USE_CONTENT_AWARE_REFRAME", "true").lower() in ("true", "1", "yes")
 USE_INTENT_TRACKING = os.environ.get("USE_INTENT_TRACKING", "false").lower() in ("true", "1", "yes")
 
 # ── Default tunables (used when no content profile is provided) ──
@@ -123,7 +128,18 @@ def build_reframe_segments(
     cfg = None
     _tuning = None
     if content_profile and USE_CONTENT_AWARE_REFRAME:
-        ct = getattr(content_profile, 'content_type', 'unknown') or 'unknown'
+        base_ct = getattr(content_profile, 'content_type', 'unknown') or 'unknown'
+        # v2 Phase 11: a multi-speaker panel needs distinct editorial
+        # routing (tighter holds, no in-shot tracking, per-turn snaps).
+        # Previously the classifier would set content_type="podcast" and
+        # is_multi_speaker_panel=True, but the segmenter only looked at
+        # content_type so panels ran with vlog/podcast pacing. Promote
+        # the flag to its own ct key here so get_config("multi_speaker_panel")
+        # returns the panel preset.
+        if getattr(content_profile, 'is_multi_speaker_panel', False):
+            ct = "multi_speaker_panel"
+        else:
+            ct = base_ct
         try:
             from backend.services.content_type_config import get_config, get_tuning_from_profile
             cfg = get_config(ct)

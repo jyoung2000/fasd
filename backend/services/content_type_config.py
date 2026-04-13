@@ -21,6 +21,10 @@ class ContentType(str, Enum):
     SPORTS = "sports"
     MUSIC_VIDEO = "music_video"
     ANIME = "anime"
+    # v2 Phase 11: distinct preset for seated 2-5 person panels (Verzuz,
+    # debate show, interview show). Panels need tighter holds and snap-
+    # on-speaker-turn pacing — not the vlog/podcast tracking presets.
+    MULTI_SPEAKER_PANEL = "multi_speaker_panel"
     UNKNOWN = "unknown"
 
 
@@ -176,6 +180,35 @@ CONTENT_TYPE_CONFIG = {
         # Intent tracking — snappiest, fast cuts demand fast response
         "intent_ema_alpha": 0.55,
         "intent_switch_margin": 0.10,
+    },
+    # v2 Phase 11 — multi-speaker panel (Verzuz, debate show, interview panel).
+    # Mirrors PODCAST but with tighter per-speaker holds and no in-shot
+    # tracking: seats are fixed so the camera should snap on speaker turn,
+    # not pan. Short-shot override is gated separately on shot-detector
+    # confidence in layout_engine.
+    ContentType.MULTI_SPEAKER_PANEL: {
+        "apply_lead_room": False,
+        "wide_master_on_multi_face": False,
+        "allow_tracking": False,
+        "allow_tracking_within_shot": False,
+        "allow_motion_tracking": False,
+        "use_split_screen_on_overlap": True,
+        "overlap_threshold_seconds": 1.0,
+        "laughter_widen_ms": 1500,
+        "fallback_preference": "blur_fill",
+        "ease_speaker_turn_ms": 300,
+        "ease_shot_cut_ms": 0,
+        "ease_subject_walk_ms": 400,
+        "speaker_confidence_threshold": 0.5,
+        "speaker_coverage_threshold": 0.60,
+        "dense_dominance_threshold": 0.70,
+        "multi_speaker_threshold": 0.20,
+        # Tighter hold floor than podcast (0.9s vs 1.2s default pacing)
+        # so speaker turns feel immediate.
+        "min_hold_seconds_panel": 0.9,
+        "anticipation_lead_seconds": 0.20,
+        "intent_ema_alpha": 0.35,
+        "intent_switch_margin": 0.15,
     },
     ContentType.UNKNOWN: {
         "apply_lead_room": False,

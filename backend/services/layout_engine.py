@@ -447,7 +447,26 @@ def _plan_layout_impl(
         if content_type else False
     )
     _panel_short_shot_overrides: dict = {}
-    if is_panel and face_registry and getattr(face_registry, "slots", None):
+    # v2 Phase 11 (Fix 3): gate the short-shot override on shot-detector
+    # confidence. The opencv frame-diff fallback fires on static panel
+    # content (lighting flicker, compression noise) — 179 "shots" on a
+    # 10-minute clip. Each fake shot was getting hard-pinned to an active
+    # speaker slot via a 2-keyframe stationary crop, bypassing the L1
+    # solver and reintroducing the 2-Hz stair-stepping this phase was
+    # supposed to eliminate. If ANY shot is low-confidence, skip the
+    # override and let the L1 solver handle smoothing.
+    _any_low_conf_shots = any(
+        getattr(s, "detector_confidence", "high") == "low" for s in shots
+    )
+    if _any_low_conf_shots:
+        logger.info(
+            "[%s] [Layout+Solver] panel short-shot override SKIPPED: shot "
+            "detector confidence is low (opencv fallback on %d shots). "
+            "Trusting L1 solver.",
+            job_id, sum(1 for s in shots
+                        if getattr(s, "detector_confidence", "high") == "low"),
+        )
+    if is_panel and not _any_low_conf_shots and face_registry and getattr(face_registry, "slots", None):
         _source_aspect = (
             source_width / source_height if source_height > 0 else 16 / 9
         )
@@ -741,4 +760,135 @@ def _build_saliency_dominant_crop(sc, regions_per_frame, source_width, source_he
         layout_mode=LayoutMode.SINGLE,
         face_positions=kf_positions,
         transition_type="cut",
+    )
+
+
+def layout_from_reframe_segments(
+    reframe_segments: list,
+    face_registry,
+    source_width: int,
+    source_height: int,
+    job_id: str = "",
+) -> LayoutTimeline:
+    """Build a LayoutTimeline directly from ReframeSegments.
+
+    v2 Phase 11 (Fix 7): the ReframeSegmenter already produces a
+    content-aware, L1-solved, confidence-gated timeline. The legacy
+    ``plan_layout`` path runs its own shot detection + required-regions
+    + camera solver pass, which on the Verzuz/Tank-Tyrese clip
+    produced a second, incompatible decomposition (179 opencv-fallback
+    "shots", a panel short-shot override that hard-pinned 165 of them
+    to single-slot centers, and a different content_type than what
+    the segmenter was using). The two paths running in series means
+    the final keyframes come from whichever one wrote last — with
+    no smoothing guarantees.
+
+    This adapter emits one ``LayoutSegment`` per ``ReframeSegment``
+    without re-running any detection, re-solving, or re-smoothing.
+    ``ReframeSegment.subject_x`` / ``subject_y`` are in source-pixel
+    space; this function converts to the 0-100 normalized coordinate
+    that downstream consumers expect in ``face_positions``.
+
+    Any ``ReframeSegment.motion_path`` values (already L1-solved for
+    tracking segments) are threaded through as keyframes so the
+    renderer gets smoothing without a second solver pass.
+    """
+    from backend.models import LayoutMode
+
+    if not reframe_segments:
+        return LayoutTimeline(
+            segments=[],
+            default_mode="single",
+            face_registry=face_registry,
+            total_layout_changes=0,
+        )
+
+    _sw = max(source_width, 1)
+    _sh = max(source_height, 1)
+
+    # ReframeSegment.layout → LayoutMode
+    _layout_map = {
+        "single": LayoutMode.SINGLE,
+        "split": LayoutMode.SPLIT,
+        "triple": LayoutMode.TRIPLE,
+        "wide_master": LayoutMode.SINGLE,   # Renderer treats wide_master
+        "blur_fill": LayoutMode.SINGLE,     # and blur_fill as SINGLE + bg
+        "stacked_gameplay": LayoutMode.GAMEPLAY,
+        "grid": LayoutMode.TRIPLE,
+    }
+
+    segments: list = []
+    layout_changes = 0
+    prev_mode: str = None
+
+    for rseg in reframe_segments:
+        _layout_mode = _layout_map.get(
+            getattr(rseg, "layout", "single"), LayoutMode.SINGLE,
+        )
+
+        # Build keyframes. Use motion_path if present (tracking/panning
+        # already L1-solved in the segmenter), otherwise emit stationary
+        # start/end kf pair at the subject_x/y.
+        motion_path = getattr(rseg, "motion_path", None)
+        if motion_path:
+            kf_positions = [
+                {
+                    "timestamp": float(t),
+                    "x": float(px / _sw * 100.0),
+                    "y": float(py / _sh * 100.0),
+                    "solver_mode": str(getattr(rseg, "strategy", "stationary")),
+                    "solver_zoom": 1.0,
+                }
+                for (t, px, py) in motion_path
+            ]
+        else:
+            _cx = float(rseg.subject_x / _sw * 100.0)
+            _cy = float(rseg.subject_y / _sh * 100.0)
+            kf_positions = [
+                {
+                    "timestamp": float(rseg.start),
+                    "x": _cx, "y": _cy,
+                    "solver_mode": str(getattr(rseg, "strategy", "stationary")),
+                    "solver_zoom": 1.0,
+                },
+                {
+                    "timestamp": float(rseg.end),
+                    "x": _cx, "y": _cy,
+                    "solver_mode": str(getattr(rseg, "strategy", "stationary")),
+                    "solver_zoom": 1.0,
+                },
+            ]
+
+        # Count layout transitions.
+        if prev_mode is not None and _layout_mode != prev_mode:
+            layout_changes += 1
+        prev_mode = _layout_mode
+
+        seg = LayoutSegment(
+            start=float(rseg.start),
+            end=float(rseg.end),
+            layout_mode=_layout_mode,
+            face_positions=kf_positions,
+            transition_type="cut" if not segments else "dissolve",
+        )
+        segments.append(seg)
+
+    # Determine default mode as the most-used mode.
+    if segments:
+        mode_counts = Counter(s.layout_mode for s in segments)
+        default_mode = mode_counts.most_common(1)[0][0]
+    else:
+        default_mode = LayoutMode.SINGLE
+
+    logger.info(
+        "[%s] [Layout] built from %d reframe segments (skipped re-detection, "
+        "re-solving, and short-shot override); default=%s, transitions=%d",
+        job_id, len(reframe_segments), default_mode, layout_changes,
+    )
+
+    return LayoutTimeline(
+        segments=segments,
+        default_mode=default_mode,
+        face_registry=face_registry,
+        total_layout_changes=layout_changes,
     )

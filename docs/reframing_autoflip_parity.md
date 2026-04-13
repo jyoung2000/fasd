@@ -1864,3 +1864,113 @@ init-POST body grew by the same 2 fields.
   classifier validates anime/music tokens via
   `normalize_anime_subtype` / `normalize_music_subtype` (which
   return `None` for unknown values).
+
+## v2 Phase 11 — regression fixes (Verzuz panel clip)
+
+A 10-minute multi-speaker Verzuz-style panel (Tank vs Tyrese,
+`user override 'debate'`) regressed vs. prior runs: crop jittered
+across 28 unique `subject_x` values on 69 segments for a clip with
+4 speakers in fixed seats. Root cause was not one bug but seven
+systems each overriding the ReframeSegmenter's (correct) output
+with worse data.
+
+1. **`USE_CONTENT_AWARE_REFRAME` now defaults to `true`.** The
+   segmenter's content-aware branches (panel hold, narrative,
+   gaming, anime) were shipped dormant, so `classify_content`'s
+   output never reached the segmenter and every panel clip ran as
+   `content_type=unknown`. Parity bench (Phase 10) had already
+   passed with these branches enabled; there was no reason to keep
+   the flag off. `content_classifier.py` flipped to the same default.
+2. **`ReframeSegmenter` routes `is_multi_speaker_panel` → its own
+   `ct` key.** When the classifier sets `content_type=podcast` but
+   `is_multi_speaker_panel=True`, the segmenter now loads
+   `CONTENT_TYPE_CONFIG[MULTI_SPEAKER_PANEL]` (tighter holds, no
+   in-shot tracking, 0.9 s min hold, 0.2 s anticipation) instead of
+   the vlog/podcast preset. Added `ContentType.MULTI_SPEAKER_PANEL`
+   enum + config entry.
+3. **Face registry quality gate is now any-slot, not
+   25%-of-slots.** The old cross-shot-merge rejection predicate
+   was `fraction of slots with span>60% AND frames>30 > 0.25`.
+   The Verzuz clip had Slot 8 spanning `[14-98]%` with 558 frames
+   — 1 of 9 slots, under the 25% gate — but that single merged
+   slot was enough to poison speaker-to-slot mapping because
+   everyone ends up mapped to it. Now any single matching slot
+   rejects the whole embedding registry in favor of position-based.
+   Panel-mode also now prefers position-based when both are valid
+   (seats are fixed, embedding splits happen on pose/lighting).
+4. **Panel short-shot override is gated on shot-detector
+   confidence.** `Shot` gained a `detector_confidence` field
+   (`"high"` = PySceneDetect, `"low"` = opencv frame-diff
+   fallback). `layout_engine._plan_layout_impl` now refuses to run
+   the short-shot override if any shot is low-confidence — the
+   opencv fallback fired 179 "shots" on a static panel (lighting
+   flicker) and the override was hard-pinning 165 of them to
+   single-slot centers with 2-keyframe stationary crops, bypassing
+   the L1 solver and reintroducing the 2-Hz stair-stepping that
+   Phase 1 was built to eliminate.
+5. **OpenCV frame-diff fallback raised threshold 40 → 55 + HSV
+   histogram correlation secondary gate.** Real cuts have HSV hue
+   correlation < 0.6; lighting flicker has > 0.8. Dedup window
+   widened from 0.5 s → 1.0 s. Combined with Fix 4's confidence
+   marking, this makes the fallback usable as a safety net even
+   when PySceneDetect is absent.
+6. **Vision-model quality gate lowered 70% → 25%.** When > 25% of
+   scenes hedge to center (`subject_x ∈ [47, 53]`), the whole
+   batch of vision-derived subject positions is collapsed to the
+   default (50) + `precise_x`/`precise_y`/`active_speaker_x`
+   cleared. The downstream dense-face-data override in
+   `pipeline.py` then fills every scene from face detection, which
+   is strictly more reliable than a hedging vision model. On the
+   Verzuz clip qwen3-vl-8b returned center defaults on 42% of
+   frames — below the old 70% gate, so the garbage was fed into
+   tracking.
+7. **Whisper subprocess launcher evicts Ollama VRAM first.** Added
+   `transcription._evict_ollama_for_whisper()` which calls
+   `/api/ps`, POSTs `keep_alive=0` to each loaded model, and
+   sleeps 2 s for the driver to reclaim memory — best effort,
+   errors swallowed. On a 4 GB 1650 (Jalon's rig) Ollama's idle
+   CUDA context was enough to force Whisper to CPU int8 fallback,
+   pushing transcription from ~30 s to 12 minutes for a 10-min clip.
+8. **`layout_from_reframe_segments` adapter** (the big one). When
+   the ReframeSegmenter already produced a content-aware,
+   L1-solved segment timeline, `pipeline.py` now builds the
+   `LayoutTimeline` directly from those segments instead of
+   re-running shot detection + required-regions + camera solver
+   in `plan_layout`. Two camera-path systems running in series
+   was producing incompatible decompositions (segmenter's 69
+   segments vs plan_layout's 179 shots, with the frontend seeing
+   whichever wrote last). `plan_layout` is still kept as the
+   fallback path for AUTOFLIP runs and for when the segmenter
+   doesn't run.
+
+### Test coverage
+
+- `backend/tests/test_v2_phase11_regression_fixes.py` — 12 cases
+  covering Fixes 1-5 and 7 (content-type config, face-registry
+  selection rule, Shot dataclass, layout_engine source checks,
+  layout_from_reframe_segments end-to-end).
+- `backend/tests/test_whisper_ollama_eviction.py` — 3 async cases
+  mocking `httpx.AsyncClient` to confirm Fix 6 evicts loaded
+  models, no-ops on an empty `/api/ps`, and swallows connection
+  errors.
+
+### Expected log deltas on the Tank/Tyrese clip
+
+Before:
+```
+ReframeSegmenter: content_type=unknown
+Embedding registry found 9 slots, position-based found 5 — using embeddings (max wins)
+ShotDetector (opencv fallback): 179 shots
+[Layout+Solver] panel short-shot override: 165 shots (< 20 frames) mapped to active-speaker slot
+Whisper CUDA failed — falling back to CPU (int8)
+```
+
+After:
+```
+ReframeSegmenter: content_type=multi_speaker_panel
+[FaceRegistry] embedding registry rejected: 1 slot had span>60% and frame_count>30 (cross-shot merge). Using position-based (5 slots)
+ShotDetector (opencv fallback): ~15 shots (confidence=low)
+[Layout+Solver] panel short-shot override SKIPPED: shot detector confidence is low (opencv fallback on 15 shots). Trusting L1 solver.
+Evicted 2 Ollama model(s) from VRAM before Whisper CUDA
+[Layout] Built from 69 reframe segments (skipped plan_layout second-solve)
+```

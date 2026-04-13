@@ -2684,6 +2684,9 @@ async def _run_analysis_inner(job_id: str):
 
     # ── Reframe Segmenter (replaces per-second synthesis when enabled) ──
     _reframe_segments_used = False
+    # v2 Phase 11 (Fix 7): hoist so the downstream plan_layout branch
+    # can see the segmenter output and skip a redundant second solve.
+    reframe_segments: list = []
     _pacing_estimator = None
     # Hoisted so both AUTOFLIP and REFRAME_SEGMENTER branches can reference it
     # without UnboundLocalError when the AUTOFLIP path doesn't execute.
@@ -3397,7 +3400,43 @@ async def _run_analysis_inner(job_id: str):
             # Try camera solver first (per-shot, eliminates cross-cut drift)
             _solver_on = os.environ.get("CLIPAI_CAMERA_SOLVER", settings.CLIPAI_CAMERA_SOLVER).lower() != "off"
             _layout_face_data = dense_face_results if dense_face_results else face_results
-            if _solver_on and _layout_face_data and not _is_gameplay:
+
+            # v2 Phase 11 (Fix 7): if the ReframeSegmenter already produced
+            # a content-aware, L1-solved segment timeline, adapt it directly
+            # into a LayoutTimeline instead of re-running shot detection +
+            # required-regions + camera solver in plan_layout. The
+            # second-solve path on the Verzuz/Tank-Tyrese clip was
+            # reintroducing the exact 2-Hz stair-stepping the segmenter
+            # was built to eliminate (179 opencv-fallback shots →
+            # panel short-shot override hard-pinned 165 of them).
+            if (_reframe_segments_used and reframe_segments
+                    and not _is_gameplay):
+                try:
+                    from backend.services.layout_engine import (
+                        layout_from_reframe_segments,
+                    )
+                    layout_timeline = layout_from_reframe_segments(
+                        reframe_segments=reframe_segments,
+                        face_registry=face_registry,
+                        source_width=source_width,
+                        source_height=source_height,
+                        job_id=job_id,
+                    )
+                    default_layout_mode = layout_timeline.default_mode
+                    logger.info(
+                        "[%s] [Layout] Built from %d reframe segments "
+                        "(skipped plan_layout second-solve)",
+                        job_id, len(reframe_segments),
+                    )
+                except Exception as _lfr_e:
+                    logger.warning(
+                        "[%s] layout_from_reframe_segments failed "
+                        "(%s) — falling back to plan_layout",
+                        job_id, _lfr_e,
+                    )
+                    layout_timeline = None
+
+            if layout_timeline is None and _solver_on and _layout_face_data and not _is_gameplay:
                 try:
                     from backend.services.layout_engine import plan_layout
 
