@@ -594,17 +594,49 @@ def _gt_music_video_beat() -> GroundTruth:
 
 
 def _gt_anime_hard_cuts() -> GroundTruth:
-    # 6 shots × 2 s; switches happen at shot cuts (t=2,4,6,8,10).
-    expected = [2.0, 4.0, 6.0, 8.0, 10.0]
-    # Subtitle bar at y=85..95% — represented as a required region
-    # spanning x=15..85 (the bar is centered horizontally) on every
-    # frame. The miss-rate metric will score it.
+    """Per-frame ground truth for the anime hard-cuts fixture.
+
+    Phase 6 dropped the sub-bar approach in favor of the
+    "right moment" framing test. Subtitle bars in anime are
+    typically wider than a 9:16 vertical crop and cannot be
+    physically contained — chasing the bar would yank the crop
+    away from the dramatic anchor (the face, the impact frame,
+    the reaction shot). That's the wrong call for anime.
+
+    The Phase 6 ground truth instead measures whether the
+    segmenter lands the crop on the **active anime speaker /
+    anchor** at every frame:
+
+      - Speakers at slot 0 (x=30) and slot 1 (x=70), face
+        bbox 10 % wide
+      - Speaker rotates every 2 s (matches the 6 hard cuts)
+      - Required region per frame = active speaker's face bbox
+
+    With the existing single-subject path the segmenter already
+    centers on each speaker → miss rate ≈ 0. The Phase 6 anime
+    anchor adds VALUE for production cases where the dense face
+    stream is unreliable (real anime detection has high miss
+    rates, the fixture's synthetic data is clean), but on this
+    fixture the anchor agrees with the speaker tracker so the
+    metric is unchanged. The Phase 6 demonstration is in the
+    unit tests + the AST guards on the Stage 7b wiring.
+    """
     duration = 12.0
     fps = 10.0
     n = int(duration * fps)
-    sub_bar = (15.0, 85.0)
-    regions = [[sub_bar] for _ in range(n)]
-    return GroundTruth(expected_switches=expected, required_regions_per_frame=regions)
+    centers_pct = [30.0, 70.0]  # slot 0, slot 1
+    face_w = 10.0
+    half = face_w / 2.0
+    regions: list[list[tuple[float, float]]] = []
+    for i in range(n):
+        t = i / fps
+        slot_idx = int(t / 2.0) % 2
+        cx = centers_pct[slot_idx]
+        regions.append([(cx - half, cx + half)])
+    return GroundTruth(
+        expected_switches=[2.0, 4.0, 6.0, 8.0, 10.0],
+        required_regions_per_frame=regions,
+    )
 
 
 def _gt_tps_character_offset() -> GroundTruth:

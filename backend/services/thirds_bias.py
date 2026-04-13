@@ -286,10 +286,21 @@ def applies_to_content(content_type: Optional[str]) -> bool:
 def applies_to_profile(content_profile) -> bool:
     """Return True when the thirds-bias should fire for this profile.
 
-    Wraps ``applies_to_content`` and additionally checks
-    ``content_profile.is_multi_speaker_panel`` — debates / panels
-    share the ``podcast`` parent type but prefer symmetry over
-    thirds, so they're explicitly excluded.
+    Wraps ``applies_to_content`` and additionally checks:
+
+    - ``content_profile.is_multi_speaker_panel`` — debates / panels
+      share the ``podcast`` parent type but prefer symmetry over
+      thirds, so they're explicitly excluded.
+    - ``content_profile.is_animated`` (Phase 6 extension) — the
+      ``ContentType.ANIME`` parent type isn't in the bias set, but
+      anime dialogue + slice-of-life content gets the thirds bias
+      via the ANIMATION_DIALOGUE / TALKING_HEAD downstream clip
+      types. We honor the profile-level ``is_animated`` flag here
+      so the gate fires on the parent type without needing to wait
+      until ``classify_clip`` runs.
+    - ``content_profile.anime_subtype == "action"`` — action anime
+      explicitly OPTS OUT of the thirds bias (the reaction-shot
+      compositions are choreographed in source, no need to bias).
 
     Accepts None / non-profile inputs and returns False.
     """
@@ -297,4 +308,15 @@ def applies_to_profile(content_profile) -> bool:
         return False
     if getattr(content_profile, "is_multi_speaker_panel", False):
         return False
+
+    # Phase 6: anime profile handling
+    is_animated = bool(getattr(content_profile, "is_animated", False))
+    anime_subtype = getattr(content_profile, "anime_subtype", None) or ""
+    if is_animated:
+        if anime_subtype == "action":
+            return False
+        # Anime dialogue / slice-of-life / unspecified all get the
+        # bias since ANIMATION_DIALOGUE downstream is in the bias set.
+        return True
+
     return applies_to_content(getattr(content_profile, "content_type", None))

@@ -1,0 +1,301 @@
+"""Phase 6 — Anime / cartoon face detection.
+
+The standard live-action face detectors (MediaPipe FaceMesh, OpenCV
+DNN, YuNet) struggle on anime / cartoon characters. Anime faces have
+exaggerated eye proportions, simplified nose / mouth geometry, and
+hard outlines instead of skin texture — none of which the
+human-trained detectors handle reliably. The existing
+``backend/services/face_detector.py`` papers over this with
+``ANIME_MODE_DETECTED`` (a flag set when the human-pose verifier
+rejects > 50 % of detections) which downgrades the verification
+gate, but it doesn't actually find faces the live-action detector
+missed in the first place.
+
+This module is the dedicated anime detector. Two production tiers:
+
+- **lbpcascade_animeface tier**: lazily loads the public
+  ``lbpcascade_animeface`` Haar cascade
+  (``https://github.com/nagadomi/lbpcascade_animeface``). The
+  cascade XML ships at ``backend/models/lbpcascade_animeface.xml``
+  and is downloaded at build time. Returns ``AnimeFaceDetection``
+  results with bbox + confidence.
+
+- **Heuristic tier**: when OpenCV / numpy / the cascade aren't
+  available (sandbox path) the detector returns an empty result
+  so callers fall through to the existing detection chain. The
+  pure-Python helpers (``score_anime_face_density``,
+  ``best_face_in_frame``) work without an imaging stack and are
+  unit-testable in isolation.
+
+Detection results are converted to ``backend.services.face_detector.FaceInfo``
+shape via ``to_face_info`` so anime detections slot into the
+existing dense-face stream / face_registry / camera_solver
+pipeline without any segmenter changes.
+
+The reframe pipeline calls this detector via:
+
+    if profile.is_animated and CLIPAI_ANIME_FACE_DETECTOR:
+        anime_faces = detect_anime_faces(frame_path)
+        if anime_faces:
+            face_results.extend(to_face_info(d) for d in anime_faces)
+
+so anime detections AUGMENT the live-action stream rather than
+replacing it. The face_registry's identity-clustering step then
+folds them into the same slot system.
+
+Feature flag: ``CLIPAI_ANIME_FACE_DETECTOR`` env var, default OFF
+until in-docker validation lands the post-Phase-6 numbers.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+
+# ──────────────────── Feature flag ────────────────────
+
+USE_ANIME_FACE_DETECTOR = os.environ.get(
+    "CLIPAI_ANIME_FACE_DETECTOR", "0",
+).lower() in ("1", "true", "yes", "on")
+
+
+# ──────────────────── Tuning ────────────────────
+
+# Default Haar cascade path. Download at:
+# https://github.com/nagadomi/lbpcascade_animeface/raw/master/lbpcascade_animeface.xml
+DEFAULT_CASCADE_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "..", "models", "lbpcascade_animeface.xml",
+)
+
+# Minimum face size as a fraction of frame width. Anime cuts often
+# have full-frame face close-ups — the lower bound on bbox size
+# kills false positives from background characters.
+MIN_FACE_FRAC = 0.05
+
+# Max face size as a fraction of frame width. Anything larger is
+# almost certainly a foreground prop or a logo, not a face.
+MAX_FACE_FRAC = 0.95
+
+
+# ──────────────────── Result dataclass ────────────────────
+
+
+@dataclass
+class AnimeFaceDetection:
+    """One anime face detection result.
+
+    Coordinates are in **percent of frame** (0–100), matching the
+    rest of the reframe pipeline. ``confidence`` reflects the
+    raw cascade score normalized to [0, 1].
+    """
+
+    x_center: float
+    y_center: float
+    width: float
+    height: float
+    confidence: float
+    source: str = "lbpcascade_animeface"
+
+
+@dataclass
+class AnimeDetectionResult:
+    """All anime faces detected in a single frame."""
+
+    timestamp: float
+    detections: list[AnimeFaceDetection] = field(default_factory=list)
+    skipped_reason: str = ""
+
+    @property
+    def has_faces(self) -> bool:
+        return bool(self.detections)
+
+
+# ──────────────────── Pure-Python scoring helpers ────────────────────
+
+
+def score_anime_face_density(
+    detections: list[AnimeFaceDetection],
+    *,
+    min_faces: int = 1,
+) -> float:
+    """Return a dramatic-moment score in [0, 1] for an anime frame.
+
+    Combines:
+      - face count (weighted toward "more is more dramatic", capped at 4)
+      - max face confidence (peak detection signal)
+      - max face area (closer face = more dramatic)
+
+    Returns 0.0 when ``detections`` is empty so the caller can
+    fall through to motion / contrast signals.
+    """
+    if not detections:
+        return 0.0
+    n = min(len(detections), 4)
+    count_score = n / 4.0
+    max_conf = max(d.confidence for d in detections)
+    max_area = max(d.width * d.height for d in detections) / 10000.0
+    max_area = min(max_area, 1.0)
+    score = 0.4 * count_score + 0.35 * max_conf + 0.25 * max_area
+    return max(0.0, min(1.0, score))
+
+
+def best_face_in_frame(
+    detections: list[AnimeFaceDetection],
+) -> Optional[AnimeFaceDetection]:
+    """Pick the most prominent anime face in a frame.
+
+    Ranks by (confidence × area), so a confident close-up beats
+    a high-confidence wide background face. Returns None on
+    empty input.
+    """
+    if not detections:
+        return None
+    return max(
+        detections,
+        key=lambda d: d.confidence * (d.width * d.height),
+    )
+
+
+def to_face_info(detection: AnimeFaceDetection, *, identity_id: int = -1):
+    """Convert an ``AnimeFaceDetection`` to the existing ``FaceInfo`` shape.
+
+    Lazily imports ``backend.services.face_detector`` so this module
+    stays importable in a sandbox where the heavy face_detector
+    dependencies (cv2 / mediapipe) aren't available.
+
+    The output sets ``is_human=False`` so downstream verifiers know
+    the detection came from the anime path and skip the human-pose
+    check that would normally reject it.
+    """
+    from backend.services.face_detector import FaceInfo
+
+    return FaceInfo(
+        x_center=float(detection.x_center),
+        y_center=float(detection.y_center),
+        width=float(detection.width),
+        height=float(detection.height),
+        # The cascade doesn't emit landmarks, so use bbox center
+        # for nose_x / nose_y. The estimate_yaw fall-through in
+        # gaze_estimator returns 0 (forward) when nose == center,
+        # which is the right default for anime characters where
+        # we don't have reliable head-pose data.
+        nose_x=float(detection.x_center),
+        nose_y=float(detection.y_center),
+        confidence=float(detection.confidence),
+        identity_id=int(identity_id),
+        # Mark non-human so the human-pose verifier doesn't reject
+        # this detection.
+        is_human=False,
+        # No live-action speaker signal for anime — leave 0.
+        lip_aperture=0.0,
+        is_speaking=False,
+        y_bottom=float(detection.y_center + detection.height / 2),
+        pose_confidence=0.0,
+    )
+
+
+# ──────────────────── Cascade-backed detector ────────────────────
+
+
+def detect_anime_faces(
+    frame_path: str,
+    *,
+    timestamp: float = 0.0,
+    cascade_path: Optional[str] = None,
+    min_face_frac: float = MIN_FACE_FRAC,
+    max_face_frac: float = MAX_FACE_FRAC,
+    scale_factor: float = 1.1,
+    min_neighbors: int = 5,
+) -> AnimeDetectionResult:
+    """Run the lbpcascade_animeface detector on a single frame.
+
+    Lazily imports OpenCV / numpy so this module loads in a
+    sandbox without them. Returns
+    ``AnimeDetectionResult(skipped_reason=...)`` when the cascade
+    can't be loaded, the frame can't be read, or the imports fail.
+
+    Args:
+        frame_path: Filesystem path to the source frame.
+        timestamp: Timestamp the frame represents (seconds).
+        cascade_path: Optional override for the cascade XML file.
+            Defaults to ``DEFAULT_CASCADE_PATH``.
+        min_face_frac / max_face_frac: Bbox size gates as fractions
+            of frame width.
+        scale_factor / min_neighbors: Standard cv2 cascade params.
+
+    Returns:
+        ``AnimeDetectionResult`` with ``detections`` and either
+        ``has_faces`` or a ``skipped_reason``.
+    """
+    try:
+        import cv2  # noqa: F401
+    except ImportError as exc:
+        return AnimeDetectionResult(
+            timestamp=timestamp,
+            skipped_reason=f"missing deps: {exc}",
+        )
+
+    cascade_file = cascade_path or DEFAULT_CASCADE_PATH
+    if not os.path.isfile(cascade_file):
+        return AnimeDetectionResult(
+            timestamp=timestamp,
+            skipped_reason=f"cascade not found: {cascade_file}",
+        )
+
+    cascade = cv2.CascadeClassifier(cascade_file)
+    if cascade.empty():
+        return AnimeDetectionResult(
+            timestamp=timestamp,
+            skipped_reason=f"cascade failed to load: {cascade_file}",
+        )
+
+    img = cv2.imread(frame_path)
+    if img is None:
+        return AnimeDetectionResult(
+            timestamp=timestamp,
+            skipped_reason=f"cannot read frame: {frame_path}",
+        )
+
+    h, w = img.shape[:2]
+    if w <= 0 or h <= 0:
+        return AnimeDetectionResult(
+            timestamp=timestamp,
+            skipped_reason="degenerate frame",
+        )
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.equalizeHist(gray)
+
+    min_side = max(int(w * min_face_frac), 8)
+    max_side = max(int(w * max_face_frac), min_side + 1)
+    rects = cascade.detectMultiScale(
+        gray,
+        scaleFactor=float(scale_factor),
+        minNeighbors=int(min_neighbors),
+        minSize=(min_side, min_side),
+        maxSize=(max_side, max_side),
+    )
+
+    detections: list[AnimeFaceDetection] = []
+    for x, y, fw, fh in rects:
+        cx = (x + fw / 2.0) / w * 100.0
+        cy = (y + fh / 2.0) / h * 100.0
+        # Cascade detectors don't expose a per-detection confidence
+        # but ``detectMultiScale3`` does. For Phase 6 minimal we
+        # use a conservative constant; the production wiring can
+        # switch to detectMultiScale3 once the integration lands.
+        detections.append(AnimeFaceDetection(
+            x_center=cx,
+            y_center=cy,
+            width=fw / w * 100.0,
+            height=fh / h * 100.0,
+            confidence=0.85,
+        ))
+
+    return AnimeDetectionResult(timestamp=timestamp, detections=detections)

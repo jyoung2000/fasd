@@ -145,24 +145,32 @@ def lead_room_offset_px(
     crop_width_px: float,
     *,
     max_frac: float = 0.08,
+    anime_action_multiplier: float = 1.0,
 ) -> float:
     """Convert a yaw value to a horizontal lead-room offset in pixels.
 
     Returns a signed float to ADD to ``subject_x`` (the source-frame
     pixel coordinate of the crop center). The magnitude is
-    ``|yaw| * max_frac * crop_width_px`` and the sign is OPPOSITE
-    of yaw — a face looking left (yaw < 0) gets a positive offset
-    (camera shifts right), placing the face on the LEFT side of the
-    output crop with space to look INTO. This matches the existing
-    categorical convention and the cinematography rule.
+    ``|yaw| * max_frac * crop_width_px * anime_action_multiplier``
+    and the sign is OPPOSITE of yaw — a face looking left (yaw < 0)
+    gets a positive offset (camera shifts right), placing the face
+    on the LEFT side of the output crop with space to look INTO.
+    This matches the existing categorical convention and the
+    cinematography rule.
 
     Args:
         yaw: Yaw value in ``[-1.0, 1.0]`` from ``estimate_yaw``.
         crop_width_px: Output crop width in source pixels (≈ 607 for
             16:9 → 9:16 on a 1920-wide source).
         max_frac: Maximum offset as a fraction of the crop width.
-            Default 0.08 matches the v2 spec — about 50 px on 600
-            crop, gentler than the categorical step (~95 px).
+            Default 0.08 matches the v2 Phase 4 spec — about 50 px
+            on 600 crop, gentler than the categorical step (~95 px).
+        anime_action_multiplier: Phase 6 extension. Multiplies the
+            offset magnitude when the caller knows the segment is
+            anime action content (where head turns are exaggerated
+            and the cinematography convention asks for more
+            lead-room). 1.0 = unchanged (default). The v2 spec
+            recommends 1.5 for ``anime_subtype == "action"``.
 
     Returns:
         Signed pixel offset to add to ``subject_x``. Zero when yaw
@@ -171,9 +179,10 @@ def lead_room_offset_px(
     if crop_width_px <= 0:
         return 0.0
     yaw = max(-1.0, min(1.0, float(yaw)))
+    multiplier = max(0.0, float(anime_action_multiplier))
     # Sign convention: face looking left → positive offset (shift
     # camera right) → face lands on left third of output.
-    return -yaw * float(max_frac) * float(crop_width_px)
+    return -yaw * float(max_frac) * float(crop_width_px) * multiplier
 
 
 def yaw_to_categorical(yaw: float, threshold: float = 0.15) -> str:

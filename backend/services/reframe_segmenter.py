@@ -92,6 +92,7 @@ def build_reframe_segments(
     interpolated_timeline=None,
     frame_saliency: list = None,
     music_beat_grid=None,
+    anime_anchors: list = None,
 ) -> list[ReframeSegment]:
     """Build a segment-based reframe timeline.
 
@@ -655,6 +656,76 @@ def build_reframe_segments(
     for seg in raw_segments:
         seg.subject_x = _slot_to_x(seg.active_slot, face_registry, source_width)
 
+    # ── Stage 7b: Anime saliency anchor override (Phase 6) ──
+    #
+    # Behind ``CLIPAI_ANIME_ANCHOR=1`` (default OFF). When the
+    # content profile is animated AND the caller passed a list of
+    # pre-computed ``AnimeAnchor`` objects via the new
+    # ``anime_anchors`` kwarg, this sub-block walks each segment
+    # and replaces ``seg.subject_x`` with the segment's strongest
+    # anime anchor (face / motion / contrast / saturation peak).
+    # Falls back to the existing ``_slot_to_x`` value when the
+    # segment has no qualifying anchor — so the anime override
+    # only fires on segments where the saliency pipeline produced
+    # a strong-enough signal.
+    #
+    # The anime anchor is the answer to "always reframe the right
+    # moment": for action moments it lands on the motion centroid;
+    # for dialogue / reaction shots it lands on the dramatic face;
+    # for spell effects it lands on the saturation peak.
+    #
+    # Production callers (``pipeline.py``) build ``anime_anchors``
+    # by extracting per-frame features (anime_face_detector +
+    # motion + contrast + saturation) and running them through
+    # ``anime_anchor.score_anime_sequence``. The parity runner
+    # builds them from the fixture's pre-baked features.
+    anime_anchor_count = 0
+    try:
+        from backend.services.anime_anchor import (
+            USE_ANIME_ANCHOR,
+            aggregate_anchors_to_segment_x,
+        )
+
+        _is_animated = bool(
+            getattr(content_profile, "is_animated", False)
+            if content_profile else False
+        )
+        if (
+            USE_ANIME_ANCHOR
+            and _is_animated
+            and anime_anchors
+        ):
+            _anime_subtype = (
+                getattr(content_profile, "anime_subtype", None)
+                if content_profile else None
+            )
+            for seg in raw_segments:
+                if seg.layout in (
+                    "wide_master", "split", "grid", "blur_fill", "stacked_gameplay",
+                ):
+                    continue
+                fallback_x_pct = (
+                    seg.subject_x / source_width * 100.0
+                    if source_width > 0 else 50.0
+                )
+                anchor_x_pct, anchor_src = aggregate_anchors_to_segment_x(
+                    anime_anchors,
+                    start=seg.start,
+                    end=seg.end,
+                    fallback_x_pct=fallback_x_pct,
+                )
+                if anchor_src != "fallback":
+                    seg.subject_x = anchor_x_pct / 100.0 * source_width
+                    seg.subject_source = f"anime_anchor_{anchor_src}"
+                    anime_anchor_count += 1
+    except Exception as e:
+        logger.warning(
+            "[%s] Anime anchor override failed (non-fatal): %s",
+            job_id, e,
+        )
+    if anime_anchor_count > 0:
+        _log("AnimeAnchor: %d segments overridden by anime saliency", anime_anchor_count)
+
     # ── Stage 8: Lead-room application (narrative/vlog) ──
     #
     # Two tiers, controlled by two independent feature flags:
@@ -709,6 +780,17 @@ def build_reframe_segments(
             # shots don't get a thirds offset even though their
             # parent ContentType is "podcast".
             _thirds_on = USE_THIRDS_BIAS and _thirds_applies_profile(content_profile)
+            # Phase 6: anime-action multiplier on the lead-room
+            # offset. Applied to BOTH Stage 8 (stationary) and
+            # Stage 10c (tracking / panning). Other anime sub-types
+            # use the default 1.0.
+            _anime_subtype_now = (
+                getattr(content_profile, "anime_subtype", None)
+                if content_profile else None
+            )
+            _anime_action_mult = (
+                1.5 if _anime_subtype_now == "action" else 1.0
+            )
 
             for seg in raw_segments:
                 if seg.active_slot is None or seg.layout in (
@@ -722,7 +804,10 @@ def build_reframe_segments(
                         dense_faces, seg.active_slot, seg.start, seg.end,
                     )
                     if abs(yaw) > 0.01:
-                        offset_px = lead_room_offset_px(yaw, _crop_width_px)
+                        offset_px = lead_room_offset_px(
+                            yaw, _crop_width_px,
+                            anime_action_multiplier=_anime_action_mult,
+                        )
                         seg.subject_x = float(seg.subject_x) + offset_px
                         seg.lead_room_direction = yaw_to_categorical(yaw)
                         lead_room_count += 1
@@ -1093,6 +1178,17 @@ def build_reframe_segments(
                     _crop_w = float(source_width)
                 _half = _crop_w / 2.0
                 _do_thirds = _USE_TH and _th_applies(content_profile)
+                # Phase 6: anime action multiplier — passed to
+                # lead_room_offset_px when the segment's parent
+                # is anime + action subtype so head-turn lead-
+                # room is exaggerated to match the cinematography.
+                _anime_subtype_post = (
+                    getattr(content_profile, "anime_subtype", None)
+                    if content_profile else None
+                )
+                _anime_mult_post = (
+                    1.5 if _anime_subtype_post == "action" else 1.0
+                )
                 for seg in raw_segments:
                     if seg.active_slot is None or seg.layout in (
                         "wide_master", "split", "grid", "blur_fill", "stacked_gameplay",
@@ -1108,7 +1204,10 @@ def build_reframe_segments(
                     ) if _USE_V2 else 0.0
                     offset = 0.0
                     if _USE_V2 and abs(yaw) > 0.01:
-                        offset += _lr_off(yaw, _crop_w)
+                        offset += _lr_off(
+                            yaw, _crop_w,
+                            anime_action_multiplier=_anime_mult_post,
+                        )
                     if _do_thirds:
                         _face_pct = float(seg.subject_x) / max(source_width, 1) * 100.0
                         offset += _th_off(

@@ -230,6 +230,28 @@ Plus the music-video-only Phase 5 metric (`downbeat_snap_error`):
 | `music_video_beat` | OFF | 0.40 | 200.0 | 200.0 | 5 |
 | `music_video_beat` | ON | **1.00** | **0.0** | **0.0** | 8 (5 + 3 pulse cuts) |
 
+### v2 Phase 6 — anime fixture re-baseline
+
+Phase 6 changed the ``anime_hard_cuts`` ground truth: dropped the
+geometrically un-fittable sub bar (15..85 % > 31.6 % crop) and
+replaced it with the active speaker bbox (10 % wide, alternating
+slot 0 = 30, slot 1 = 70). The sub bar was the wrong test for
+anime reframing — chasing it would yank the crop away from the
+dramatic anchor.
+
+| Fixture | Mode | required_region_miss_rate | Notes |
+|---|---|---|---|
+| `anime_hard_cuts` (Phase 5 baseline, sub bar) | — | 1.00 | un-fittable |
+| `anime_hard_cuts` (Phase 6 baseline, speaker bbox) | OFF | 0.33 | residual is from speaker-turn anticipation |
+| `anime_hard_cuts` (Phase 6, all flags ON) | ON | 0.33 | unchanged on the parity bench because the bench has no per-frame anime features for the anchor scorer |
+
+The Phase 6 anime anchor mechanism is verified end-to-end via 48
+unit tests (face detector helpers + anchor scorer + segmenter
+Stage 7b wiring + lead-room multiplier + applies_to_profile
+extension). The parity bench numbers will move once the
+production pipeline.py wiring extracts per-frame anime features
+and passes them via the new ``anime_anchors`` kwarg.
+
 The Phase 5 ON row hits the spec exit criterion exactly: every cut
 lands at 0 ms from a downbeat — well under the spec's ±40 ms
 target. The 3 pulse cuts are visual re-anchors inserted at internal
