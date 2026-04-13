@@ -120,13 +120,51 @@ def classify_content(
         return profile
 
     # ── User override via metadata ──
+    #
+    # The upload UI sends one of a fixed set of tokens via
+    # ``JobResult.content_type_override``, which the pipeline injects
+    # into ``metadata['content_type_override']`` before this call. We
+    # normalize through ``content_type_strings.normalize_ui_content_type``
+    # so:
+    #   - Legacy tokens ("gameplay", "movie", "podcast") map to the
+    #     correct ContentType enum values (previously only "podcast"
+    #     matched by coincidence).
+    #   - Phase 2 tokens ("debate", "vlog", "anime", "music_video",
+    #     "gameplay_moba", "gameplay_tps", "gameplay_racing", "stream",
+    #     "sports", "cartoon", "panel", "interview", "narrative",
+    #     "cinematic") route without touching this file again.
+    #   - Invalid / unknown tokens fall through to heuristic
+    #     classification instead of crashing.
+    #
+    # Also still accepts the legacy ``content_type`` and ``reframe_style``
+    # metadata keys for callers that haven't been updated.
     if metadata:
-        user_type = metadata.get("content_type") or metadata.get("reframe_style")
-        if user_type and user_type in [ct.value for ct in ContentType]:
-            profile.content_type = user_type
+        from backend.services.content_type_strings import normalize_ui_content_type
+
+        user_type = (
+            metadata.get("content_type_override")
+            or metadata.get("content_type")
+            or metadata.get("reframe_style")
+        )
+        normalized = normalize_ui_content_type(user_type) if user_type else None
+        if normalized is not None:
+            profile.content_type = normalized.content_type.value
             profile.confidence = 1.0
-            profile.signals = {"user_override": user_type}
-            _log("%s (conf=1.00, signals=user_override)", user_type)
+            profile.is_multi_speaker_panel = normalized.is_multi_speaker_panel
+            profile.is_animated = normalized.is_animated
+            profile.signals = {
+                "user_override": normalized.raw,
+                "normalized": normalized.content_type.value,
+                "panel": normalized.is_multi_speaker_panel,
+                "animated": normalized.is_animated,
+            }
+            _log(
+                "user override %r → %s (conf=1.00, panel=%s, animated=%s)",
+                normalized.raw,
+                normalized.content_type.value,
+                normalized.is_multi_speaker_panel,
+                normalized.is_animated,
+            )
             return profile
 
     # ── Signal 1: Cut rate ──

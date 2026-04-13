@@ -1215,19 +1215,49 @@ async def _run_analysis_inner(job_id: str):
             logger.warning("[%s] Dense face detection failed (non-fatal): %s", job_id, e)
 
     # ── Gameplay content detection ──
-    # Check if content is FPS / hero shooter before spending effort on face tracking.
-    # If the user declared "gameplay" via content_type_override we trust that immediately.
-    # Otherwise we auto-detect using crosshair persistence, HUD corners, and face rarity.
+    # Check if content is FPS / hero shooter before spending effort on face
+    # tracking. If the user declared a gameplay variant via
+    # content_type_override (gameplay / gameplay_fps / gameplay_moba /
+    # gameplay_tps / gameplay_racing) we trust it immediately. If they
+    # declared *any other* recognized override (podcast, debate, vlog,
+    # movie, anime, music_video, stream, sports, ...) we respect that
+    # and skip the gameplay auto-detect. Otherwise (auto / unknown /
+    # invalid) we run the face-rarity heuristic.
+    #
+    # Note: ``stream`` normalizes to ContentType.GAMING but does NOT
+    # take the face-skipping fast path — it has a facecam and still
+    # needs the face pipeline for the overlay.
+    from backend.services.content_type_strings import (
+        is_gameplay_override,
+        is_user_override,
+        normalize_ui_content_type,
+    )
+
     _is_gameplay = False
     _job_data = await database.load_job(job_id)
     _content_override = getattr(_job_data, "content_type_override", "") if _job_data else ""
     _game_type = getattr(_job_data, "game_type", "") if _job_data else ""
+    _normalized_override = normalize_ui_content_type(_content_override)
 
-    if _content_override == "gameplay":
+    if is_gameplay_override(_content_override):
         _is_gameplay = True
-        logger.info("[%s] Content type override = gameplay (user-declared)", job_id)
-    elif _content_override not in ("podcast", "movie"):
-        # Auto-detect: only if user didn't declare a non-gameplay type
+        logger.info(
+            "[%s] Content type override = %s (user-declared gameplay fast-path)",
+            job_id, _normalized_override.raw if _normalized_override else _content_override,
+        )
+    elif is_user_override(_content_override):
+        # User picked a non-gameplay type (or stream) — respect it and
+        # skip auto-detect so we don't silently upgrade their choice.
+        logger.info(
+            "[%s] Content type override = %s → %s (user-declared, "
+            "skipping gameplay auto-detect)",
+            job_id,
+            _normalized_override.raw,
+            _normalized_override.content_type.value,
+        )
+    else:
+        # Auto-detect: run the face-rarity heuristic when the user
+        # picked "auto" / nothing / an unrecognized token.
         try:
             from backend.services.face_detector import classify_gameplay_content
             _dense_or_sparse = dense_face_results or face_results
@@ -2598,13 +2628,23 @@ async def _run_analysis_inner(job_id: str):
             from backend.services.content_classifier import classify_content, USE_CONTENT_AWARE_REFRAME
             _video_dur = metadata.get("duration", 0)
             _shot_cuts = scene_cut_timestamps if scene_cut_timestamps else []
+            # Inject the user's content-type override into the metadata
+            # dict the classifier receives. The ffprobe metadata dict
+            # historically did NOT carry ``content_type_override`` at
+            # all, so the classifier's user-override branch only fired
+            # by accident for "podcast" (whose spelling happened to
+            # match the enum value) and silently never fired for
+            # "gameplay" or "movie". This line is the plumbing fix.
+            _classifier_metadata = dict(metadata) if metadata else {}
+            if _content_override:
+                _classifier_metadata["content_type_override"] = _content_override
             _content_profile = classify_content(
                 shot_cuts=_shot_cuts,
                 face_registry=face_registry,
                 dense_faces=dense_face_results,
                 scenes=scenes,
                 video_duration=_video_dur,
-                metadata=metadata,
+                metadata=_classifier_metadata,
                 job_id=job_id,
                 transcript_segments=transcript,
             )

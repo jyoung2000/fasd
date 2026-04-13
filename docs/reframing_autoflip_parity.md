@@ -142,6 +142,120 @@ Tests: 27 → 37 passing (+10 new tests across 3 test files)
 
 ## Out of scope (follow-ups)
 
-- Multi-region tracking (AutoFlip handles multiple required regions with a unified LP)
-- Cinematography "rule of thirds" bias
+- Multi-region tracking (AutoFlip handles multiple required regions with a unified LP) — **queued for Phase 3 of v2**
+- Cinematography "rule of thirds" bias — **queued for Phase 4 of v2**
 - Gameplay HUD-aware padding (orthogonal to solver quality, lives in layout_engine)
+
+---
+
+## v2 — Content-aware parity work (Phases 1–10)
+
+The "Phases 0–4" table above covers the solver-quality work. A second
+wave of phases starts from the opposite end: routing per-content-type
+behaviours so anime, debates, music videos, vlogs, and multi-game
+streams all get editorially-correct framing instead of falling into
+the "generic talking-head" bucket. This section will grow one sub-
+heading per v2 phase as they land.
+
+### v2 Phase 1 — Content-type override plumbing
+
+**Before:**
+The upload UI dropdown sent strings (`"gameplay"`, `"movie"`,
+`"podcast"`) that didn't match the `ContentType` enum values
+(`"gaming"`, `"narrative"`, `"podcast"`). The classifier's
+user-override branch at `content_classifier.py:122-130` checked
+`user_type in [ct.value for ct in ContentType]`, so:
+
+| UI token | Enum value | Override fired? |
+|---|---|---|
+| `gameplay` | `gaming` | ❌ |
+| `movie` | `narrative` | ❌ |
+| `podcast` | `podcast` | ✅ (by coincidence) |
+
+Worse, `metadata['content_type_override']` was never injected into
+the dict `classify_content` received — the ffprobe metadata dict
+historically did NOT carry that key, so even the `"podcast"` case
+only worked if a downstream caller happened to plumb the override
+through as `metadata['content_type']` or `metadata['reframe_style']`,
+which the pipeline did not.
+
+Gameplay worked only via a separate hard-coded
+`_content_override == "gameplay"` comparison at `pipeline.py:1226`,
+which bypassed the classifier entirely — so downstream tuning still
+thought content type was `UNKNOWN` even for user-declared gameplay.
+
+**After (v2 Phase 1):**
+
+- **New module** `backend/services/content_type_strings.py` with
+  `normalize_ui_content_type(token)`, `is_gameplay_override(token)`,
+  and `is_user_override(token)`. Maps every UI token (both legacy and
+  Phase 2 forward-compat) to a
+  `NormalizedContentType(content_type, is_multi_speaker_panel,
+  is_animated, is_gameplay_fastpath, raw)`.
+- **Classifier override branch** now normalizes through the helper,
+  honours `is_multi_speaker_panel` / `is_animated` on the profile,
+  and logs the normalized form. Accepts `content_type_override`,
+  `content_type`, and `reframe_style` metadata keys so older callers
+  still work.
+- **Pipeline** injects `_content_override` into a `_classifier_metadata`
+  dict before calling `classify_content`, so the UI override actually
+  reaches the classifier's user-override branch. Gameplay fast-path
+  now uses `is_gameplay_override()` instead of a bare string literal,
+  so the Phase 2 gameplay variants (`gameplay_fps` / `gameplay_moba`
+  / `gameplay_tps` / `gameplay_racing`) are covered without further
+  edits here. Non-gameplay user overrides now correctly skip the
+  gameplay auto-detect step via `is_user_override()`.
+- **`stream`** normalizes to `ContentType.GAMING` but is deliberately
+  NOT a gameplay fast-path candidate — it has a facecam and still
+  needs the face pipeline. Phase 7 will handle its `STACKED_GAMEPLAY`
+  layout routing downstream.
+
+### Normalization matrix
+
+| UI token | `ContentType` | Flags | fastpath |
+|---|---|---|---|
+| `gameplay` *(legacy)* | `gaming` | — | yes |
+| `movie` *(legacy)* | `narrative` | — | no |
+| `podcast` *(legacy)* | `podcast` | — | no |
+| `debate` / `panel` | `podcast` | panel | no |
+| `interview` | `podcast` | — | no |
+| `vlog` | `vlog` | — | no |
+| `narrative` / `cinematic` | `narrative` | — | no |
+| `anime` / `cartoon` | `anime` | animated | no |
+| `music_video` | `music_video` | — | no |
+| `gameplay_fps` | `gaming` | — | yes |
+| `gameplay_moba` | `gaming` | — | yes |
+| `gameplay_tps` | `gaming` | — | yes |
+| `gameplay_racing` | `gaming` | — | yes |
+| `stream` | `gaming` | — | **no** (facecam) |
+| `sports` | `sports` | — | no |
+| `auto` / `""` / invalid | — | — | — (heuristic path) |
+
+### Tests
+
+| File | Count | Purpose |
+|---|---|---|
+| `test_content_type_override_plumbing.py` | 78 | normalizer / `classify_content` override branch / `pipeline.py` AST plumbing |
+| Pre-existing classifier/plumbing suites | 54 | zero regressions |
+| **Total (v2 Phase 1 scope)** | **132** | all green |
+
+### Exit criteria met
+
+- ✅ Every UI token round-trips through `normalize_ui_content_type` to
+  the correct `ContentType` enum value.
+- ✅ `classify_content` with `metadata['content_type_override']`
+  short-circuits to `confidence=1.0` on the normalized enum value and
+  sets `is_multi_speaker_panel` / `is_animated` from the normalized
+  bundle.
+- ✅ Pipeline AST asserts the metadata injection is present and that
+  the gameplay fast-path uses `is_gameplay_override()` instead of a
+  bare `== "gameplay"` literal.
+- ✅ Invalid / unknown tokens fall through to the heuristic path
+  without crashing; `confidence != 1.0` so downstream consumers can
+  still distinguish a user override from a heuristic guess.
+- ✅ Legacy `metadata['content_type']` / `metadata['reframe_style']`
+  keys still work for older callers.
+- ✅ No regression on the 54 pre-existing classifier / plumbing
+  tests; no regression on `test_pipeline_source_width_hoisted.py`
+  (which guards that `source_width` is still bound at function
+  scope despite the nearby edits).
