@@ -315,7 +315,13 @@ def build_required_regions(
     _active_count = 0
     _passive_same_count = 0
     _passive_no_speaker_count = 0
-    _saliency_dropped_outside_face = 0
+    # v4.1 Fix 3: split the saliency-gate counters three ways so the
+    # verifier can tell whether saliency is being dropped by the
+    # containment check, kept on faceless frames, or kept inside face
+    # bboxes. The old single counter collapsed all three cases.
+    _sal_face_outside_dropped = 0    # frame had faces; saliency was outside their bboxes
+    _sal_face_inside_kept = 0        # frame had faces; saliency was inside
+    _sal_faceless_kept = 0           # frame had no faces; saliency passed through unfiltered
     _lead_room_applied = 0
     _hard_floor_boosts = 0
 
@@ -468,21 +474,35 @@ def build_required_regions(
             face_regions_this_frame = [
                 r for r in frame_regions if r.source == "face"
             ]
+            # v4.1 Fix 3: on faceless frames in dialogue mode, saliency
+            # is the ONLY anchor source the camera solver has for that
+            # frame (nothing else can win the AttentionAnchor priority
+            # chain between person_body and motion_centroid). Dropping
+            # it because "it's outside a face bbox" — when there IS no
+            # face bbox — kills the saliency exactly where it's needed
+            # most. Bypass min_area, containment, and the overlap gate
+            # on truly faceless frames so at least one saliency region
+            # survives to feed promote_preferred_to_required.
+            faceless_frame = not face_regions_this_frame
             for blob in getattr(sal_frame, 'blobs', []):
                 bx, by, bw, bh = blob[0], blob[1], blob[2], blob[3]
                 area = bw * bh
                 _sal_score = getattr(sal_frame, 'mean_score', 0.5)
-                # Per-content-type weight + min-area gate
+                # Per-content-type weight + min-area gate. Faceless
+                # dialogue frames skip the min-area filter entirely —
+                # any non-zero saliency signal is load-bearing there.
                 sal_weight, min_area = _saliency_weight_for_content(
                     content_type, _sal_score,
                 )
-                if area < min_area:
-                    continue
+                if not (dialogue_mode and faceless_frame):
+                    if area < min_area:
+                        continue
                 cand_cx = bx + bw / 2
                 cand_cy = by + bh / 2
-                # Dialogue-mode gate: drop saliency regions whose center lies
-                # outside the union of face bboxes expanded by 1.5× when
-                # faces exist in the frame.
+                # Dialogue-mode containment gate: drop saliency regions
+                # whose center lies outside the union of face bboxes
+                # expanded by 1.5× ONLY when faces exist in the frame.
+                # Faceless frames skip this entirely.
                 if dialogue_mode and face_regions_this_frame:
                     inside_any = False
                     for fr_reg in face_regions_this_frame:
@@ -493,8 +513,12 @@ def build_required_regions(
                             inside_any = True
                             break
                     if not inside_any:
-                        _saliency_dropped_outside_face += 1
+                        _sal_face_outside_dropped += 1
                         continue
+                    else:
+                        _sal_face_inside_kept += 1
+                elif dialogue_mode and faceless_frame:
+                    _sal_faceless_kept += 1
                 candidate = RequiredRegion(
                     timestamp=ff.timestamp,
                     cx=cand_cx, cy=cand_cy,
@@ -505,7 +529,13 @@ def build_required_regions(
                     saliency_score=_sal_score,
                     weight=sal_weight,
                 )
-                if not _overlaps_any(candidate, frame_regions, 0.5):
+                # Overlap gate: on faceless frames skip the overlap
+                # check too (there are no faces to overlap with, and we
+                # want multiple saliency regions per frame so the
+                # anchor chain has options).
+                if dialogue_mode and faceless_frame:
+                    frame_regions.append(candidate)
+                elif not _overlaps_any(candidate, frame_regions, 0.5):
                     frame_regions.append(candidate)
 
         # ── Hard floor: active speaker weight >= 1.5 × max other face weight ──
@@ -559,10 +589,22 @@ def build_required_regions(
             "(>= 1.5x passive in-frame max)",
             _hard_floor_boosts,
         )
-    if _saliency_dropped_outside_face > 0:
+    # v4.1 Fix 3: three-way split log. N=kept on faceless frames,
+    # M=dropped because outside face bboxes, K=kept inside face bboxes.
+    # Lets the verifier tell at a glance whether the gate is working
+    # or whether the SaliencyTracker just isn't emitting much.
+    if dialogue_mode and (
+        _sal_faceless_kept
+        or _sal_face_outside_dropped
+        or _sal_face_inside_kept
+    ):
         logger.info(
-            "[SaliencyV2] dialogue-mode gate dropped %d saliency regions outside face bboxes",
-            _saliency_dropped_outside_face,
+            "[SaliencyV2] dialogue-mode gate: %d faceless-frame saliency kept, "
+            "%d face-frame saliency dropped (outside face bboxes), "
+            "%d face-frame saliency kept (inside face bboxes)",
+            _sal_faceless_kept,
+            _sal_face_outside_dropped,
+            _sal_face_inside_kept,
         )
     if _lead_room_applied > 0:
         logger.info(

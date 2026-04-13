@@ -20,6 +20,11 @@ psutil>=5.9.0
 numpy>=1.24.0
 scipy>=1.10.0
 opencv-python-headless>=4.8.0
+# v4.1: ultralytics (YOLOv8n) backend for object_detector /
+# person_detector. Without this, PersonDetector silently falls back to
+# backend=none → person_body anchor source produces 0 anchors on
+# faceless frames and the camera drifts onto background motion.
+ultralytics>=8.0.0
 mcp>=1.8.0
 pyannote.audio>=3.1.0
 torch>=2.0.0

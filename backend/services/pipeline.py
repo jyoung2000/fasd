@@ -2579,6 +2579,15 @@ async def _run_analysis_inner(job_id: str):
     # Hoisted so both AUTOFLIP and REFRAME_SEGMENTER branches can reference it
     # without UnboundLocalError when the AUTOFLIP path doesn't execute.
     _interpolated_timeline = None
+    # v4.1 hotfix: hoist source_width / source_height to function scope.
+    # Both the AUTOFLIP (line ~2668) and REFRAME_SEGMENTER (line ~2764)
+    # branches previously referenced a bare `source_width` when converting
+    # pixel subject_x to a 0-100 int for SceneDescription. That variable
+    # only existed as a kwarg name inside build_reframe_segments —
+    # NameError at pipeline scope. Hoist it here once so both branches
+    # (and any future additions) can read the same local.
+    source_width = int(metadata.get("width", 1920) or 1920)
+    source_height = int(metadata.get("height", 1080) or 1080)
     _has_speaker_data = active_speaker_events or transcript_speaker_events
     USE_AUTOFLIP_REFRAME = os.environ.get("USE_AUTOFLIP_REFRAME", "false").lower() in ("true", "1", "yes")
     if dense_face_results and face_registry and scenes and _has_speaker_data:

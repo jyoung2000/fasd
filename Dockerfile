@@ -90,6 +90,18 @@ RUN mkdir -p /app/backend/models && \
     curl -sL -o /app/backend/models/face_detection_yunet_2023mar.onnx \
     "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
 
+# v4.1: pre-download YOLOv8n weights for PersonDetector / ObjectDetector
+# (~5.5MB). object_detector.py looks at /data/models/yolov8n.pt first,
+# so stash the weights there at build time. Without this step the first
+# analysis run stalls while ultralytics downloads from GitHub, or fails
+# silently on offline containers. Also verify load so broken builds
+# fail early instead of silently landing backend=none.
+RUN mkdir -p /data/models && \
+    curl --retry 4 --retry-delay 5 --retry-all-errors -fsSL \
+      -o /data/models/yolov8n.pt \
+      "https://github.com/ultralytics/assets/releases/download/v8.2.0/yolov8n.pt" && \
+    python3 -c "from ultralytics import YOLO; m = YOLO('/data/models/yolov8n.pt'); print(f'YOLOv8n loaded: {len(m.names)} classes')"
+
 # Install CUDA runtime libraries via pip for GPU passthrough support.
 # These PyPI packages provide the CUDA shared libraries that ctranslate2
 # and faster-whisper need — no NVIDIA apt repo or system CUDA required.

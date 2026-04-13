@@ -144,6 +144,18 @@ RUN mkdir -p /app/backend/models && \
     curl -sL -o /app/backend/models/face_recognition_sface_2021dec.onnx \
     "https://github.com/opencv/opencv_zoo/raw/main/models/face_recognition_sface/face_recognition_sface_2021dec.onnx"
 
+# v4.1: pre-download YOLOv8n weights for PersonDetector / ObjectDetector
+# (~5.5MB). object_detector.py looks at /data/models/yolov8n.pt first,
+# so stash the weights there at build time. Without this step the first
+# analysis run would stall for 10-30s while ultralytics downloads the
+# model from GitHub — or fail silently if the container has no internet.
+# Also verify the model can actually load so a broken build fails early.
+RUN mkdir -p /data/models && \
+    curl --retry 4 --retry-delay 5 --retry-all-errors -fsSL \
+      -o /data/models/yolov8n.pt \
+      "https://github.com/ultralytics/assets/releases/download/v8.2.0/yolov8n.pt" && \
+    python3 -c "from ultralytics import YOLO; m = YOLO('/data/models/yolov8n.pt'); print(f'YOLOv8n loaded: {len(m.names)} classes')"
+
 # Copy backend source
 COPY backend/ ./backend/
 

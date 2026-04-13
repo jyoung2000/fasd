@@ -60,33 +60,78 @@ class ObjectDetector:
         self.conf_threshold = conf_threshold
         self.backend_name = "none"
         self._model = None
+        self._init_errors: list = []  # kept for diagnostics
 
-        # Try ultralytics first
+        # ── Try ultralytics YOLOv8n ──
+        # v4.1: promote the init errors from DEBUG to WARNING and tag
+        # them so the log tells us the actual cause. Before the hotfix,
+        # "import failed" and "model file missing" and "weights loaded
+        # but YOLO() threw" all collapsed to a single silent DEBUG line,
+        # and ObjectDetector.backend_name=="none" cascaded through
+        # PersonDetector with no diagnostic trail.
         try:
             from ultralytics import YOLO
-            model_path = os.path.join(model_dir, "yolov8n.pt")
-            if not os.path.exists(model_path):
-                model_path = "yolov8n.pt"  # let ultralytics download to its cache
-            self._model = YOLO(model_path)
-            self.backend_name = "ultralytics-yolov8n"
-            logger.info("ObjectDetector: backend=ultralytics-yolov8n")
-            return
+        except ImportError as e:
+            msg = f"ultralytics not installed: {e}"
+            self._init_errors.append(("ultralytics_import", msg))
+            logger.warning(
+                "[ObjectDetector] ultralytics import failed — YOLOv8n "
+                "backend unavailable. pip install ultralytics>=8.0.0 "
+                "to enable (error: %s)", e,
+            )
         except Exception as e:
-            logger.debug("ObjectDetector: ultralytics unavailable: %s", e)
+            msg = f"ultralytics failed to import: {type(e).__name__}: {e}"
+            self._init_errors.append(("ultralytics_import_other", msg))
+            logger.warning("[ObjectDetector] %s", msg)
+        else:
+            model_path = os.path.join(model_dir, "yolov8n.pt")
+            try:
+                if not os.path.exists(model_path):
+                    logger.info(
+                        "[ObjectDetector] YOLOv8n weights not at %s; "
+                        "falling back to ultralytics auto-download cache",
+                        model_path,
+                    )
+                    model_path = "yolov8n.pt"
+                self._model = YOLO(model_path)
+                self.backend_name = "ultralytics-yolov8n"
+                logger.info(
+                    "[ObjectDetector] backend=yolov8n, model_path=%s, "
+                    "classes=%d",
+                    model_path, len(getattr(self._model, "names", {}) or {}),
+                )
+                return
+            except Exception as e:
+                msg = f"YOLO({model_path}) failed: {type(e).__name__}: {e}"
+                self._init_errors.append(("ultralytics_load", msg))
+                logger.warning("[ObjectDetector] %s", msg)
 
-        # Fall through to OpenCV DNN MobileNet-SSD
+        # ── Fall through to OpenCV DNN MobileNet-SSD ──
         try:
             proto = os.path.join(model_dir, "MobileNetSSD_deploy.prototxt")
             weights = os.path.join(model_dir, "MobileNetSSD_deploy.caffemodel")
             if os.path.exists(proto) and os.path.exists(weights):
                 self._model = cv2.dnn.readNetFromCaffe(proto, weights)
                 self.backend_name = "opencv-mobilenet-ssd"
-                logger.info("ObjectDetector: backend=opencv-mobilenet-ssd")
+                logger.info("[ObjectDetector] backend=opencv-mobilenet-ssd")
                 return
+            else:
+                logger.info(
+                    "[ObjectDetector] OpenCV DNN weights not found at %s / %s",
+                    proto, weights,
+                )
         except Exception as e:
-            logger.debug("ObjectDetector: OpenCV DNN unavailable: %s", e)
+            msg = f"OpenCV DNN failed: {type(e).__name__}: {e}"
+            self._init_errors.append(("opencv_dnn", msg))
+            logger.warning("[ObjectDetector] %s", msg)
 
-        logger.info("ObjectDetector: backend=none (no class-aware detector available)")
+        logger.warning(
+            "[ObjectDetector] backend=none — no class-aware detector available. "
+            "PersonDetector will emit 0 person_body anchors and faceless "
+            "frames will fall back to last_face_decay / motion_centroid. "
+            "Init errors: %s",
+            self._init_errors or "[]",
+        )
 
     def detect(self, frame_bgr, timestamp: float) -> list:
         """Run detection on a single BGR frame. Returns list[ObjectDetection]."""
