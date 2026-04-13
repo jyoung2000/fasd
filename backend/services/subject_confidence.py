@@ -23,6 +23,20 @@ CONFIDENCE_HIGH = 0.70        # stationary at face slot
 CONFIDENCE_MEDIUM = 0.50      # inherit last known position
 CONFIDENCE_LOW = 0.30         # blur_fill
 # Below CONFIDENCE_LOW → wide_master
+# Fix 5: raise the wide_master floor. Previously, confidence < 0.30
+# produced wide_master. That's too eager — confidence often drops
+# momentarily on occlusion / profile frames even though the subject
+# never left the crop. Only segments below 0.15 should be candidates
+# for wide_master.
+CONFIDENCE_WIDE_MASTER_FLOOR = 0.15
+
+# Fix 1: weighted face-in-crop gate. Faces whose identity_id matches
+# a tracked slot count with weight 1.0; untracked faces (crowd /
+# background / false positives) count with weight 0.2. Weighting is
+# further multiplied by face area as a percent of the frame so a large
+# close-up face beats five tiny crowd faces.
+UNTRACKED_FACE_WEIGHT = 0.2
+WEIGHTED_FACE_RATIO_THRESHOLD = 0.30
 
 # ── Fallback preferences per content type ──
 # What to do when confidence is between LOW and MEDIUM
@@ -34,7 +48,93 @@ FALLBACK_PREFERENCE = {
     "sports":       "blur_fill",      # motion reads through blur
     "music_video":  "blur_fill",      # motion reads through blur
     "anime":        "blur_fill",      # motion reads through blur
+    "multi_speaker_panel": "blur_fill",  # same as podcast — show the seats
     "unknown":      "blur_fill",      # safe default
+}
+
+# Fix 3: ordered fallback cascade per content type. Each tier name is
+# resolved by _SalientFallbackResolver below. The cascade is tried in
+# order; the first tier that returns a valid center wins.
+FALLBACK_CASCADE_BY_CONTENT = {
+    "multi_speaker_panel": [
+        "active_speaker_slot",
+        "prev_crop_continuity",
+        "saliency_peak",
+        "face_centroid",
+        "prev_anywhere",
+        "hardcoded_center",
+    ],
+    "podcast": [
+        "active_speaker_slot",
+        "prev_crop_continuity",
+        "saliency_peak",
+        "face_centroid",
+        "prev_anywhere",
+        "hardcoded_center",
+    ],
+    "talking_head": [
+        "face_centroid",
+        "prev_crop_continuity",
+        "saliency_peak",
+        "prev_anywhere",
+        "hardcoded_center",
+    ],
+    "vlog": [
+        "face_centroid",
+        "saliency_peak",
+        "motion_proxy",
+        "prev_crop_continuity",
+        "prev_anywhere",
+        "hardcoded_center",
+    ],
+    "anime": [
+        "face_centroid",
+        "saliency_peak",
+        "motion_proxy",
+        "prev_crop_continuity",
+        "prev_anywhere",
+        "hardcoded_center",
+    ],
+    "narrative": [
+        "face_centroid",
+        "saliency_peak",
+        "motion_proxy",
+        "prev_crop_continuity",
+        "prev_anywhere",
+        "hardcoded_center",
+    ],
+    "music_video": [
+        "face_centroid",
+        "motion_proxy",
+        "saliency_peak",
+        "prev_crop_continuity",
+        "prev_anywhere",
+        "hardcoded_center",
+    ],
+    "sports": [
+        "motion_proxy",
+        "saliency_peak",
+        "face_centroid",
+        "prev_crop_continuity",
+        "prev_anywhere",
+        "hardcoded_center",
+    ],
+    "gaming": [
+        "persistent_hud_region",
+        "motion_proxy",
+        "saliency_peak",
+        "prev_crop_continuity",
+        "prev_anywhere",
+        "hardcoded_center",
+    ],
+    "unknown": [
+        "prev_crop_continuity",
+        "saliency_peak",
+        "face_centroid",
+        "motion_proxy",
+        "prev_anywhere",
+        "hardcoded_center",
+    ],
 }
 
 
@@ -61,6 +161,8 @@ class SubjectConfidenceEstimator:
         speaker_to_slot: dict,
         source_width: int,
         source_height: int,
+        frame_saliency: Optional[list] = None,
+        persistent_regions=None,
     ):
         self.face_registry = face_registry
         self.dense_faces = dense_faces or []
@@ -69,6 +171,17 @@ class SubjectConfidenceEstimator:
         self.speaker_to_slot = speaker_to_slot or {}
         self.source_width = source_width
         self.source_height = source_height
+        # Fix 1 + 2: saliency regions used by the weighted face gate's
+        # short-circuit inspection AND by _SalientFallbackResolver when
+        # the primary face tier fails.
+        self.frame_saliency = frame_saliency or []
+        self.persistent_regions = persistent_regions
+        # Build a set of tracked slot_ids once for O(1) membership checks
+        # in _check_face_in_crop_window's weighted loop.
+        self._tracked_slot_ids: set = set()
+        if face_registry and getattr(face_registry, "slots", None):
+            for s in face_registry.slots:
+                self._tracked_slot_ids.add(int(s.slot_id))
 
     def evaluate(
         self,
@@ -96,9 +209,13 @@ class SubjectConfidenceEstimator:
         reasons = []
 
         # ── Check 1: Face-in-window ──
-        # Is there a face from the registry inside the proposed crop rectangle?
+        # Fix 1: weighted gate (tracked-slot faces count 1.0, untracked
+        # count 0.2, scaled by face area) + active-speaker short-circuit
+        # (if the active speaker is known AND their face is inside the
+        # crop rect, the gate passes unconditionally).
         face_in_crop, face_check_detail = self._check_face_in_crop_window(
             seg_start, seg_end, candidate_x, target_aspect_ratio,
+            candidate_slot=candidate_slot,
         )
         if face_in_crop:
             confidence += 0.40
@@ -160,9 +277,10 @@ class SubjectConfidenceEstimator:
         confidence = 0.0
         reasons = []
 
-        # Check 1: Face-in-window
+        # Check 1: Face-in-window (Fix 1: weighted + short-circuit)
         face_in_crop, face_check_detail = self._check_face_in_crop_window(
             seg_start, seg_end, candidate_x, target_aspect_ratio,
+            candidate_slot=candidate_slot,
         )
         if face_in_crop:
             confidence += 0.40
@@ -210,8 +328,25 @@ class SubjectConfidenceEstimator:
         seg_end: float,
         candidate_x: int,
         target_aspect_ratio: float,
+        candidate_slot: Optional[int] = None,
     ) -> tuple:
-        """Check if any registered face is inside the proposed crop window.
+        """Check whether the proposed crop rect contains the subject.
+
+        Fix 1: the old check counted every detected face equally and
+        gated at ≥30% face count inside the crop. On a panel with a
+        reactive audience, 12/62 faces landed in the crop and the gate
+        failed — despite all 3 panelists' faces being squarely inside.
+        The gate now:
+
+          (a) short-circuits to True when `candidate_slot` is the
+              active speaker AND that speaker's face is inside the
+              crop rect — the segment IS correct no matter how many
+              background faces spill outside.
+          (b) computes a WEIGHTED ratio where a tracked-slot face
+              counts 1.0 and an untracked face counts 0.2, with both
+              scaled by face area as a fraction of the frame (area
+              scale ∈ [0.25, 2.0]).
+          (c) passes when the weighted ratio ≥ WEIGHTED_FACE_RATIO_THRESHOLD.
 
         Returns (bool, detail_string).
         """
@@ -236,30 +371,148 @@ class SubjectConfidenceEstimator:
             crop_right = 100
             crop_left = 100 - crop_width_pct
 
-        # Check if any face in the interval falls within the crop window
-        faces_checked = 0
-        faces_in_window = 0
+        # ── (a) Active-speaker short-circuit ──
+        # Build the set of slot_ids that are the active speaker at ANY
+        # point in this segment. If candidate_slot matches one of
+        # those, we only need to confirm that speaker's face actually
+        # sits inside the crop rect — and if it does, we pass the gate
+        # without looking at background faces at all.
+        active_slots_in_segment: set = set()
+        if self.active_speaker_events:
+            for ev in self.active_speaker_events:
+                ov_s = max(seg_start, ev.start)
+                ov_e = min(seg_end, ev.end)
+                if ov_e > ov_s and getattr(ev, "slot_id", -1) >= 0:
+                    active_slots_in_segment.add(int(ev.slot_id))
+
+        active_face_inside = False
+        if (candidate_slot is not None
+                and int(candidate_slot) in active_slots_in_segment):
+            for df in self.dense_faces:
+                if df.timestamp < seg_start or df.timestamp > seg_end:
+                    continue
+                for f in df.faces:
+                    if getattr(f, "identity_id", -1) != int(candidate_slot):
+                        continue
+                    fx = getattr(f, "x", None)
+                    if fx is None:
+                        fx = getattr(f, "nose_x", 50)
+                    if crop_left <= fx <= crop_right:
+                        active_face_inside = True
+                        break
+                if active_face_inside:
+                    break
+            if active_face_inside:
+                return True, (
+                    f"active_speaker_slot{candidate_slot}_in_crop "
+                    f"[{crop_left:.0f}-{crop_right:.0f}] (short-circuit)"
+                )
+
+        # ── (b) + (c) Weighted ratio gate ──
+        weight_in = 0.0
+        weight_total = 0.0
+        raw_in = 0
+        raw_total = 0
         for df in self.dense_faces:
             if df.timestamp < seg_start or df.timestamp > seg_end:
                 continue
             for f in df.faces:
-                sid = getattr(f, 'identity_id', -1)
-                if sid < 0:
-                    continue
-                face_x = getattr(f, 'x', None)
+                face_x = getattr(f, "x", None)
                 if face_x is None:
-                    face_x = getattr(f, 'nose_x', 50)
-                faces_checked += 1
-                if crop_left <= face_x <= crop_right:
-                    faces_in_window += 1
+                    face_x = getattr(f, "nose_x", 50)
 
-        if faces_checked == 0:
+                sid = getattr(f, "identity_id", -1)
+                tracked = int(sid) in self._tracked_slot_ids if sid is not None else False
+
+                fw = float(getattr(f, "width", 10.0))
+                fh = float(getattr(f, "height", 10.0))
+                # face area as percent of frame * 0.01; clamp to
+                # [0.25, 2.0] so tiny crowd faces still count a little
+                # and single huge faces don't completely dominate.
+                area_scale = max(0.25, min(2.0, (fw * fh) / 100.0))
+                base = 1.0 if tracked else UNTRACKED_FACE_WEIGHT
+                is_human_conf = float(getattr(f, "pose_confidence", 1.0) or 1.0)
+                w = base * area_scale * max(0.3, is_human_conf)
+
+                weight_total += w
+                raw_total += 1
+                if crop_left <= face_x <= crop_right:
+                    weight_in += w
+                    raw_in += 1
+
+        if weight_total <= 0:
             return False, "no_faces_in_interval"
 
-        ratio = faces_in_window / faces_checked
-        if ratio >= 0.3:  # At least 30% of detected faces are in the crop
-            return True, f"{faces_in_window}/{faces_checked} faces in crop"
-        return False, f"only {faces_in_window}/{faces_checked} faces in crop (need 30%)"
+        ratio = weight_in / weight_total
+        if ratio >= WEIGHTED_FACE_RATIO_THRESHOLD:
+            return True, (
+                f"{raw_in}/{raw_total} faces in crop, "
+                f"weighted={ratio:.2f} ≥ {WEIGHTED_FACE_RATIO_THRESHOLD:.2f}"
+            )
+        return False, (
+            f"only {raw_in}/{raw_total} faces in crop, "
+            f"weighted={ratio:.2f} < {WEIGHTED_FACE_RATIO_THRESHOLD:.2f} "
+            f"(need {WEIGHTED_FACE_RATIO_THRESHOLD:.0%})"
+        )
+
+    def per_frame_in_crop_pass_rate(
+        self,
+        seg_start: float,
+        seg_end: float,
+        candidate_x: int,
+        target_aspect_ratio: float = 9 / 16,
+    ) -> float:
+        """Fraction of dense face frames in [seg_start, seg_end] where
+        AT LEAST ONE tracked-slot face center is inside the proposed crop.
+
+        Fix 5: the confidence estimator above aggregates across the
+        whole window, which means one bad mid-segment frame can pull
+        the gate below the threshold for an entire 5 second segment.
+        This per-frame robustness helper lets the segmenter promote a
+        segment back out of wide_master when ≥40 %% of frames had a
+        tracked face visibly inside the crop rect — the dropout is
+        momentary, not systematic.
+
+        Returns a 0.0-1.0 ratio; 0.0 if no frames fall in the window.
+        """
+        if not self.dense_faces:
+            return 0.0
+        src_aspect = (
+            self.source_width / self.source_height
+            if self.source_height > 0 else 16 / 9
+        )
+        if target_aspect_ratio < src_aspect:
+            crop_width_pct = (target_aspect_ratio / src_aspect) * 100
+        else:
+            crop_width_pct = 100.0
+        crop_left = candidate_x - crop_width_pct / 2.0
+        crop_right = candidate_x + crop_width_pct / 2.0
+        if crop_left < 0:
+            crop_left = 0
+            crop_right = crop_width_pct
+        if crop_right > 100:
+            crop_right = 100
+            crop_left = 100 - crop_width_pct
+
+        n_frames = 0
+        n_pass = 0
+        for df in self.dense_faces:
+            if df.timestamp < seg_start or df.timestamp > seg_end:
+                continue
+            n_frames += 1
+            for f in df.faces:
+                sid = getattr(f, "identity_id", -1)
+                if sid is None or int(sid) not in self._tracked_slot_ids:
+                    continue
+                fx = getattr(f, "x", None)
+                if fx is None:
+                    fx = getattr(f, "nose_x", 50)
+                if crop_left <= fx <= crop_right:
+                    n_pass += 1
+                    break
+        if n_frames == 0:
+            return 0.0
+        return n_pass / n_frames
 
     def _check_speaker_agreement(
         self,
@@ -443,6 +696,293 @@ def face_in_proposed_crop(seg, face_registry, dense_faces,
     return False
 
 
+class _SalientFallbackResolver:
+    """Fix 2: multi-tier fallback cascade for the low-confidence case.
+
+    Replaces the old `hardcoded_center (x=50)` fallback with an
+    ordered list of strategies. Each tier returns (x, y, source_tag)
+    in 0-100 percent coordinates; the first tier that returns a valid
+    center wins.
+
+    Tiers:
+      - prev_crop_continuity: previous segment's (x,y) if it was
+        confident (>= 0.5) AND its end is within 2s of this segment's
+        start. Speakers don't teleport — continuity beats centering.
+      - saliency_peak: dominant saliency region in the segment window,
+        gated on mean_score >= 0.40.
+      - face_centroid: weighted centroid of ALL faces (tracked and
+        untracked) in the window. Serves as a body-proxy when face
+        detection succeeded but the tracked slot gate failed.
+      - motion_proxy: frame-to-frame face-position deltas. When a
+        face is moving, the mean position of moving faces is the
+        motion centroid — good for sports / dance / anime action.
+      - active_speaker_slot: face_registry slot of whichever speaker
+        is active during this segment, directly from the events.
+      - persistent_hud_region: horizontal center of the game frame
+        (NOT the HUD overlay) for gaming content.
+      - prev_anywhere: previous segment's (x,y) regardless of age —
+        last-ditch continuity before the hardcoded center.
+      - hardcoded_center: true last resort at (50, 50).
+    """
+
+    def __init__(
+        self,
+        estimator: "SubjectConfidenceEstimator",
+        content_type: str,
+        last_seg,
+        candidate_x: Optional[int],
+        candidate_y: Optional[int] = 50,
+    ):
+        self.estimator = estimator
+        self.content_type = content_type or "unknown"
+        self.last_seg = last_seg  # expects .end, .subject_x, .subject_y, .confidence or None
+        self.candidate_x = candidate_x
+        self.candidate_y = candidate_y if candidate_y is not None else 50
+
+    def resolve(self, seg_start: float, seg_end: float) -> tuple:
+        cascade = FALLBACK_CASCADE_BY_CONTENT.get(
+            self.content_type, FALLBACK_CASCADE_BY_CONTENT["unknown"],
+        )
+        for tier in cascade:
+            result = self._try_tier(tier, seg_start, seg_end)
+            if result is not None:
+                x, y, source = result
+                return (
+                    int(round(max(0, min(100, x)))),
+                    int(round(max(0, min(100, y)))),
+                    source,
+                )
+        # Cascade is guaranteed to end in hardcoded_center, but just in
+        # case it was misconfigured, return center here too.
+        return 50, 50, "hardcoded_center_default"
+
+    def _try_tier(self, tier: str, seg_start: float, seg_end: float):
+        if tier == "prev_crop_continuity":
+            ls = self.last_seg
+            if ls is None:
+                return None
+            gap = float(seg_start) - float(getattr(ls, "end", -1.0))
+            conf = float(getattr(ls, "confidence", 0.0) or 0.0)
+            if gap <= 2.0 and gap >= 0.0 and conf >= 0.5:
+                return (
+                    _coerce_pct(getattr(ls, "subject_x_pct", None))
+                    or _coerce_pct(getattr(ls, "subject_x", None), default=50),
+                    _coerce_pct(getattr(ls, "subject_y_pct", None))
+                    or _coerce_pct(getattr(ls, "subject_y", None), default=50),
+                    "prev_crop_continuity",
+                )
+            return None
+
+        if tier == "saliency_peak":
+            peak = self._saliency_peak_in_window(seg_start, seg_end)
+            if peak is not None:
+                return (peak[0], peak[1], "saliency_peak")
+            return None
+
+        if tier == "face_centroid":
+            centroid = self._face_centroid_in_window(seg_start, seg_end)
+            if centroid is not None:
+                return (centroid[0], centroid[1], "face_centroid")
+            return None
+
+        if tier == "motion_proxy":
+            motion = self._motion_proxy_in_window(seg_start, seg_end)
+            if motion is not None:
+                return (motion[0], motion[1], "motion_proxy")
+            return None
+
+        if tier == "active_speaker_slot":
+            active = self._active_speaker_slot_in_window(seg_start, seg_end)
+            if active is not None:
+                return (active[0], active[1], "active_speaker_slot")
+            return None
+
+        if tier == "persistent_hud_region":
+            pr = self.estimator.persistent_regions
+            if pr is not None:
+                cx = getattr(pr, "game_frame_cx", None)
+                cy = getattr(pr, "game_frame_cy", None)
+                if cx is not None and cy is not None:
+                    return (float(cx), float(cy), "persistent_hud_region")
+            return None
+
+        if tier == "prev_anywhere":
+            ls = self.last_seg
+            if ls is not None:
+                return (
+                    _coerce_pct(getattr(ls, "subject_x_pct", None))
+                    or _coerce_pct(getattr(ls, "subject_x", None), default=50),
+                    _coerce_pct(getattr(ls, "subject_y_pct", None))
+                    or _coerce_pct(getattr(ls, "subject_y", None), default=50),
+                    "prev_anywhere",
+                )
+            return None
+
+        if tier == "hardcoded_center":
+            return (50.0, 50.0, "hardcoded_center")
+
+        return None
+
+    # ── Tier helpers ──
+
+    def _saliency_peak_in_window(self, seg_start: float, seg_end: float):
+        regs = [
+            r for r in self.estimator.frame_saliency
+            if seg_start <= float(getattr(r, "timestamp", -1)) <= seg_end
+        ]
+        if not regs:
+            return None
+        # Gate on mean saliency strength; ignore weak noise blobs.
+        scored = [
+            r for r in regs
+            if float(getattr(r, "saliency_score", 0.0)) >= 0.40
+        ]
+        if not scored:
+            return None
+        # Prefer the largest score·area product.
+        best = max(
+            scored,
+            key=lambda r: float(r.saliency_score) * float(r.w) * float(r.h),
+        )
+        return (float(best.x), float(best.y))
+
+    def _face_centroid_in_window(self, seg_start: float, seg_end: float):
+        total_w = 0.0
+        sum_x = 0.0
+        sum_y = 0.0
+        for df in self.estimator.dense_faces:
+            if df.timestamp < seg_start or df.timestamp > seg_end:
+                continue
+            for f in df.faces:
+                fx = getattr(f, "x", None)
+                if fx is None:
+                    fx = getattr(f, "nose_x", 50)
+                fy = getattr(f, "y", None)
+                if fy is None:
+                    fy = getattr(f, "nose_y", 50)
+                fw = float(getattr(f, "width", 10.0))
+                fh = float(getattr(f, "height", 10.0))
+                # Tracked identities get full weight; untracked faces
+                # get the reduced weight so we don't centroid on
+                # background crowds when a tracked speaker is also in
+                # the frame but was missed by the primary gate.
+                sid = getattr(f, "identity_id", -1)
+                tracked = int(sid) in self.estimator._tracked_slot_ids if sid is not None else False
+                base = 1.0 if tracked else UNTRACKED_FACE_WEIGHT
+                w = max(0.1, base * (fw * fh) / 100.0)
+                total_w += w
+                sum_x += float(fx) * w
+                sum_y += float(fy) * w
+        if total_w <= 0:
+            return None
+        return (sum_x / total_w, sum_y / total_w)
+
+    def _motion_proxy_in_window(self, seg_start: float, seg_end: float):
+        # Face-position deltas across consecutive dense frames inside
+        # the segment. The mean position of moving faces = motion
+        # centroid proxy. Works even without full optical flow data.
+        samples = []
+        prev_map = {}
+        for df in self.estimator.dense_faces:
+            if df.timestamp < seg_start or df.timestamp > seg_end:
+                continue
+            curr_map = {}
+            for f in df.faces:
+                sid = getattr(f, "identity_id", -1)
+                if sid is None or int(sid) < 0:
+                    continue
+                fx = getattr(f, "x", None)
+                if fx is None:
+                    fx = getattr(f, "nose_x", 50)
+                fy = getattr(f, "y", None)
+                if fy is None:
+                    fy = getattr(f, "nose_y", 50)
+                curr_map[int(sid)] = (float(fx), float(fy))
+                if int(sid) in prev_map:
+                    px, py = prev_map[int(sid)]
+                    dx = float(fx) - px
+                    dy = float(fy) - py
+                    if (dx * dx + dy * dy) > 4.0:  # > 2% total move
+                        samples.append((float(fx), float(fy)))
+            prev_map = curr_map
+        if not samples:
+            return None
+        sx = sum(p[0] for p in samples) / len(samples)
+        sy = sum(p[1] for p in samples) / len(samples)
+        return (sx, sy)
+
+    def _active_speaker_slot_in_window(self, seg_start: float, seg_end: float):
+        if not self.estimator.active_speaker_events:
+            return None
+        # Pick the slot with the largest coverage in the window.
+        coverage: dict = {}
+        for ev in self.estimator.active_speaker_events:
+            ov_s = max(seg_start, ev.start)
+            ov_e = min(seg_end, ev.end)
+            if ov_e > ov_s and getattr(ev, "slot_id", -1) >= 0:
+                coverage[int(ev.slot_id)] = (
+                    coverage.get(int(ev.slot_id), 0.0) + (ov_e - ov_s)
+                )
+        if not coverage:
+            return None
+        best_slot = max(coverage, key=coverage.get)
+        if self.estimator.face_registry is None:
+            return None
+        for s in getattr(self.estimator.face_registry, "slots", []) or []:
+            if int(s.slot_id) == best_slot:
+                return (float(s.x_center), 50.0)
+        return None
+
+
+def _coerce_pct(val, default=None):
+    if val is None:
+        return default
+    try:
+        v = float(val)
+    except (TypeError, ValueError):
+        return default
+    # Values that look like pixel x/y get normalized to 0-100 when
+    # caller stores them pre-scaled. Heuristic: if > 100, assume pixels
+    # and caller should pass subject_x_pct explicitly; fall back to
+    # default in that case to avoid invalid coordinates.
+    if v < 0 or v > 100:
+        return default
+    return v
+
+
+def resolve_fallback_center(
+    estimator,
+    content_type: str,
+    seg_start: float,
+    seg_end: float,
+    last_seg,
+    candidate_x: Optional[int],
+    candidate_y: Optional[int] = 50,
+) -> tuple:
+    """Public entry point for Fix 2's salient fallback cascade.
+
+    Args:
+        estimator: SubjectConfidenceEstimator (holds dense_faces,
+            face_registry, frame_saliency, active_speaker_events).
+        content_type: Content type string; drives the cascade order.
+        seg_start, seg_end: Segment time range in seconds.
+        last_seg: Previous segment-like object (with .end, .subject_x,
+            .subject_y, .confidence) or None for the first segment.
+        candidate_x, candidate_y: Candidate 0-100 coordinates if any.
+
+    Returns:
+        (x_pct, y_pct, source_tag) — 0-100 integer coordinates + tag.
+    """
+    resolver = _SalientFallbackResolver(
+        estimator=estimator,
+        content_type=content_type,
+        last_seg=last_seg,
+        candidate_x=candidate_x,
+        candidate_y=candidate_y,
+    )
+    return resolver.resolve(seg_start, seg_end)
+
+
 def get_fallback_strategy(
     confidence: float,
     content_type: str,
@@ -459,8 +999,13 @@ def get_fallback_strategy(
       >= 0.70: no fallback needed (caller uses the candidate)
       >= 0.50: USE the current candidate position (face IS detected,
                just with medium confidence — don't discard it)
-      >= 0.30: content-type-dependent (blur_fill or wide_master)
-      <  0.30: wide_master (absolute last resort)
+      >= 0.15: content-type-dependent (blur_fill or wide_master) but
+               only after the salient-fallback cascade has tried and
+               failed; caller passes the cascade result here via
+               candidate_x. (Fix 5: raised wide_master floor from
+               0.30 → 0.15 so momentary confidence dips don't trigger
+               the letterbox.)
+      <  0.15: wide_master (absolute last resort)
     """
     if confidence >= CONFIDENCE_HIGH:
         return None  # No fallback — use the candidate as-is
@@ -486,11 +1031,32 @@ def get_fallback_strategy(
 
     preference = FALLBACK_PREFERENCE.get(content_type, "blur_fill")
 
-    if confidence >= CONFIDENCE_LOW:
+    if confidence >= CONFIDENCE_WIDE_MASTER_FLOOR:
+        # Fix 5: instead of defaulting to wide_master with hardcoded
+        # center, the caller now passes in a salient-fallback center
+        # (via candidate_x). Emit a stationary crop at that center.
+        # Only when the cascade itself returned the hardcoded_center
+        # tag (or candidate_x is None) do we fall to blur_fill.
+        if candidate_x is not None:
+            return (
+                "stationary", "single",
+                candidate_x,
+                candidate_slot,
+                "confidence_low_salient_fallback",
+            )
         if preference == "wide_master":
             return ("wide_master", "wide_master", 50, None, "confidence_low_wide_master")
         else:
             return ("blur_fill", "blur_fill", 50, None, "confidence_low_blur_fill")
 
-    # Absolute last resort
+    # Absolute last resort — still try the cascade center before
+    # letterboxing, but mark it so the pipeline knows the confidence
+    # was very low.
+    if candidate_x is not None:
+        return (
+            "stationary", "single",
+            candidate_x,
+            candidate_slot,
+            "confidence_very_low_salient_fallback",
+        )
     return ("wide_master", "wide_master", 50, None, "confidence_very_low_wide_master")

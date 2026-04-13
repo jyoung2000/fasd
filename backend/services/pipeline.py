@@ -2810,6 +2810,10 @@ async def _run_analysis_inner(job_id: str):
                     persistent_regions=_persistent_regions,
                     pacing_estimator=_pacing_estimator,
                     interpolated_timeline=_interpolated_timeline,
+                    # Fix 2: feed saliency regions into the segmenter
+                    # so the salient-fallback cascade has a non-face
+                    # signal to resolve low-confidence segments.
+                    frame_saliency=_saliency_regions if '_saliency_regions' in dir() else None,
                 )
                 if reframe_segments:
                     # Replace scenes with one scene per reframe segment

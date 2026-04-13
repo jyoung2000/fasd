@@ -272,13 +272,59 @@ def classify_content(
         if music_hits >= 2:
             scores["music_video"] = scores.get("music_video", 0) + 3.0
             signals["scene_desc_music_video"] = music_hits
+        # Fix 4: tighten the anime text-signal gate. The Verzuz panel
+        # got anime=3.0 with just 2 scene keyword hits and high avg
+        # faces, which three-way-tied podcast/vlog/anime at conf=0.26.
+        # Require BOTH a stronger scene-description signal (≥5 hits)
+        # AND a "few faces" signature (avg_faces < 1.5) before the
+        # text scores high. Otherwise give a small bump (+1.0) that
+        # can be overridden by geometry. Tracks which rule fired.
         if anime_hits >= 2:
-            scores["anime"] = scores.get("anime", 0) + 3.0
             signals["scene_desc_anime"] = anime_hits
+            _avg_faces_for_anime = signals.get("avg_faces", 0)
+            if anime_hits >= 5 and _avg_faces_for_anime < 1.5:
+                # Strong anime signal: large bump (+5) so it dominates
+                # geometry-driven scores. Exempt from the tiebreaker
+                # below so it's respected even against high vlog/
+                # narrative counts.
+                scores["anime"] = scores.get("anime", 0) + 5.0
+                signals["scene_desc_anime_strong"] = True
+            else:
+                # Weak text signal: small bump only. Prevents the
+                # three-way tie with podcast/vlog on panels where
+                # scene descriptions incidentally mention "animation"
+                # / "subtitles" / etc.
+                scores["anime"] = scores.get("anime", 0) + 1.0
+                signals["scene_desc_anime_weak"] = True
 
     # ── Pick winner ──
+    # Fix 4: geometry-wins-over-text tiebreaker.
+    # When scores are near-tied (top two within 1.0 AND both include a
+    # text-driven category like anime/music_video), defer to the
+    # geometry-based categories (podcast, vlog, narrative, gaming,
+    # sports) which rely on face slot / cut-rate / avg_faces signals.
+    # Text hits are noisy — 2 anime keyword matches out of 50 scenes
+    # shouldn't beat stable face-registry geometry.
     best_type = max(scores, key=scores.get)
     best_score = scores[best_type]
+    _TEXT_DRIVEN_TYPES = {"anime", "music_video"}
+    _GEOMETRY_DRIVEN_TYPES = {"podcast", "vlog", "narrative", "gaming", "sports"}
+    # Strong-anime detection (≥5 keyword hits + avg_faces<1.5) is
+    # trusted and exempt from the tiebreaker. Weak anime hits (the
+    # 2-keyword-hit noise that burned the Verzuz run) still go through.
+    _strong_anime = signals.get("scene_desc_anime_strong") is True
+    if best_type in _TEXT_DRIVEN_TYPES and not _strong_anime:
+        # Find the top geometry-driven score for comparison.
+        geom_contenders = [
+            (t, s) for t, s in scores.items()
+            if t in _GEOMETRY_DRIVEN_TYPES
+        ]
+        geom_contenders.sort(key=lambda x: -x[1])
+        if geom_contenders and (best_score - geom_contenders[0][1]) < 1.0:
+            best_type = geom_contenders[0][0]
+            best_score = geom_contenders[0][1]
+            signals["geometry_over_text_tiebreak"] = True
+
     total_score = sum(scores.values())
     confidence = best_score / total_score if total_score > 0 else 0.0
 
@@ -398,14 +444,23 @@ def classify_content(
             )
             dom_slot = max(face_registry.slots, key=lambda s: s.frame_count)
             dom_pct = dom_slot.frame_count / total_frames_seen
-            if avg_range < 15 and dom_pct < 0.6:
+            # Fix 4: loosen avg_range from 15 → 20 per the
+            # accuracy-fix spec. The Verzuz run had avg_slot_x_range
+            # ≈ 14.7 which passed the old gate, but the spec accepts
+            # up to 20 as a "seated panel" signature since on-stage
+            # characters can rock in-place. Still require dom_pct <
+            # 0.6 (no single slot dominates the frame).
+            if avg_range < 20 and dom_pct < 0.6:
                 is_multi_speaker_panel = True
                 signals["multi_speaker_panel"] = True
                 signals["panel_avg_slot_range"] = round(avg_range, 1)
                 signals["panel_dominant_pct"] = round(dom_pct, 2)
                 # Add a score bump for PODCAST so the primary classifier
-                # doesn't land on VLOG when the panel signal fires.
-                scores["podcast"] = scores.get("podcast", 0) + 2.0
+                # doesn't land on VLOG/ANIME when the panel signal fires.
+                # Use a larger bump (+4.0) than the old +2.0 so the
+                # geometry signal can outweigh text-driven anime hits
+                # on ambiguous scene descriptions.
+                scores["podcast"] = scores.get("podcast", 0) + 4.0
                 # Re-pick winner with the bump.
                 best_type = max(scores, key=scores.get)
                 best_score = scores[best_type]

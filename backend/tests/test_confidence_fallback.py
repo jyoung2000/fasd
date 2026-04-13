@@ -197,7 +197,16 @@ class TestCascadingFallback:
         assert strategy == "blur_fill"
 
     def test_very_low_always_wide_master(self):
-        fallback = get_fallback_strategy(0.15, "podcast")
+        # Accuracy-fix Fix 5 raised the wide_master confidence floor
+        # from 0.30 to 0.15 so transient detection jitter can't trigger
+        # letterbox. Confidence strictly below 0.15 (e.g. 0.10) still
+        # ends up at wide_master when no cascade candidate is provided.
+        # The old 0.15 → wide_master assertion was locking in the
+        # pre-fix behavior.
+        fallback = get_fallback_strategy(
+            0.10, "podcast",
+            candidate_x=None, candidate_slot=None,
+        )
         assert fallback is not None
         strategy, layout, _, _, _ = fallback
         assert strategy == "wide_master"

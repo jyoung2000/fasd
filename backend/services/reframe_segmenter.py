@@ -90,6 +90,7 @@ def build_reframe_segments(
     persistent_regions=None,
     pacing_estimator=None,
     interpolated_timeline=None,
+    frame_saliency: list = None,
 ) -> list[ReframeSegment]:
     """Build a segment-based reframe timeline.
 
@@ -159,6 +160,12 @@ def build_reframe_segments(
             speaker_to_slot=speaker_to_slot,
             source_width=source_width,
             source_height=source_height,
+            # Fix 2: frame_saliency feeds the salient-fallback cascade
+            # so low-confidence segments can land on a real subject
+            # (via saliency_peak / face_centroid / motion_proxy) instead
+            # of hardcoded_center.
+            frame_saliency=frame_saliency,
+            persistent_regions=persistent_regions,
         )
     except Exception as e:
         logger.warning("[%s] SubjectConfidenceEstimator init failed: %s", job_id, e)
@@ -412,37 +419,115 @@ def build_reframe_segments(
             )
             seg.confidence = conf
 
+            # Fix 5: per-frame robustness safeguard. Before committing
+            # a confidence-driven fallback, check whether a tracked
+            # face was actually inside the proposed crop for ≥40 %% of
+            # the segment's dense frames. If yes, the aggregated
+            # confidence dropped below the threshold because of
+            # transient occlusions / profile shots / detection jitter
+            # — not because the subject left the crop. Restore the
+            # candidate and skip the fallback.
+            from backend.services.subject_confidence import CONFIDENCE_HIGH as _CONF_HI
+            if conf < _CONF_HI and _confidence_estimator is not None:
+                try:
+                    pass_rate = _confidence_estimator.per_frame_in_crop_pass_rate(
+                        seg.start, seg.end, _sx_pct,
+                    )
+                    if pass_rate >= 0.40:
+                        seg.confidence = max(conf, _CONF_HI)
+                        last_confident_x = seg.subject_x
+                        last_confident_slot = seg.active_slot
+                        _log(
+                            "segment %.1f-%.1fs: per-frame safeguard rescued "
+                            "(pass_rate=%.0f%% ≥ 40%%), keeping candidate x=%d",
+                            seg.start, seg.end, pass_rate * 100, _sx_pct,
+                        )
+                        continue
+                except Exception as _pfe:
+                    logger.debug(
+                        "[%s] per-frame safeguard failed %.1f-%.1f: %s",
+                        job_id, seg.start, seg.end, _pfe,
+                    )
+
             if conf >= 0.70:
                 # High confidence — keep as-is
                 last_confident_x = seg.subject_x
                 last_confident_slot = seg.active_slot
                 continue
 
-            # Apply fallback ladder
+            # Apply fallback ladder.
+            #
+            # Fix 2+3: run the salient-fallback cascade BEFORE calling
+            # get_fallback_strategy so the strategy has a real candidate
+            # center to promote instead of defaulting to 50. The cascade
+            # picks the best non-letterbox tier for the content type
+            # (active_speaker_slot → prev_crop_continuity → saliency_peak
+            # → face_centroid → motion_proxy → prev_anywhere →
+            # hardcoded_center).
             try:
-                from backend.services.subject_confidence import get_fallback_strategy
-                _last_x_pct = int(round(last_confident_x / source_width * 100.0)) if last_confident_x is not None else None
+                from backend.services.subject_confidence import (
+                    get_fallback_strategy,
+                    resolve_fallback_center,
+                )
+                _last_x_pct = (
+                    int(round(last_confident_x / source_width * 100.0))
+                    if last_confident_x is not None else None
+                )
                 _cand_x_pct = int(round(seg.subject_x / source_width * 100.0))
+
+                # Build a "last_seg_like" object carrying the fields the
+                # resolver reads: end, subject_x (as 0-100 pct), subject_y
+                # (0-100 pct), confidence. We don't have a real prev
+                # ReframeSegment in scope for the very first iteration,
+                # so fall back to None there.
+                _last_seg_like = None
+                if last_confident_x is not None:
+                    class _LS:
+                        pass
+                    _last_seg_like = _LS()
+                    _last_seg_like.end = seg.start  # within the ≤2s gap window
+                    _last_seg_like.subject_x = _last_x_pct
+                    _last_seg_like.subject_y = 50
+                    _last_seg_like.confidence = 0.7  # last_confident_* was set at >= 0.70
+
+                fb_x_pct, fb_y_pct, fb_source = resolve_fallback_center(
+                    _confidence_estimator,
+                    ct,
+                    seg.start, seg.end,
+                    _last_seg_like,
+                    candidate_x=_cand_x_pct,
+                    candidate_y=50,
+                )
+
                 fallback = get_fallback_strategy(
                     conf, ct,
                     last_confident_x=_last_x_pct,
                     last_confident_slot=last_confident_slot,
-                    candidate_x=_cand_x_pct,
+                    candidate_x=fb_x_pct,
                     candidate_slot=seg.active_slot,
                 )
                 if fallback is not None:
-                    strategy, layout, fb_x_pct, active_slot, reason = fallback
+                    strategy, layout, chosen_x_pct, active_slot, reason = fallback
                     seg.strategy = strategy
                     seg.layout = layout
                     # Convert fallback subject_x from 0-100 back to pixel space
-                    seg.subject_x = float(fb_x_pct) / 100.0 * source_width
+                    seg.subject_x = float(chosen_x_pct) / 100.0 * source_width
                     seg.active_slot = active_slot
                     seg.reason = reason
-                    seg.subject_source = "last_known" if "inherit" in reason else "hardcoded_center"
+                    # Fix 2: record the cascade tier that produced the
+                    # center so logs tell us which fallback fired. No
+                    # more blind "hardcoded_center" on every bad segment.
+                    seg.subject_source = (
+                        fb_source if strategy != "wide_master" else "wide_master"
+                    )
                     seg.fallback_reason = conf_reason
                     fallback_count += 1
-                    _log("segment %.1f-%.1fs: confidence=%.2f, fallback=%s (reason=%s)",
-                         seg.start, seg.end, conf, strategy.upper(), conf_reason)
+                    _log(
+                        "segment %.1f-%.1fs: confidence=%.2f, fallback=%s "
+                        "(source=%s, reason=%s)",
+                        seg.start, seg.end, conf, strategy.upper(),
+                        seg.subject_source, conf_reason,
+                    )
             except Exception as e:
                 logger.warning("[%s] Fallback ladder failed for segment %.1f-%.1f: %s",
                                job_id, seg.start, seg.end, e)
@@ -673,6 +758,45 @@ def build_reframe_segments(
 
     if l1_count > 0:
         _log("L1 camera path solved for %d segments", l1_count)
+
+    # ── Fix 5: surrounding-mean center for wide_master segments ──
+    # Any segment still showing strategy=wide_master with subject_x
+    # exactly at source_width/2 is the hardcoded-center fallback from
+    # Stage 3. Replace with the mean subject_x of its nearest confident
+    # neighbors within ±5 s so panning continuity is preserved instead
+    # of yanking the crop to the middle of the frame.
+    try:
+        _center_px = source_width / 2.0
+        _surround_window = 5.0
+        _rewritten = 0
+        for i, seg in enumerate(raw_segments):
+            if seg.strategy != "wide_master":
+                continue
+            if abs(seg.subject_x - _center_px) > 1.0:
+                continue  # already has a custom center, leave alone
+            neigh_xs = []
+            seg_mid = (seg.start + seg.end) / 2.0
+            for j, nseg in enumerate(raw_segments):
+                if j == i or nseg.strategy == "wide_master":
+                    continue
+                n_mid = (nseg.start + nseg.end) / 2.0
+                if abs(n_mid - seg_mid) <= _surround_window:
+                    neigh_xs.append(nseg.subject_x)
+            if neigh_xs:
+                seg.subject_x = float(sum(neigh_xs)) / len(neigh_xs)
+                seg.subject_source = "wide_master_surround_mean"
+                _rewritten += 1
+        if _rewritten > 0:
+            _log(
+                "wide_master surround-mean: %d segments rewritten "
+                "from hardcoded center to neighbor mean (±%.0fs)",
+                _rewritten, _surround_window,
+            )
+    except Exception as _wmr:
+        logger.warning(
+            "[%s] wide_master surround-mean rewrite failed: %s",
+            job_id, _wmr,
+        )
 
     # ── Summary logging ──
     slot_counts = Counter()
