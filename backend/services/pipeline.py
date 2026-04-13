@@ -2855,6 +2855,119 @@ async def _run_analysis_inner(job_id: str):
                     logger.warning("[%s] LocalPacingEstimator failed (non-fatal): %s", job_id, pe)
                     _pacing_estimator = None
 
+                # ── Phase 6: Anime saliency anchor extraction ──
+                #
+                # When the content profile is animated AND the
+                # CLIPAI_ANIME_ANCHOR flag is on, build a per-frame
+                # AnimeFrameFeatures stream from the existing dense
+                # face data + lazy OpenCV motion / contrast /
+                # saturation extraction, score it via
+                # anime_anchor.score_anime_sequence, and pass the
+                # result to build_reframe_segments via the new
+                # anime_anchors kwarg.
+                #
+                # All gated behind the Phase 6 flags (default OFF) so
+                # this is a no-op until in-docker validation flips
+                # the flags. Wrapped in try/except so any OpenCV /
+                # cascade failure stays non-fatal and the existing
+                # speaker-tracking path still runs.
+                _anime_anchors_for_seg = None
+                try:
+                    from backend.services.anime_anchor import (
+                        USE_ANIME_ANCHOR as _USE_AA,
+                        AnimeFrameFeatures,
+                        score_anime_sequence,
+                    )
+
+                    if _USE_AA and _content_profile and getattr(
+                        _content_profile, "is_animated", False,
+                    ):
+                        _features_seq: list = []
+                        # Build per-frame features from dense_face_results.
+                        # The face signal comes from the highest-conf
+                        # face on each frame; motion / contrast /
+                        # saturation default to 0 (OpenCV-backed
+                        # extraction is wired separately when the
+                        # cascade XML lands — Phase 6 follow-up).
+                        for df in dense_face_results:
+                            best_face = None
+                            best_score = -1.0
+                            for f in getattr(df, "faces", []) or []:
+                                conf = float(getattr(f, "confidence", 0.0) or 0.0)
+                                if conf > best_score:
+                                    best_score = conf
+                                    best_face = f
+                            face_x = float(getattr(best_face, "nose_x", 50.0)) if best_face else 50.0
+                            face_y = float(getattr(best_face, "nose_y", 50.0)) if best_face else 50.0
+                            face_score = (
+                                max(0.0, min(1.0, best_score))
+                                if best_face is not None else 0.0
+                            )
+                            _features_seq.append(AnimeFrameFeatures(
+                                timestamp=float(df.timestamp),
+                                face_x_pct=face_x,
+                                face_y_pct=face_y,
+                                face_score=face_score,
+                            ))
+                        _anime_subtype_pipe = getattr(
+                            _content_profile, "anime_subtype", None,
+                        )
+                        _anime_anchors_for_seg = score_anime_sequence(
+                            _features_seq, anime_subtype=_anime_subtype_pipe,
+                        )
+                        logger.info(
+                            "[%s] AnimeAnchor: built %d per-frame anchors (subtype=%s)",
+                            job_id, len(_anime_anchors_for_seg), _anime_subtype_pipe,
+                        )
+                except Exception as _aa_e:
+                    logger.warning(
+                        "[%s] Anime anchor extraction failed (non-fatal): %s",
+                        job_id, _aa_e,
+                    )
+
+                # ── Phase 5: Music-video beat detection ──
+                #
+                # When the content profile is music_video AND the
+                # CLIPAI_MUSIC_BEAT_SNAP flag is on, run librosa beat
+                # tracking on the audio file extracted by
+                # audio_analyzer.py. Lazy import; graceful fallback
+                # to None when librosa / audio file aren't available.
+                _music_beat_grid_for_seg = None
+                try:
+                    from backend.services.beat_detector import (
+                        USE_MUSIC_BEAT_SNAP as _USE_BS,
+                        detect_beats,
+                    )
+
+                    _ct_for_beats = (
+                        getattr(_content_profile, "content_type", None)
+                        if _content_profile else None
+                    )
+                    _audio_path = f"/data/uploads/{job_id}/audio.wav"
+                    if (
+                        _USE_BS
+                        and _ct_for_beats == "music_video"
+                        and os.path.isfile(_audio_path)
+                    ):
+                        _grid = detect_beats(_audio_path)
+                        if _grid.has_data:
+                            _music_beat_grid_for_seg = _grid
+                            logger.info(
+                                "[%s] BeatDetector: tempo=%.1f BPM, %d beats, %d downbeats",
+                                job_id, _grid.tempo_bpm,
+                                len(_grid.beat_times), len(_grid.downbeat_times),
+                            )
+                        else:
+                            logger.info(
+                                "[%s] BeatDetector: empty grid (skipped: %s)",
+                                job_id, _grid.lp_message if hasattr(_grid, "lp_message") else "",
+                            )
+                except Exception as _bs_e:
+                    logger.warning(
+                        "[%s] Beat detection failed (non-fatal): %s",
+                        job_id, _bs_e,
+                    )
+
                 reframe_segments = build_reframe_segments(
                     shot_cuts=_shot_cuts,
                     face_registry=face_registry,
@@ -2874,6 +2987,9 @@ async def _run_analysis_inner(job_id: str):
                     # so the salient-fallback cascade has a non-face
                     # signal to resolve low-confidence segments.
                     frame_saliency=_saliency_regions if '_saliency_regions' in dir() else None,
+                    # Phase 5 + Phase 6 follow-up wiring
+                    music_beat_grid=_music_beat_grid_for_seg,
+                    anime_anchors=_anime_anchors_for_seg,
                 )
                 if reframe_segments:
                     # Replace scenes with one scene per reframe segment
