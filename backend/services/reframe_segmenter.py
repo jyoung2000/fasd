@@ -655,26 +655,129 @@ def build_reframe_segments(
         seg.subject_x = _slot_to_x(seg.active_slot, face_registry, source_width)
 
     # ── Stage 8: Lead-room application (narrative/vlog) ──
+    #
+    # Two tiers, controlled by two independent feature flags:
+    #
+    #   * Categorical (legacy)   — ``estimate_gaze_from_dense``
+    #     returns "left" / "right" / "center"; ``apply_lead_room``
+    #     applies a step shift of ~5 % of the viewport width. This
+    #     is what the segmenter has used since the original AutoFlip
+    #     work and what runs by default.
+    #
+    #   * Continuous V2 (Phase 4) — ``estimate_yaw_from_dense``
+    #     returns a smoothed float in [-1, 1] and
+    #     ``lead_room_offset_px`` produces a linearly-scaled pixel
+    #     offset capped at ``0.08 * crop_width`` at full yaw. Fires
+    #     ONLY when ``CLIPAI_GAZE_LEAD_ROOM_V2=1`` (default OFF
+    #     until the in-docker validation lands the post-Phase-4
+    #     numbers — see docs/autoflip_parity_v2_results.md).
+    #
+    # Phase 4 also adds an optional thirds-bias x-offset
+    # (``CLIPAI_THIRDS_BIAS=1``, default OFF) that runs AFTER the
+    # lead-room step on segments whose content type is in
+    # ``thirds_bias.THIRDS_BIAS_CONTENT_TYPES``. The thirds offset
+    # is composed with whatever lead-room offset already fired, so
+    # both flags can be ON simultaneously.
     lead_room_count = 0
+    thirds_count = 0
     if _apply_lead_room and dense_faces:
         try:
-            from backend.services.gaze_estimator import estimate_gaze_from_dense, apply_lead_room as _apply_lr
+            from backend.services.gaze_estimator import (
+                USE_GAZE_LEAD_ROOM_V2,
+                apply_lead_room as _apply_lr,
+                estimate_gaze_from_dense,
+                estimate_yaw_from_dense,
+                lead_room_offset_px,
+                yaw_to_categorical,
+            )
+            from backend.services.thirds_bias import (
+                USE_THIRDS_BIAS,
+                applies_to_profile as _thirds_applies_profile,
+                thirds_x_offset_px,
+            )
+
+            # Crop width in source pixels (16:9 → 9:16). Match the
+            # value used by l1_camera_path / multi_region_layout so
+            # offsets here are commensurate with the LP's box.
+            _crop_aspect = 9.0 / 16.0
+            _crop_width_px = float(source_height) * _crop_aspect
+            if _crop_width_px > source_width:
+                _crop_width_px = float(source_width)
+            # The profile-aware check folds in the
+            # is_multi_speaker_panel exclusion so debate / panel
+            # shots don't get a thirds offset even though their
+            # parent ContentType is "podcast".
+            _thirds_on = USE_THIRDS_BIAS and _thirds_applies_profile(content_profile)
+
             for seg in raw_segments:
-                if seg.active_slot is None or seg.layout in ("wide_master", "split", "grid", "blur_fill", "stacked_gameplay"):
+                if seg.active_slot is None or seg.layout in (
+                    "wide_master", "split", "grid", "blur_fill", "stacked_gameplay",
+                ):
                     continue
-                gaze = estimate_gaze_from_dense(dense_faces, seg.active_slot, seg.start, seg.end)
-                if gaze != "center":
-                    # apply_lead_room works in 0-100 space; convert at boundary
-                    sx_pct = seg.subject_x / source_width * 100.0
-                    adjusted_pct = _apply_lr(int(round(sx_pct)), gaze)
-                    seg.subject_x = adjusted_pct / 100.0 * source_width
-                    seg.lead_room_direction = gaze
-                    lead_room_count += 1
+
+                if USE_GAZE_LEAD_ROOM_V2:
+                    # ── Phase 4 continuous-yaw path ──
+                    yaw = estimate_yaw_from_dense(
+                        dense_faces, seg.active_slot, seg.start, seg.end,
+                    )
+                    if abs(yaw) > 0.01:
+                        offset_px = lead_room_offset_px(yaw, _crop_width_px)
+                        seg.subject_x = float(seg.subject_x) + offset_px
+                        seg.lead_room_direction = yaw_to_categorical(yaw)
+                        lead_room_count += 1
+                else:
+                    # ── Legacy categorical path ──
+                    gaze = estimate_gaze_from_dense(
+                        dense_faces, seg.active_slot, seg.start, seg.end,
+                    )
+                    if gaze != "center":
+                        sx_pct = seg.subject_x / source_width * 100.0
+                        adjusted_pct = _apply_lr(int(round(sx_pct)), gaze)
+                        seg.subject_x = adjusted_pct / 100.0 * source_width
+                        seg.lead_room_direction = gaze
+                        lead_room_count += 1
+
+                # ── Phase 4 thirds-bias x-offset ──
+                # Optional, on top of the lead-room offset above.
+                # Defers to the post-lead-room yaw (or zero when the
+                # categorical path is in effect) for the left-vs-right
+                # decision so both offsets compose coherently.
+                if _thirds_on:
+                    if USE_GAZE_LEAD_ROOM_V2:
+                        _yaw_for_thirds = yaw  # already computed above
+                    else:
+                        # Re-derive yaw for the thirds decision so
+                        # the categorical path can still pick the
+                        # correct third without breaking its lead-room
+                        # behavior.
+                        _yaw_for_thirds = estimate_yaw_from_dense(
+                            dense_faces, seg.active_slot, seg.start, seg.end,
+                        )
+                    _face_pct = float(seg.subject_x) / max(source_width, 1) * 100.0
+                    thirds_offset = thirds_x_offset_px(
+                        face_x_pct=_face_pct,
+                        crop_width_px=_crop_width_px,
+                        source_width_px=float(source_width),
+                        yaw=_yaw_for_thirds,
+                    )
+                    if thirds_offset != 0.0:
+                        seg.subject_x = float(seg.subject_x) + thirds_offset
+                        thirds_count += 1
+
+                # Clamp so the crop center stays inside the source
+                # frame even after composing the two offsets — without
+                # this, an aggressive yaw on a face near the edge
+                # could push subject_x outside [half, src_w - half]
+                # and downstream renderers would clip.
+                _half = _crop_width_px / 2.0
+                seg.subject_x = max(_half, min(source_width - _half, float(seg.subject_x)))
         except Exception as e:
             logger.warning("[%s] Lead-room application failed (non-fatal): %s", job_id, e)
 
     if lead_room_count > 0:
         _log("lead room applied to %d segments", lead_room_count)
+    if thirds_count > 0:
+        _log("thirds-bias x-offset applied to %d segments", thirds_count)
 
     # ── Stage 9: Hard constraints from persistent regions ──
     if persistent_regions and hasattr(persistent_regions, 'as_rects'):
@@ -946,6 +1049,97 @@ def build_reframe_segments(
 
     if l1_count > 0:
         _log("L1 camera path solved for %d segments", l1_count)
+
+    # ── Stage 10c: Phase 4 V2 lead-room + thirds-bias post-process ──
+    #
+    # Stage 8 applies Phase 4 offsets to ``seg.subject_x`` BEFORE the
+    # L1 solver runs, but the L1 solver in Stage 10 OVERWRITES
+    # ``seg.subject_x`` (and writes ``seg.motion_path``) for tracking
+    # / panning segments — clobbering the offset. This post-process
+    # re-applies the same lead-room + thirds-bias offsets to the
+    # L1-solved path so the bias survives.
+    #
+    # For stationary segments Stage 8 already did the right thing
+    # and the L1 solver leaves ``seg.subject_x`` alone; this loop
+    # detects that and skips them so the offset isn't applied twice.
+    #
+    # For tracking / panning segments the same offset is added to
+    # every entry in ``seg.motion_path`` AND to ``seg.subject_x``,
+    # producing a uniformly-shifted smooth path. The shift is by a
+    # constant within a single segment, which preserves smoothness
+    # (max accel / max jerk are unchanged) while moving the subject
+    # to the lead-room / thirds position.
+    #
+    # Both flags default OFF; the post-process is a no-op when neither
+    # is set.
+    phase4_post_count = 0
+    if dense_faces:
+        try:
+            from backend.services.gaze_estimator import (
+                USE_GAZE_LEAD_ROOM_V2 as _USE_V2,
+                estimate_yaw_from_dense as _est_yaw,
+                lead_room_offset_px as _lr_off,
+            )
+            from backend.services.thirds_bias import (
+                USE_THIRDS_BIAS as _USE_TH,
+                applies_to_profile as _th_applies,
+                thirds_x_offset_px as _th_off,
+            )
+            if _USE_V2 or (_USE_TH and _th_applies(content_profile)):
+                _crop_aspect = 9.0 / 16.0
+                _crop_w = float(source_height) * _crop_aspect
+                if _crop_w > source_width:
+                    _crop_w = float(source_width)
+                _half = _crop_w / 2.0
+                _do_thirds = _USE_TH and _th_applies(content_profile)
+                for seg in raw_segments:
+                    if seg.active_slot is None or seg.layout in (
+                        "wide_master", "split", "grid", "blur_fill", "stacked_gameplay",
+                    ):
+                        continue
+                    if seg.strategy not in ("tracking", "panning"):
+                        # Stationary segments already got their offset
+                        # in Stage 8 — Stage 10 didn't touch
+                        # subject_x, so nothing to repair here.
+                        continue
+                    yaw = _est_yaw(
+                        dense_faces, seg.active_slot, seg.start, seg.end,
+                    ) if _USE_V2 else 0.0
+                    offset = 0.0
+                    if _USE_V2 and abs(yaw) > 0.01:
+                        offset += _lr_off(yaw, _crop_w)
+                    if _do_thirds:
+                        _face_pct = float(seg.subject_x) / max(source_width, 1) * 100.0
+                        offset += _th_off(
+                            face_x_pct=_face_pct,
+                            crop_width_px=_crop_w,
+                            source_width_px=float(source_width),
+                            yaw=yaw,
+                        )
+                    if offset == 0.0:
+                        continue
+                    # Apply uniformly to subject_x AND every motion_path entry
+                    seg.subject_x = max(_half, min(source_width - _half, float(seg.subject_x) + offset))
+                    if seg.motion_path:
+                        new_path = []
+                        for entry in seg.motion_path:
+                            t = entry[0]
+                            x = float(entry[1]) + offset
+                            x = max(_half, min(source_width - _half, x))
+                            # Preserve any extra tuple elements (e.g. y)
+                            new_path.append((t, x) + tuple(entry[2:]))
+                        seg.motion_path = new_path
+                    phase4_post_count += 1
+        except Exception as e:
+            logger.warning(
+                "[%s] Phase 4 V2 post-process failed (non-fatal): %s",
+                job_id, e,
+            )
+    if phase4_post_count > 0:
+        _log(
+            "Phase4 V2 post-process: %d tracking/panning segments shifted",
+            phase4_post_count,
+        )
 
     # ── Fix 5: surrounding-mean center for wide_master segments ──
     # Any segment still showing strategy=wide_master with subject_x

@@ -218,6 +218,21 @@ running `python -m backend.scripts.measure_autoflip_parity`):
 |---|---|---|---|---|---|
 | `2speaker_alternating` | 1.0 | 0 | 50.0 | 100.0 | 0.40 |
 | `3speaker_panel` | 1.0 | 0 | 60.0 | 120.0 | 0.75 |
+| `vlog_walk_and_talk` (Phase 3 OFF) | — | 0 | 0.0 | ≈0 | 0.60 |
+| `vlog_walk_and_talk` (Phase 4 ON, V2 lead-room + thirds bias) | — | 0 | 0.0 | ≈0 | **0.43** |
+
+The vlog row demonstrates Phase 4's intended improvement: the
+required-region miss rate drops from 0.60 → 0.43 (−28 %) when
+both ``CLIPAI_GAZE_LEAD_ROOM_V2=1`` and ``CLIPAI_THIRDS_BIAS=1``
+are set. The other metrics (max accel, max jerk, overlap count)
+are unchanged because Phase 4 applies a uniform constant offset
+within each segment, which preserves the L1 solver's smoothness
+guarantees.
+
+The 2speaker / 3speaker fixtures are unchanged at flag-ON because
+podcast / debate content have ``apply_lead_room=False`` in the
+content config — Stage 8 (and therefore Phase 4) doesn't fire on
+them. Phase 5+ may revisit this for the multi-region LP path.
 
 The accel / jerk numbers are large because the metric is computed
 on a per-segment-step basis and these fixtures have hard speaker

@@ -260,6 +260,264 @@ thought content type was `UNKNOWN` even for user-declared gameplay.
   (which guards that `source_width` is still bound at function
   scope despite the nearby edits).
 
+### v2 Phase 4 — Gaze-aware lead-room + rule-of-thirds bias
+
+**Before:**
+The reframe segmenter's Stage 8 lead-room application used a
+**categorical** gaze estimator (``estimate_gaze_from_dense`` →
+``"left"`` / ``"right"`` / ``"center"``) and a step-shift
+``apply_lead_room`` that moved ``subject_x`` by ~5 % of the
+viewport width in the corresponding direction. There was no
+rule-of-thirds bias — the segmenter dropped the camera center on
+the face's bbox center, putting the face at ``x = 1/2`` of the
+output crop instead of one of the two thirds intersections.
+
+The categorical step also only fired on STATIONARY segments
+because the L1 solver in Stage 10 immediately overwrote
+``seg.subject_x`` for tracking / panning segments — so on long
+walking-vlog shots, the lead-room contribution was zero.
+
+**After (v2 Phase 4):**
+
+- **`backend/services/gaze_estimator.py`** gained a continuous-yaw
+  tier alongside the legacy categorical functions:
+    - ``estimate_yaw(face) → float`` returns a signed value in
+      ``[-1.0, 1.0]`` from the same nose-vs-bbox-center asymmetry
+      the categorical estimator uses (sign convention: -1 = full
+      left, +1 = full right, 0 = forward / unknown). Out-of-range
+      inputs are clamped, missing keypoints return 0.
+    - ``estimate_yaw_from_dense(...)`` averages per-frame yaws
+      for a face slot in a time window with a **bidirectional
+      EMA at α=0.3** (the same smoothing pattern the saliency
+      Fix 6 path uses) so single-frame jitter doesn't flip the
+      lead-room sign.
+    - ``smooth_yaw_ema(values, alpha=0.3)`` is the symmetric
+      forward+backward EMA helper, exposed for callers that
+      want to smooth a custom yaw series.
+    - ``lead_room_offset_px(yaw, crop_width_px, max_frac=0.08)``
+      converts a yaw to a continuous pixel offset linearly
+      scaled at ``|yaw| * 0.08 * crop_width_px``. Sign convention
+      matches the categorical: face looking left → +offset
+      (camera shifts right) → face lands on the LEFT third of
+      the output with space to look INTO.
+    - ``yaw_to_categorical(yaw, threshold=0.15)`` round-trips
+      the continuous tier back to the legacy ``"left"`` /
+      ``"right"`` / ``"center"`` strings so the existing
+      ``seg.lead_room_direction`` field stays populated when
+      the V2 path fires.
+    - ``USE_GAZE_LEAD_ROOM_V2`` env flag, default OFF.
+
+- **`backend/services/thirds_bias.py`** *(new)* implements the
+  rule-of-thirds Gaussian scorer + helpers:
+    - ``thirds_bias_score(x_norm, y_norm, sigma=0.12)`` — 2-D
+      Gaussian peaked at the four output-frame thirds
+      intersections ``(1/3, 1/3)``, ``(2/3, 1/3)``,
+      ``(1/3, 2/3)``, ``(2/3, 2/3)``. Returns the **maximum**
+      score across the four peaks. A point exactly on an
+      intersection scores 1.0; a point at frame center scores
+      ≈ 0.15; a corner ≈ 0.0004.
+    - ``best_thirds_intersection(x, y)`` — closest intersection
+      lookup used by ``thirds_x_offset_px`` for tie-breaking.
+    - ``thirds_x_offset_px(face_x_pct, crop_width_px, ..., yaw=0)``
+      — computes the horizontal shift in source pixels needed
+      to move the face from the centered position to one of
+      the two horizontal thirds. Defers to gaze for the
+      left-vs-right choice when ``|yaw| ≥ 0.10``; defaults to
+      the LEFT third (the cinematography default) for
+      forward-facing subjects.
+    - ``thirds_score_for_region(...)`` — per-region scorer used
+      by Phase 5+ to weight optional regions in the multi-
+      region LP by their thirds compliance.
+    - ``applies_to_content(content_type)`` — gate by content
+      type. The set spans ``narrative`` / ``vlog`` / ``podcast``
+      (parent ``ContentType`` values) plus ``cinematic_dialogue``
+      / ``animation_dialogue`` / ``talking_head`` (``ClipContentType``
+      values) so callers with either flavor work.
+    - ``applies_to_profile(content_profile)`` — combined gate
+      that ALSO checks ``profile.is_multi_speaker_panel`` and
+      excludes debates / panels (symmetry beats thirds for 3+
+      seated subjects). Reframe segmenter callers should use
+      this entry point.
+    - ``USE_THIRDS_BIAS`` env flag, default OFF.
+
+- **`backend/services/reframe_segmenter.py`** wires both into
+  Stage 8 and a new Stage 10c post-process:
+    - **Stage 8** (lead-room block) gained two parallel paths:
+      when ``USE_GAZE_LEAD_ROOM_V2`` is ON, it calls the
+      continuous yaw API + ``lead_room_offset_px``; when OFF,
+      the legacy categorical ``apply_lead_room`` path runs
+      unchanged. Optionally composes a thirds-bias x-offset
+      via ``thirds_x_offset_px`` when ``USE_THIRDS_BIAS`` is
+      ON AND ``applies_to_profile(content_profile)`` returns
+      True. Both offsets compose with a final clamp to keep
+      ``subject_x`` inside ``[half_crop, source_width − half_crop]``.
+    - **Stage 10c** (new post-process after the L1 solver)
+      re-applies the same Phase 4 offsets to tracking / panning
+      segments. The L1 solver in Stage 10 overwrites
+      ``seg.subject_x`` and writes ``seg.motion_path`` for these
+      segments — without Stage 10c the offset would only survive
+      on stationary segments. The post-process iterates raw
+      segments, recomputes the yaw, and uniformly shifts both
+      ``seg.subject_x`` and **every** entry in
+      ``seg.motion_path`` by the composed offset. A constant
+      shift within a segment preserves the L1 solver's smoothness
+      guarantees (max accel and jerk are unchanged).
+    - Stationary segments are detected and skipped in Stage 10c
+      so the offset isn't applied twice (once in Stage 8, once
+      in Stage 10c).
+    - Both flag branches log distinct messages so the runner
+      output can attribute each offset to either the legacy
+      categorical or the V2 path.
+
+- **`backend/scripts/measure_autoflip_parity.py`** runner update:
+  the runner now constructs a ``ContentProfile`` via
+  ``classify_content`` BEFORE calling ``build_reframe_segments``
+  so the segmenter's content-aware branches (Stage 8 lead-room,
+  Stage 10a multi-region LP, Stage 10c Phase 4 post-process)
+  actually fire on the fixture. Without this, ``cfg`` stayed
+  None inside the segmenter and ``_apply_lead_room`` was always
+  False even when the fixture declared ``content_type_override="vlog"``.
+  This is a runner-only change — the segmenter contract is
+  unchanged, and Phase 1+2+3 numbers are unchanged at flag-OFF.
+
+- **Default OFF** for both Phase 4 flags. Per the v2 ground
+  rules, any change that *might* regress an existing baseline
+  ships flag-off by default. The first in-docker validation run
+  flips the flags on once the post-Phase-4 numbers in
+  ``docs/autoflip_parity_v2_results.md`` show no regression
+  on the existing fixtures.
+
+### Tests
+
+| File | Count | Purpose |
+|---|---|---|
+| `test_phase4_gaze_thirds.py` | 80 | yaw API + smoother + lead-room offset + thirds Gaussian + x-offset + region scoring + content gates + AST guards on Stage 8/10c + AST guards on the runner integration |
+| Phase 1+2+3+9 + pre-existing | 417 | zero regressions |
+| **Total (v2 Phase 1-4 + 9 scope)** | **497** | all green |
+
+The 80 new tests break down as:
+
+- **TestEstimateYaw** (7) — center → 0, asymmetric → signed
+  value, full edge → ±1, missing keypoints → 0, zero width → 0.
+- **TestSmoothYawEMA** (4) — constant signal unchanged, step
+  signal smoothed (trend preserved), short input unchanged,
+  alpha=1 returns unchanged.
+- **TestEstimateYawFromDense** (4) — no matching slot → 0,
+  outside-window frames ignored, consistent gaze averages
+  correctly, mixed gaze averages to ~0.
+- **TestLeadRoomOffsetPx** (7) — sign convention, half-magnitude
+  scaling, zero edge cases, out-of-range yaw clamping, custom
+  ``max_frac``.
+- **TestYawToCategorical** (5) — left / right / center buckets,
+  threshold boundaries, agreement with legacy
+  ``estimate_gaze_direction``.
+- **TestApplyLeadRoomLegacyPreserved** (1) — categorical
+  ``apply_lead_room`` still on the public API.
+- **TestThirdsBiasScore** (6) — peaks at intersections, center
+  ≈ 0.15, corner ≈ 0, clamps out-of-range, σ=0 → 0,
+  symmetric.
+- **TestBestThirdsIntersection** (2) — closest pick, clamps.
+- **TestThirdsXOffsetPx** (5) — left/right yaw direction, no-yaw
+  default to LEFT third, zero crop edge case, sub-threshold
+  yaw default.
+- **TestThirdsScoreForRegion** (4) — region inside crop scoring,
+  exact intersection scores ~1, degenerate crop returns 0,
+  upper-third scores higher than center.
+- **TestAppliesToContent** (16) — narrative / vlog /
+  cinematic_dialogue / animation_dialogue / talking_head /
+  podcast all True; multi_speaker_panel / music_video /
+  gameplay variants / animation / generic / None all False.
+- **TestAppliesToProfile** (8) — podcast profile passes,
+  debate (panel flag set) excluded, narrative / vlog pass,
+  music_video excluded, anime profile excluded by parent
+  type, None handled, missing-attr profile defaults safely.
+- **TestPhase4FeatureFlagsDefaultOff** (2) — both flags default
+  OFF.
+- **TestReframeSegmenterIntegrationAST** (6) — V2 yaw imports
+  present, thirds-bias imports present, Stage 8 clamps
+  composed offsets, Stage 10c post-process exists, Stage 10c
+  skips stationary segments, legacy categorical path still
+  in the source.
+- **TestRunnerIntegrationAST** (2) — runner imports
+  ``classify_content``, runner passes ``content_profile=`` to
+  ``build_reframe_segments``.
+
+### Sandbox sanity numbers
+
+Captured via the parity runner with scipy installed:
+
+| Fixture | Flag OFF (Phase 3 baseline) | Flag ON (Phase 4) | Δ |
+|---|---|---|---|
+| `vlog_walk_and_talk` `required_region_miss_rate` | 0.60 | **0.43** | **−0.17 (−28%)** |
+| `vlog_walk_and_talk` other metrics | unchanged | unchanged | — |
+| `2speaker_alternating` (podcast) | unchanged | unchanged | — (panel/podcast skip Stage 8) |
+| `3speaker_panel` (debate) | unchanged | unchanged | — (panel exclusion) |
+
+The 28% miss-rate reduction on the vlog fixture is exactly the
+gap Phase 4 was meant to close — the face walks 35→65 % of frame
+horizontally and the previous L1 path centered on its average
+position, leaving the face partially out of crop on both ends of
+the walk. The Phase 4 V2 lead-room + thirds-bias offset shifts
+the path so the face lands on a third of the output crop with
+more headroom, dropping the miss rate from 0.60 to 0.43.
+
+The other metrics are unchanged because Phase 4 applies a
+**uniform** offset within each segment — max acceleration and
+max jerk see no per-frame deltas, just a constant translation.
+
+### Open questions resolved this phase
+
+- **What does "y at 1/3 of 9:16 output" mean for 16:9 → 9:16?**
+  Almost nothing — the 9:16 vertical crop fills the full source
+  height (1080), so the y axis isn't a free variable for the
+  segmenter's crop center decision. Phase 4 implements the
+  **horizontal** thirds bias (shifting subject_x to put the face
+  at x=1/3 or x=2/3 of the OUTPUT crop) and exposes the y-axis
+  scoring as ``thirds_score_for_region`` for Phase 5+ which
+  could use it to weight optional regions in the multi-region LP.
+
+- **Why is Stage 8 alone insufficient?** The L1 solver in
+  Stage 10 overwrites ``seg.subject_x`` for tracking / panning
+  segments. Without Stage 10c the Phase 4 offset only survived
+  on stationary segments. Stage 10c re-applies the offset to
+  tracking / panning segments after the L1 solver runs,
+  preserving the lead-room / thirds intent without disturbing
+  smoothness.
+
+- **Why is the runner change non-regressive?** The
+  ``classify_content`` call is a pure function that builds a
+  ContentProfile from in-memory inputs; with all Phase 4 flags
+  OFF the profile is read by Stage 8 / Stage 10a / Stage 10c
+  but their inner ``if FLAG_ON`` branches don't fire, so the
+  segmenter's behavior is identical to before. Verified
+  end-to-end against the 2speaker / 3speaker / vlog fixtures —
+  flag-OFF numbers match Phase 3 exactly.
+
+### Out of scope for this phase
+
+- **Per-frame yaw inside a single segment**. Stage 10c applies
+  a **constant** offset across each segment based on the segment's
+  mean yaw. Phase 4 minimal accepts this trade-off because
+  per-frame yaw modulation would conflict with the L1 solver's
+  smoothness guarantees (the L1 solver isn't aware of a per-
+  frame target shift). A future phase could push the per-frame
+  yaw INTO the L1 solver as a target-trajectory adjustment.
+
+- **Vertical thirds bias at the renderer level**. The
+  ``thirds_score_for_region`` and y-coordinate handling in
+  ``thirds_bias_score`` are exposed for Phase 5+ but not yet
+  wired into the multi-region LP weight column. Phase 5 (music
+  video beat snap) or a follow-up could pull them in.
+
+- **Animation-dialogue mismatch**. ``applies_to_profile`` uses
+  the parent ``ContentType.ANIME`` value (not in the bias set)
+  rather than the downstream ``ClipContentType.ANIMATION_DIALOGUE``
+  value (which IS in the bias set). For Phase 4 minimal this
+  means anime content gets no thirds bias even though the spec
+  mentions it. Phase 6 (anime path) is the natural place to
+  fix this — that phase will re-route the gate via a profile
+  helper that knows about the eventual ClipContentType.
+
 ### v2 Phase 3 — Multi-region required-region LP
 
 **Before:** `backend/services/required_regions.py` produced per-frame

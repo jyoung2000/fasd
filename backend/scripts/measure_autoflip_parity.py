@@ -77,9 +77,17 @@ def _run_segmenter(spec: FixtureSpec) -> list:
     without numpy. The fixture's ``content_type_override`` /
     ``anime_subtype`` / ``music_subtype`` / ``game_type`` flow through
     the same metadata-injection contract that ``pipeline.py`` uses for
-    real jobs; the test bench mirrors that contract exactly so the
-    measured numbers are directly comparable to production.
+    real jobs:
+
+      1. Build a ``content_profile`` via ``classify_content`` with the
+         fixture metadata as a fake ffprobe dict.
+      2. Pass the profile to ``build_reframe_segments`` via the
+         ``content_profile`` kwarg.
+
+    This mirrors what ``pipeline._run_analysis_inner`` does so the
+    runner numbers are directly comparable to production output.
     """
+    from backend.services.content_classifier import classify_content
     from backend.services.reframe_segmenter import build_reframe_segments
 
     kwargs = spec.build()
@@ -93,15 +101,25 @@ def _run_segmenter(spec: FixtureSpec) -> list:
     if spec.game_type:
         metadata["game_type"] = spec.game_type
 
-    # ``build_reframe_segments`` accepts a ``metadata`` kwarg only
-    # when the caller wants to forward UI overrides. Older versions
-    # didn't — in that case classify_content reads the override from
-    # the global content_profile path. We try-fall here so the runner
-    # works against both shapes without an explicit version check.
+    # Build a content profile so the segmenter's content-aware
+    # branches (Stage 8 lead-room, Stage 10c Phase 4 post-process,
+    # Stage 10a multi-region LP, etc.) actually fire on the fixture.
+    content_profile = None
     try:
-        return build_reframe_segments(metadata=metadata, **kwargs)
-    except TypeError:
-        return build_reframe_segments(**kwargs)
+        content_profile = classify_content(
+            shot_cuts=kwargs.get("shot_cuts", []),
+            face_registry=kwargs.get("face_registry"),
+            dense_faces=kwargs.get("dense_faces", []),
+            scenes=[],  # fixtures don't expose a scenes list
+            video_duration=kwargs.get("video_duration", 0.0),
+            metadata=metadata,
+        )
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning(
+            "classify_content failed (continuing without profile): %s", e
+        )
+
+    return build_reframe_segments(content_profile=content_profile, **kwargs)
 
 
 # ─────────────── Result extraction ────────────────────────────
