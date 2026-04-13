@@ -93,6 +93,7 @@ def build_reframe_segments(
     frame_saliency: list = None,
     music_beat_grid=None,
     anime_anchors: list = None,
+    gameplay_motion_centroids: list = None,
 ) -> list[ReframeSegment]:
     """Build a segment-based reframe timeline.
 
@@ -725,6 +726,129 @@ def build_reframe_segments(
         )
     if anime_anchor_count > 0:
         _log("AnimeAnchor: %d segments overridden by anime saliency", anime_anchor_count)
+
+    # ── Stage 7c: Gameplay subject tracker override (Phase 7) ──
+    #
+    # Behind ``CLIPAI_GAMEPLAY_TRACKER=1`` (default OFF). When the
+    # content profile has a ``gameplay_subtype`` (set by Phase 2's
+    # normalizer when the user picks a gameplay variant) AND the
+    # caller passed a list of pre-computed
+    # ``GameplayMotionCentroid`` objects via the new
+    # ``gameplay_motion_centroids`` kwarg, this sub-block walks
+    # each segment and replaces ``seg.subject_x`` / ``seg.subject_y``
+    # with the gameplay-tracker output.
+    #
+    # The tracker uses the per-game / per-genre ``action_center_pct``
+    # from ``game_layouts.GAME_HUD_LAYOUTS`` (Phase 2) as the
+    # fallback when motion is weak. So for a TPS clip with no
+    # motion data the camera lands at (50, 45) — character offset
+    # — instead of the legacy hard-coded (50, 50). For racing,
+    # the fallback is (50, 65) — car in lower third.
+    #
+    # When motion centroids ARE strong (e.g. a TPS character
+    # walks across the frame), the tracker overrides the
+    # action-center fallback with the smoothed motion centroid,
+    # producing per-segment ``subject_x`` that follows the player.
+    #
+    # Note that gameplay clips currently take a separate fast-path
+    # in pipeline.py BEFORE the reframe segmenter even runs (the
+    # ``_is_gameplay`` branch). For Phase 7, the production
+    # integration in pipeline.py disables that fast-path when a
+    # gameplay_subtype is set so the segmenter sees the gameplay
+    # clip and the tracker can fire — that wiring lives in the
+    # Phase 7 follow-up.
+    gameplay_track_count = 0
+    try:
+        from backend.services.gameplay_subject_tracker import (
+            USE_GAMEPLAY_TRACKER,
+            aggregate_subject_x_for_segment,
+            subject_anchor_for_game,
+            subject_anchor_for_genre,
+        )
+
+        _gp_subtype = (
+            getattr(content_profile, "gameplay_subtype", None)
+            if content_profile else None
+        )
+        _gp_game_key = (
+            getattr(content_profile, "game_type", "")
+            if content_profile else ""
+        )
+        if (
+            USE_GAMEPLAY_TRACKER
+            and _gp_subtype
+            and gameplay_motion_centroids is not None
+        ):
+            # Resolve the fallback anchor: prefer the specific
+            # game key (e.g. "gta_v") over the genre default
+            # (e.g. "tps").
+            if _gp_game_key:
+                fallback_xy = subject_anchor_for_game(_gp_game_key)
+            else:
+                fallback_xy = subject_anchor_for_genre(_gp_subtype)
+
+            for seg in raw_segments:
+                if seg.layout in (
+                    "split", "grid", "wide_master", "blur_fill", "stacked_gameplay",
+                ):
+                    continue
+                x_pct, y_pct, source = aggregate_subject_x_for_segment(
+                    gameplay_motion_centroids,
+                    start=seg.start,
+                    end=seg.end,
+                    fallback_xy_pct=fallback_xy,
+                )
+                seg.subject_x = x_pct / 100.0 * source_width
+                seg.subject_y = y_pct / 100.0 * source_height
+                seg.subject_source = f"gameplay_tracker_{source}"
+                gameplay_track_count += 1
+    except Exception as e:
+        logger.warning(
+            "[%s] Gameplay tracker override failed (non-fatal): %s",
+            job_id, e,
+        )
+    if gameplay_track_count > 0:
+        _log("GameplayTracker: %d segments overridden by per-genre tracker", gameplay_track_count)
+
+    # ── Stage 7d: Stream layout routing (Phase 7) ──
+    #
+    # When the profile's gameplay_subtype is "stream" (Phase 2:
+    # gaming + facecam), force the segment layout to
+    # STACKED_GAMEPLAY so the renderer knows to stack the
+    # gameplay portion (top) and the facecam portion (bottom).
+    # The single-subject path still picks the facecam slot from
+    # the face registry; stacked_gameplay is just a layout
+    # marker for the renderer.
+    #
+    # No feature flag — this fires whenever the user explicitly
+    # picked the "stream" content type, since stream is its own
+    # editorial decision rather than a quality knob. The
+    # downstream renderer already supports STACKED_GAMEPLAY from
+    # the existing CONTENT_TYPE_CONFIG.GAMING.prefer_stacked_gameplay
+    # entry — Phase 7 just routes to it via the explicit gate.
+    stream_count = 0
+    try:
+        _gp_sub_for_stream = (
+            getattr(content_profile, "gameplay_subtype", None)
+            if content_profile else None
+        )
+        if _gp_sub_for_stream == "stream":
+            for seg in raw_segments:
+                if seg.layout not in (
+                    "split", "grid", "wide_master", "blur_fill",
+                ):
+                    if seg.layout != "stacked_gameplay":
+                        seg.layout = "stacked_gameplay"
+                        seg.strategy = "stacked_gameplay"
+                        seg.reason = seg.reason or "stream_layout"
+                        stream_count += 1
+    except Exception as e:
+        logger.warning(
+            "[%s] Stream layout routing failed (non-fatal): %s",
+            job_id, e,
+        )
+    if stream_count > 0:
+        _log("Stream: %d segments routed to STACKED_GAMEPLAY", stream_count)
 
     # ── Stage 8: Lead-room application (narrative/vlog) ──
     #

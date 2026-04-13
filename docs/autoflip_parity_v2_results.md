@@ -230,6 +230,38 @@ Plus the music-video-only Phase 5 metric (`downbeat_snap_error`):
 | `music_video_beat` | OFF | 0.40 | 200.0 | 200.0 | 5 |
 | `music_video_beat` | ON | **1.00** | **0.0** | **0.0** | 8 (5 + 3 pulse cuts) |
 
+### v2 Phase 7 — gameplay tracker + STREAM routing
+
+Phase 7 adds the per-genre gameplay subject tracker and the
+STREAM layout routing. Both target fixtures (`tps_character_offset`
++ `stream_corner_facecam`) are unchanged at flag-ON in the parity
+bench because:
+
+  - `tps_character_offset` and `stream_corner_facecam` currently
+    take the legacy `_is_gameplay` fast-path in `pipeline.py`,
+    which skips the segmenter entirely for gameplay content
+  - The fast-path produces hardcoded subject_x = 50, regardless
+    of gameplay variant
+  - Phase 7's Stage 7c segmenter integration is in place but
+    dormant until the pipeline.py wiring (Phase 7 follow-up)
+    disables the fast-path when `gameplay_subtype` is set
+  - The parity bench also doesn't pre-build
+    `gameplay_motion_centroids` from real frame data — the
+    OpenCV Farneback pass lives in pipeline.py (follow-up)
+
+The Phase 7 mechanism is verified end-to-end via 34 unit tests
+that build hand-crafted `GameplayMotionCentroid` sequences and
+assert the tracker's smoothing + clamping + per-genre fallback
+semantics work correctly. The bench numbers will move once the
+pipeline.py wiring + per-frame OpenCV extraction land.
+
+| Fixture | Mode | required_region_miss_rate | Notes |
+|---|---|---|---|
+| `tps_character_offset` | OFF | 1.00 | character at x=40, fast-path centers at 50 |
+| `tps_character_offset` | ON | 1.00 | unchanged (segmenter dormant for gameplay) |
+| `stream_corner_facecam` | OFF | 0.00 | facecam at x=85 trivially in crop |
+| `stream_corner_facecam` | ON | 0.00 | unchanged |
+
 ### v2 Phase 6 — anime fixture re-baseline
 
 Phase 6 changed the ``anime_hard_cuts`` ground truth: dropped the

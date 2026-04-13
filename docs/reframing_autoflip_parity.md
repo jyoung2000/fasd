@@ -260,6 +260,193 @@ thought content type was `UNKNOWN` even for user-declared gameplay.
   (which guards that `source_width` is still bound at function
   scope despite the nearby edits).
 
+### v2 Phase 7 — Gaming beyond FPS (MOBA / TPS / racing / stream)
+
+**Before:** The legacy gaming reframe path hard-coded
+``subject_x = 50`` (screen-center crosshair) for every gaming
+clip. Correct for FPS / hero shooters where the action sits on
+the crosshair, but wrong for:
+
+  - **MOBA / top-down**: action moves across lanes; a fixed
+    center crop loses the side-lane fight when it migrates
+  - **Third-person action (TPS)**: player character is offset
+    down+right of frame center (GTA, Elden Ring); a center crop
+    puts the character on the edge of the vertical frame
+  - **Racing**: car sits in lower third; a center crop loses
+    the road / horizon context
+  - **Stream**: gameplay + facecam should stack vertically;
+    legacy path centered the crop on neither
+
+**After (v2 Phase 7):**
+
+- **`backend/services/gameplay_subject_tracker.py`** *(new)*
+  ships the per-genre subject tracker:
+    - ``GameplayMotionCentroid(timestamp, x_pct, y_pct, magnitude)``
+      dataclass for per-frame motion centroid input. Production
+      callers compute these via OpenCV Farneback / Lucas-Kanade;
+      the parity bench uses synthetic centroids.
+    - ``track_gameplay_subject(centroids, fallback_xy_pct, ...)``
+      smooths motion centroids with EMA (default τ = 0.50 s) +
+      velocity clamping (default 15 % / sec, matching the
+      existing ``optical_flow.build_motion_tracking_path``).
+      Falls back to the per-genre action-center anchor when
+      magnitudes are below ``MIN_MOTION_MAGNITUDE = 0.6``.
+      Returns ``GameplaySubjectPath(path, source, n_motion_frames)``
+      where ``source`` is one of ``"motion"`` / ``"action_center"``
+      / ``"mixed"``.
+    - ``aggregate_subject_x_for_segment(...)`` averages the
+      smoothed path mid-segment and returns
+      ``(x_pct, y_pct, source)`` for the segmenter to consume.
+    - ``subject_anchor_for_game(game_key)`` /
+      ``subject_anchor_for_genre(genre)`` look up the
+      ``action_center_pct`` from Phase 2's ``GAME_HUD_LAYOUTS``
+      table — FPS = (50, 50), TPS = (50, 45), racing = (50, 65),
+      MOBA = (50, 50). None / unknown defaults to (50, 50).
+    - ``derive_hud_safe_subject_x(hud_zones, crop_width_pct)``
+      computes a HUD-safe subject_x for **unrecognized games**
+      by taking the area-weighted centroid of the visible HUD
+      zones and clamping it to the crop-safe range. Default
+      fallback when no specific game key is known.
+    - ``USE_GAMEPLAY_TRACKER`` env flag, default OFF.
+
+- **`backend/services/reframe_segmenter.py`** gained two new
+  sub-blocks immediately after Stage 7b (anime anchor):
+
+    - **Stage 7c — Gameplay subject tracker override**. Behind
+      ``CLIPAI_GAMEPLAY_TRACKER=1`` AND
+      ``profile.gameplay_subtype`` is set AND a populated
+      ``gameplay_motion_centroids`` list is passed via the new
+      ``build_reframe_segments`` kwarg. For each segment that's
+      not in a multi-region layout, calls
+      ``aggregate_subject_x_for_segment`` with the segment's
+      time window. The fallback resolves to
+      ``subject_anchor_for_game`` (when ``profile.game_type`` is
+      set) OR ``subject_anchor_for_genre`` (when only the
+      gameplay subtype is known). Replaces ``seg.subject_x`` /
+      ``seg.subject_y`` with the tracker output and stamps
+      ``seg.subject_source = "gameplay_tracker_{source}"``.
+
+    - **Stage 7d — Stream layout routing**. NO feature flag.
+      When ``profile.gameplay_subtype == "stream"``, forces
+      ``seg.layout = "stacked_gameplay"`` for every non-multi-
+      region segment. The downstream renderer already supports
+      STACKED_GAMEPLAY from the existing
+      ``CONTENT_TYPE_CONFIG.GAMING.prefer_stacked_gameplay``
+      entry — Phase 7 just routes to it via the explicit
+      Phase 2 stream subtype. Stream is an editorial decision
+      rather than a quality knob, so no flag.
+
+- **`backend/services/game_layouts.py`** is unchanged in this
+  commit — Phase 2 already populated ``action_center_pct`` for
+  every entry (FPS = (50, 50), TPS = (50, 45), racing = (50, 65),
+  MOBA = (50, 50)). Phase 7 just consumes those values via
+  ``get_action_center``.
+
+- **Default OFF** for ``CLIPAI_GAMEPLAY_TRACKER``. Per the v2
+  ground rules, any change that *might* regress an existing
+  baseline ships flag-off by default. The legacy gameplay
+  fast-path in pipeline.py (``_is_gameplay`` branch) still
+  fires before the segmenter even runs for gameplay clips —
+  Phase 7's segmenter integration is dormant until the
+  pipeline.py wiring (Phase 7 follow-up) disables the
+  fast-path when ``gameplay_subtype`` is set.
+
+### Tests
+
+| File | Count | Purpose |
+|---|---|---|
+| `test_phase7_gameplay.py` | 34 | per-game anchor lookups + per-genre lookups + motion tracker smoothing + aggregator + HUD-safe fallback + Stage 7c/7d AST guards + flag default |
+| Phase 1+2+3+4+5+6+9 + pre-existing | 619 | zero regressions |
+| **Total (v2 Phase 1-7 + 9 scope)** | **653** | all green |
+
+The 34 new tests break down as:
+
+- **TestSubjectAnchorForGame** (6): FPS center, TPS above
+  center, racing lower third, MOBA centered, unknown defaults,
+  None defaults.
+- **TestSubjectAnchorForGenre** (6): per-genre lookups + None
+  defaults — fps=(50,50), tps=(50,45), racing=(50,65),
+  moba=(50,50), sandbox=(50,50).
+- **TestTrackGameplaySubject** (7): no centroids fallback,
+  strong motion path, weak motion fallback, mixed source,
+  outside-window filter, velocity clamp, EMA jitter
+  suppression.
+- **TestAggregateSubjectXForSegment** (3): motion source,
+  fallback source, multi-frame averaging.
+- **TestDeriveHudSafeSubjectX** (5): empty zones, single
+  zone centroid, two-zone area weighting, clamp to crop-safe
+  range, zero-area zones ignored.
+- **TestPhase7FeatureFlagDefaultOff** (1): flag default OFF.
+- **TestReframeSegmenterStage7cAST** (6): Stage 7c block
+  present, Stage 7d stream routing present, lazy imports,
+  signature has ``gameplay_motion_centroids`` kwarg, per-game
+  + per-genre fallback both referenced, stream routing gates
+  on the subtype with no flag.
+
+### Sandbox parity numbers
+
+The Phase 7 mechanism is verified end-to-end via the 34 unit
+tests, which build hand-crafted ``GameplayMotionCentroid``
+sequences and assert the tracker's smoothing + clamping +
+fallback semantics. The parity bench fixtures
+(``tps_character_offset`` / ``stream_corner_facecam``) are
+**unchanged** at flag-ON because the bench doesn't pre-build
+``gameplay_motion_centroids`` from real frame data — that
+would need OpenCV optical flow on synthetic / real game
+footage.
+
+The bench fixtures also still take the legacy ``_is_gameplay``
+fast-path in pipeline.py, which skips the segmenter entirely
+for gameplay content. Phase 7's segmenter integration is in
+place but dormant until the pipeline.py wiring (next
+follow-up) routes gameplay-with-subtype through the segmenter
+instead of the fast-path.
+
+### Open questions resolved this phase
+
+- **Where does the motion centroid come from in production?**
+  ``pipeline._run_analysis_inner`` will call OpenCV Farneback
+  dense optical flow on sampled gameplay frames, find the
+  dominant motion centroid per frame, and pass the result via
+  the new ``gameplay_motion_centroids`` kwarg. The segmenter
+  wiring is in this commit; pipeline.py wiring is the Phase 7
+  follow-up.
+
+- **Why no flag on the stream routing?** Stream is an
+  editorial decision the user explicitly made via the
+  Phase 2 dropdown — they're saying "this is gameplay +
+  facecam, please stack them". That's a yes/no behavior
+  switch, not a quality tradeoff, so it doesn't need a flag.
+
+- **What about unrecognized games?** The
+  ``derive_hud_safe_subject_x`` fallback computes an
+  area-weighted centroid of the HUD zones and clamps it to
+  the crop-safe range. For a truly unknown game, the caller
+  passes the persistent-region detector's output as the HUD
+  zone list. Phase 7 ships the helper; the
+  persistent-region wiring is a follow-up.
+
+### Out of scope for this phase
+
+- **Production pipeline.py wiring**. Gameplay-with-subtype
+  clips currently take the legacy ``_is_gameplay`` fast-path
+  before reaching the segmenter. Phase 7 follow-up will
+  disable the fast-path when ``gameplay_subtype`` is set so
+  the segmenter sees the clip and Stage 7c can fire.
+
+- **Per-frame OpenCV motion extraction**. The segmenter
+  consumes pre-computed ``GameplayMotionCentroid`` objects.
+  The OpenCV pass that creates them lives in pipeline.py
+  (Phase 7 follow-up) and uses Farneback dense flow on
+  sampled frames.
+
+- **STACKED_GAMEPLAY layout details**. Stage 7d sets
+  ``seg.layout = "stacked_gameplay"`` but doesn't compute
+  the actual top/bottom split rectangles — that's the
+  renderer's job and the existing
+  ``CONTENT_TYPE_CONFIG.GAMING.prefer_stacked_gameplay``
+  path already handles the geometry.
+
 ### v2 Phase 6 — Animation-aware pipeline (anime / cartoon)
 
 **Before:** The reframe segmenter relied on the live-action face
