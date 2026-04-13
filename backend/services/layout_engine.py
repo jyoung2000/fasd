@@ -831,16 +831,25 @@ def layout_from_reframe_segments(
         # start/end kf pair at the subject_x/y.
         motion_path = getattr(rseg, "motion_path", None)
         if motion_path:
-            kf_positions = [
-                {
-                    "timestamp": float(t),
-                    "x": float(px / _sw * 100.0),
-                    "y": float(py / _sh * 100.0),
+            _default_py_pct = float(rseg.subject_y / _sh * 100.0)
+            kf_positions = []
+            for _mp_entry in motion_path:
+                _mp_t = float(_mp_entry[0])
+                _mp_px = float(_mp_entry[1])
+                # l1_camera_path returns 2-tuples (t, x); optical_flow returns
+                # 3-tuples (t, x, y). Handle both without crashing.
+                _mp_py_pct = (
+                    float(_mp_entry[2] / _sh * 100.0)
+                    if len(_mp_entry) > 2
+                    else _default_py_pct
+                )
+                kf_positions.append({
+                    "timestamp": _mp_t,
+                    "x": float(_mp_px / _sw * 100.0),
+                    "y": _mp_py_pct,
                     "solver_mode": str(getattr(rseg, "strategy", "stationary")),
                     "solver_zoom": 1.0,
-                }
-                for (t, px, py) in motion_path
-            ]
+                })
         else:
             _cx = float(rseg.subject_x / _sw * 100.0)
             _cy = float(rseg.subject_y / _sh * 100.0)

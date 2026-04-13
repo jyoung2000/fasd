@@ -2895,7 +2895,12 @@ async def _run_analysis_inner(job_id: str):
                         score_anime_sequence,
                     )
 
-                    if _USE_AA and _content_profile and getattr(
+                    _auto_anime_anchor = (
+                        _content_profile is not None
+                        and getattr(_content_profile, "content_type", None)
+                        == "animation_dialogue"
+                    )
+                    if (_USE_AA or _auto_anime_anchor) and _content_profile and getattr(
                         _content_profile, "is_animated", False,
                     ):
                         _features_seq: list = []
