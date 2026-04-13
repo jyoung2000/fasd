@@ -7,6 +7,13 @@ import React, { useMemo } from 'react';
  * Enabled via dev flag or keyboard shortcut. Reuses the RenderPlan debug
  * data — no new API needed.
  *
+ * v2 Phase 10: surfaces content routing (content_type, clip_content_type,
+ * anime_subtype, music_subtype, game_type, gameplay_subtype) in a header
+ * chip row plus per-segment editorial-prior decision tags
+ * (j_cut / l_cut / listener_hold / reaction_beat) under the strategy row.
+ * These hint at which Phase 3-8 tuning paths fired on this clip so an
+ * editor debugging a bad crop can attribute it to the right layer.
+ *
  * Props:
  *   renderPlan: RenderPlan JSON from /api/jobs/{id}/render_plan?debug=1
  *   currentTime: current playback position (seconds, clip-relative)
@@ -20,6 +27,21 @@ export default function ReframeDebugOverlay({ renderPlan, currentTime = 0, clipD
 
   const duration = clipDuration || renderPlan?.total_duration_sec || 1;
 
+  // v2 Phase 10: content routing identifiers surfaced via RenderPlan.debug
+  // (populated by the parity harness + pipeline.py when the v2 flags are
+  // on). Gracefully handle legacy RenderPlans that don't carry these
+  // fields — the header chips just render nothing.
+  const contentType = debug?.content_type;
+  const clipContentType = debug?.clip_content_type;
+  const animeSubtype = debug?.anime_subtype;
+  const musicSubtype = debug?.music_subtype;
+  const gameplaySubtype = debug?.gameplay_subtype;
+  const gameType = debug?.game_type;
+  const isMultiSpeakerPanel = debug?.is_multi_speaker_panel;
+  const isAnimated = debug?.is_animated;
+  const perSegmentEditorial = debug?.editorial_prior_per_segment;
+  const perSegmentReason = debug?.reason_per_segment;
+
   // Strategy color map
   const strategyColors = {
     crop: '#3b82f6',           // blue
@@ -29,6 +51,30 @@ export default function ReframeDebugOverlay({ renderPlan, currentTime = 0, clipD
     split_screen: '#10b981',   // emerald
     stacked_gameplay: '#14b8a6', // teal
     grid_2x2: '#06b6d4',      // cyan
+  };
+
+  // Per-content-type chip color (v2 Phase 10)
+  const contentTypeColors = {
+    talking_head: '#60a5fa',
+    multi_speaker_panel: '#34d399',
+    cinematic_dialogue: '#a78bfa',
+    animation: '#f472b6',
+    animation_dialogue: '#f472b6',
+    music_video: '#fb7185',
+    gameplay: '#fbbf24',
+    gameplay_moba: '#fbbf24',
+    gameplay_tps: '#fbbf24',
+    gameplay_racing: '#fbbf24',
+    stream: '#14b8a6',
+    generic: '#9ca3af',
+  };
+
+  // Editorial decision tag color (v2 Phase 10)
+  const editorialColors = {
+    j_cut: '#60a5fa',           // blue
+    l_cut: '#a78bfa',           // purple
+    listener_hold: '#34d399',   // green
+    reaction_beat: '#fb7185',   // rose
   };
 
   // Confidence color
@@ -86,6 +132,30 @@ export default function ReframeDebugOverlay({ renderPlan, currentTime = 0, clipD
     );
   }, [debug?.min_hold_per_sec]);
 
+  // v2 Phase 10: content-routing chip row. Renders a single-line
+  // summary of which tuning layer picked the crop — useful when an
+  // editor is debugging why a clip ends up in wide_master or split.
+  const hasContentRouting = (
+    contentType || clipContentType || animeSubtype || musicSubtype
+    || gameplaySubtype || gameType
+  );
+
+  const chip = (label, value, color) => (
+    <span style={{
+      padding: '1px 5px',
+      borderRadius: 3,
+      background: `${color}22`,
+      color: color,
+      fontSize: 9,
+      fontWeight: 600,
+      border: `1px solid ${color}55`,
+      whiteSpace: 'nowrap',
+    }}>
+      {label}:{' '}
+      <span style={{ color: '#e5e7eb', fontWeight: 400 }}>{value}</span>
+    </span>
+  );
+
   return (
     <div style={{
       width: '100%',
@@ -96,6 +166,34 @@ export default function ReframeDebugOverlay({ renderPlan, currentTime = 0, clipD
       color: '#9ca3af',
       fontFamily: 'monospace',
     }}>
+      {/* Content routing chips (v2 Phase 10) */}
+      {hasContentRouting && (
+        <div style={{
+          display: 'flex',
+          gap: 4,
+          flexWrap: 'wrap',
+          marginBottom: 5,
+          alignItems: 'center',
+        }}>
+          {contentType && chip(
+            'content',
+            contentType,
+            contentTypeColors[contentType] || '#9ca3af',
+          )}
+          {clipContentType && clipContentType !== contentType && chip(
+            'clip',
+            clipContentType,
+            contentTypeColors[clipContentType] || '#9ca3af',
+          )}
+          {animeSubtype && chip('anime', animeSubtype, '#f472b6')}
+          {musicSubtype && chip('music', musicSubtype, '#fb7185')}
+          {gameplaySubtype && chip('genre', gameplaySubtype, '#fbbf24')}
+          {gameType && chip('game', gameType, '#fbbf24')}
+          {isMultiSpeakerPanel && chip('panel', 'yes', '#34d399')}
+          {isAnimated && chip('animated', 'yes', '#f472b6')}
+        </div>
+      )}
+
       {/* Pacing score line chart */}
       {pacingSvg && (
         <div style={{ marginBottom: 4 }}>
@@ -139,6 +237,51 @@ export default function ReframeDebugOverlay({ renderPlan, currentTime = 0, clipD
         </div>
       )}
 
+      {/* Per-segment editorial decision tags (v2 Phase 10) */}
+      {perSegmentEditorial && perSegmentEditorial.length > 0 && ops && (
+        <div style={{
+          display: 'flex',
+          gap: 1,
+          marginBottom: 3,
+          height: 12,
+        }}>
+          {ops.map((op, i) => {
+            const widthPct = ((op.end_sec - op.start_sec) / duration) * 100;
+            const kinds = perSegmentEditorial[i] || [];
+            if (kinds.length === 0) {
+              return (
+                <div key={i} style={{
+                  width: `${widthPct}%`,
+                  minWidth: 2,
+                  height: '100%',
+                }} />
+              );
+            }
+            // Show the first kind as the background; tooltip shows all
+            const primary = kinds[0];
+            return (
+              <div key={i} style={{
+                width: `${widthPct}%`,
+                minWidth: 2,
+                height: '100%',
+                background: editorialColors[primary] || '#6b7280',
+                borderRadius: 1,
+                fontSize: 7,
+                color: 'white',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                whiteSpace: 'nowrap',
+                opacity: 0.85,
+              }}
+              title={`#${i}: ${kinds.join(', ')}`}>
+                {widthPct > 4 ? primary.replace('_', ' ').slice(0, 8) : ''}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
       {/* Confidence bars */}
       {debug?.confidence_per_segment && debug.confidence_per_segment.length > 0 && ops && (
         <div style={{ display: 'flex', gap: 1, marginBottom: 3, height: 10 }}>
@@ -173,6 +316,35 @@ export default function ReframeDebugOverlay({ renderPlan, currentTime = 0, clipD
                 color: '#fca5a5',
                 fontSize: 9,
               }}>
+                #{i}: {reason}
+              </span>
+            ) : null
+          )}
+        </div>
+      )}
+
+      {/* Per-segment reason tags (v2 Phase 10) —
+          shows anime_anchor_face / gameplay_tracker_motion /
+          multi_region_lp_fit / music_pulse_cut / editorial_reaction_beat */}
+      {perSegmentReason && perSegmentReason.some(r => r) && (
+        <div style={{
+          display: 'flex',
+          gap: 2,
+          flexWrap: 'wrap',
+          marginTop: 2,
+          fontSize: 8,
+        }}>
+          {perSegmentReason.map((reason, i) =>
+            reason ? (
+              <span key={`r${i}`} style={{
+                padding: '1px 4px',
+                borderRadius: 3,
+                background: 'rgba(96, 165, 250, 0.15)',
+                color: '#93c5fd',
+                fontSize: 8,
+                border: '1px solid rgba(96, 165, 250, 0.25)',
+              }}
+              title={`segment #${i} reason`}>
                 #{i}: {reason}
               </span>
             ) : null
