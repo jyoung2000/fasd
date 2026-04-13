@@ -565,35 +565,44 @@ def solve_camera_path(
 
     # ── Solver selection ──
     n_frames = len(targets_dz)
-    _t0 = time.perf_counter()
-    if _SOLVER_MODE == "lp" or (_SOLVER_MODE == "auto" and n_frames <= LP_MAX_FRAMES):
-        if _SOLVER_MODE == "lp" and n_frames > LP_MAX_FRAMES * 2:
-            raise ValueError(
-                f"LP solver forced but shot has {n_frames} frames "
-                f"(> {LP_MAX_FRAMES * 2} max). Use CLIPAI_L1_SOLVER=auto."
-            )
-        from backend.services._autoflip_lp import solve_autoflip_lp
-        _lp_lo = [lo_bounds[i] if lo_bounds and lo_bounds[i] is not None else 0.0
-                  for i in range(n_frames)]
-        _lp_hi = [hi_bounds[i] if hi_bounds and hi_bounds[i] is not None else float(source_width)
-                  for i in range(n_frames)]
-        # Per-frame data-term weights: scale lam1 per frame in the LP
-        _lp_weights = weights if weights is not None else None
-        solved = solve_autoflip_lp(
-            targets_dz, _lp_lo, _lp_hi,
-            lam1=1.0, lam2=LP_LAMBDA_V, lam3=LP_LAMBDA_A, lam4=LP_LAMBDA_J,
-            weights=_lp_weights,
+    if _SOLVER_MODE == "lp" and n_frames > LP_MAX_FRAMES * 2:
+        raise ValueError(
+            f"LP solver forced but shot has {n_frames} frames "
+            f"(> {LP_MAX_FRAMES * 2} max). Use CLIPAI_L1_SOLVER=auto."
         )
-        _solver_used = "lp"
-    else:
-        # For Condat: pre-weight signal for diagonal data-fidelity weighting.
-        # Replace target[t] with weighted version that pulls harder/softer.
-        if weights is not None:
-            _condat_input = _apply_condat_weights(targets_dz, weights, lam)
+    use_lp = _SOLVER_MODE == "lp" or (_SOLVER_MODE == "auto" and n_frames <= LP_MAX_FRAMES)
+    _solver_used = "lp" if use_lp else "condat"
+    _t0 = time.perf_counter()
+    try:
+        if use_lp:
+            from backend.services._autoflip_lp import solve_autoflip_lp
+            _lp_lo = [lo_bounds[i] if lo_bounds and lo_bounds[i] is not None else 0.0
+                      for i in range(n_frames)]
+            _lp_hi = [hi_bounds[i] if hi_bounds and hi_bounds[i] is not None else float(source_width)
+                      for i in range(n_frames)]
+            # Per-frame data-term weights: scale lam1 per frame in the LP
+            _lp_weights = weights if weights is not None else None
+            solved = solve_autoflip_lp(
+                targets_dz, _lp_lo, _lp_hi,
+                lam1=1.0, lam2=LP_LAMBDA_V, lam3=LP_LAMBDA_A, lam4=LP_LAMBDA_J,
+                weights=_lp_weights,
+            )
         else:
-            _condat_input = targets_dz
-        solved = _tv_denoise_1d(_condat_input, lam, 0, lo_bounds, hi_bounds)
-        _solver_used = "condat"
+            # For Condat: pre-weight signal for diagonal data-fidelity weighting.
+            # Replace target[t] with weighted version that pulls harder/softer.
+            if weights is not None:
+                _condat_input = _apply_condat_weights(targets_dz, weights, lam)
+            else:
+                _condat_input = targets_dz
+            solved = _tv_denoise_1d(_condat_input, lam, 0, lo_bounds, hi_bounds)
+    except Exception as solve_exc:
+        logger.warning(
+            "L1 solver: seg=%d frames=%d solver=%s EXCEPTION %s: %s — "
+            "falling back to raw targets",
+            seg_idx, n_frames, _solver_used,
+            type(solve_exc).__name__, solve_exc,
+        )
+        solved = list(targets_dz)
     _solve_ms = (time.perf_counter() - _t0) * 1000
 
     # ── Post-solve smoothing: kill residual jitter ──
@@ -857,7 +866,6 @@ def solve_camera_path_for_shot(
 
     # ── Solve: LP (with accel+jerk) or Condat TV ──
     n_padded = len(padded_targets)
-    _t0 = time.perf_counter()
     use_lp = (
         _SOLVER_MODE == "lp"
         or (_SOLVER_MODE == "auto" and n_padded <= LP_MAX_FRAMES)
@@ -870,24 +878,48 @@ def solve_camera_path_for_shot(
     if use_lp and n_padded > LP_MAX_FRAMES and _SOLVER_MODE == "auto":
         use_lp = False
 
-    if use_lp:
-        from backend.services._autoflip_lp import solve_autoflip_lp
-        # Build bounds for LP solver (None → unconstrained as source_width bounds)
-        lp_lo = []
-        lp_hi = []
-        for i in range(n_padded):
-            lo_val = lo_bounds[i] if lo_bounds and lo_bounds[i] is not None else 0.0
-            hi_val = hi_bounds[i] if hi_bounds and hi_bounds[i] is not None else float(source_width)
-            lp_lo.append(lo_val)
-            lp_hi.append(hi_val)
-        padded_solved = solve_autoflip_lp(
-            padded_targets, lp_lo, lp_hi,
-            lam1=1.0, lam2=LP_LAMBDA_V, lam3=LP_LAMBDA_A, lam4=LP_LAMBDA_J,
+    _solver_used = "lp" if use_lp else "condat"
+    # Pre-solve log so a hang is attributable to a specific shot. Without
+    # this, previously the "L1 solver: ..." line only fired AFTER the
+    # solve returned, which made it impossible to tell from logs which
+    # shot was the one that froze the container.
+    logger.info(
+        "L1 solver: shot=%d frames=%d n_segments=%d solver=%s span=%.2f-%.2fs — starting",
+        0, n_padded, len(segments_in_shot), _solver_used,
+        float(shot_start), float(shot_end),
+    )
+    _t0 = time.perf_counter()
+
+    try:
+        if use_lp:
+            from backend.services._autoflip_lp import solve_autoflip_lp
+            # Build bounds for LP solver (None → unconstrained as source_width bounds)
+            lp_lo = []
+            lp_hi = []
+            for i in range(n_padded):
+                lo_val = lo_bounds[i] if lo_bounds and lo_bounds[i] is not None else 0.0
+                hi_val = hi_bounds[i] if hi_bounds and hi_bounds[i] is not None else float(source_width)
+                lp_lo.append(lo_val)
+                lp_hi.append(hi_val)
+            padded_solved = solve_autoflip_lp(
+                padded_targets, lp_lo, lp_hi,
+                lam1=1.0, lam2=LP_LAMBDA_V, lam3=LP_LAMBDA_A, lam4=LP_LAMBDA_J,
+            )
+        else:
+            padded_solved = _tv_denoise_1d(padded_targets, lam, 0, lo_bounds, hi_bounds)
+    except Exception as solve_exc:
+        # Any solver explosion (scipy time-limit, infeasible LP, numpy
+        # error, memory pressure) must NOT take the worker down — fall
+        # back to the raw dead-zoned target signal. The downstream mode
+        # classifier still gets a coherent path, and the surrounding
+        # pipeline continues.
+        logger.warning(
+            "L1 solver: shot=0 frames=%d solver=%s EXCEPTION %s: %s — "
+            "falling back to raw targets",
+            n_padded, _solver_used, type(solve_exc).__name__, solve_exc,
         )
-        _solver_used = "lp"
-    else:
-        padded_solved = _tv_denoise_1d(padded_targets, lam, 0, lo_bounds, hi_bounds)
-        _solver_used = "condat"
+        padded_solved = list(padded_targets)
+
     _solve_ms = (time.perf_counter() - _t0) * 1000
 
     logger.info(

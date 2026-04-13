@@ -722,7 +722,12 @@ def build_reframe_segments(
             shot_groups.setdefault(shot_idx, []).append(i)
 
         # Solve per shot group
-        for shot_idx, seg_indices in shot_groups.items():
+        _n_shots = len(shot_groups)
+        logger.info(
+            "[%s] L1 camera path: solving %d shot groups (%d eligible segments)",
+            job_id, _n_shots, len(eligible_indices),
+        )
+        for _k, (shot_idx, seg_indices) in enumerate(shot_groups.items()):
             shot_segs = [raw_segments[i] for i in seg_indices]
             if not shot_segs:
                 continue
@@ -730,15 +735,37 @@ def build_reframe_segments(
             shot_start = shot_segs[0].start
             shot_end = shot_segs[-1].end
 
-            results = solve_camera_path_for_shot(
-                shot_start=shot_start,
-                shot_end=shot_end,
-                segments_in_shot=shot_segs,
-                propagated_path=source,
-                source_width=source_width,
-                source_height=source_height,
-                job_id=job_id,
+            # Per-iteration progress log — if a specific shot hangs the
+            # solver, this line identifies it before the hang happens.
+            # (The solver's own "L1 solver: ... starting" line is also
+            # emitted but only from solve_camera_path_for_shot; this is
+            # the caller-side breadcrumb so it stays attributable.)
+            logger.debug(
+                "[%s] L1 shot %d/%d: shot_idx=%s segs=%d span=%.2f-%.2fs",
+                job_id, _k + 1, _n_shots, shot_idx,
+                len(shot_segs), float(shot_start), float(shot_end),
             )
+
+            try:
+                results = solve_camera_path_for_shot(
+                    shot_start=shot_start,
+                    shot_end=shot_end,
+                    segments_in_shot=shot_segs,
+                    propagated_path=source,
+                    source_width=source_width,
+                    source_height=source_height,
+                    job_id=job_id,
+                )
+            except Exception as shot_exc:
+                # A single shot failing must not abort Stage 10 — skip
+                # it and leave the affected segments with their
+                # existing face-registry positions.
+                logger.warning(
+                    "[%s] L1 shot %d/%d failed (non-fatal): %s: %s",
+                    job_id, _k + 1, _n_shots,
+                    type(shot_exc).__name__, shot_exc,
+                )
+                continue
 
             for seg_i, result in zip(seg_indices, results):
                 seg = raw_segments[seg_i]
