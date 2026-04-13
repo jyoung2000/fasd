@@ -32,6 +32,11 @@ class ClipContentType(str, Enum):
     """Simplified content types for camera solver tuning."""
     TALKING_HEAD = "talking_head"      # debates, podcasts, interviews
     CINEMATIC_DIALOGUE = "cinematic_dialogue"   # narrative w/ detected dialogue shots
+    # Fix 3: multi-seat panel / interview where 2-5 people sit in
+    # fixed positions. Distinct from TALKING_HEAD (which is 1-2
+    # close-up talking heads) — panels need shot-cut-aware stationary
+    # crops on each seat, not a single held crop on the loudest.
+    MULTI_SPEAKER_PANEL = "multi_speaker_panel"
     ANIMATION = "animation"            # anime, cartoons
     ANIMATION_DIALOGUE = "animation_dialogue"   # talking anime characters
     MUSIC_VIDEO = "music_video"
@@ -74,6 +79,11 @@ class ContentProfile:
     # ClipContentType.ANIMATION_DIALOGUE routing (narrative + animated) and
     # skips per-face human verification downstream.
     is_animated: bool = False
+    # Fix 3: set to True when face signals match a seated multi-speaker
+    # panel (2-5 stable seats, high multi-face-frame rate, per-slot
+    # x-stdev small). Drives ClipContentType.MULTI_SPEAKER_PANEL routing
+    # in classify_clip — overrides talking_head / vlog / generic.
+    is_multi_speaker_panel: bool = False
 
 
 def classify_content(
@@ -351,9 +361,64 @@ def classify_content(
             job_id,
         )
 
+    # ── Fix 3: multi-speaker panel detection ──
+    # A seated interview / panel has:
+    #   - 2-5 face slots (after Fix 1 teleport-merge)
+    #   - ≥1.5 average face count per populated frame
+    #   - ≥25% of populated frames show 2+ faces simultaneously
+    #   - low per-slot x-stdev (each seat stays put; small x_range)
+    #   - no single slot dominates >60% of frames
+    #
+    # When all hit, emit is_multi_speaker_panel so classify_clip routes
+    # to ClipContentType.MULTI_SPEAKER_PANEL instead of talking_head /
+    # vlog / generic (the wrong types the old classifier produced for
+    # the Verzuz run).
+    is_multi_speaker_panel = False
+    multi_face_frame_pct = 0.0
+    if dense_faces:
+        populated = [df for df in dense_faces if df.faces]
+        if populated:
+            multi_face_frame_pct = sum(
+                1 for df in populated if len(df.faces) >= 2
+            ) / len(populated)
+            signals["multi_face_frame_pct"] = round(multi_face_frame_pct, 2)
+
+    if (face_registry and face_registry.slots
+            and 2 <= len(face_registry.slots) <= 5
+            and signals.get("avg_faces", 0) >= 1.5
+            and multi_face_frame_pct >= 0.25):
+        # Per-slot x-range (avg_slot_x_range) must be small enough that
+        # each "seat" is actually stable, and no single slot dominates
+        # >60% of the dense frames.
+        total_frames_seen = sum(s.frame_count for s in face_registry.slots)
+        if total_frames_seen > 0:
+            avg_range = (
+                sum(s.x_max - s.x_min for s in face_registry.slots)
+                / len(face_registry.slots)
+            )
+            dom_slot = max(face_registry.slots, key=lambda s: s.frame_count)
+            dom_pct = dom_slot.frame_count / total_frames_seen
+            if avg_range < 15 and dom_pct < 0.6:
+                is_multi_speaker_panel = True
+                signals["multi_speaker_panel"] = True
+                signals["panel_avg_slot_range"] = round(avg_range, 1)
+                signals["panel_dominant_pct"] = round(dom_pct, 2)
+                # Add a score bump for PODCAST so the primary classifier
+                # doesn't land on VLOG when the panel signal fires.
+                scores["podcast"] = scores.get("podcast", 0) + 2.0
+                # Re-pick winner with the bump.
+                best_type = max(scores, key=scores.get)
+                best_score = scores[best_type]
+                total_score = sum(scores.values())
+                confidence = best_score / total_score if total_score > 0 else 0.0
+                if confidence >= 0.25 and best_score >= 2.0:
+                    profile.content_type = best_type
+                    profile.confidence = min(1.0, confidence)
+
     profile.signals = signals
     profile.is_cinematic_dialogue = is_cinematic_dialogue
     profile.is_animated = is_animated
+    profile.is_multi_speaker_panel = is_multi_speaker_panel
     _log(
         "%s (conf=%.2f, signals=%s, scores=%s)",
         profile.content_type, profile.confidence,
@@ -394,8 +459,20 @@ def classify_clip(
         base_type = _CONTENT_TYPE_MAP.get(
             content_profile.content_type, ClipContentType.GENERIC
         )
-        # Narrative → CINEMATIC_DIALOGUE promotion
-        if getattr(content_profile, "is_cinematic_dialogue", False):
+        # Fix 3: MULTI_SPEAKER_PANEL promotion takes precedence over
+        # CINEMATIC_DIALOGUE and the animation branch below — a seated
+        # panel is a panel regardless of whether the raw classifier
+        # guessed podcast/narrative/vlog/generic.
+        if getattr(content_profile, "is_multi_speaker_panel", False):
+            base_type = ClipContentType.MULTI_SPEAKER_PANEL
+            logger.info(
+                "[ContentClassifier] multi_speaker_panel signal fired "
+                "→ MULTI_SPEAKER_PANEL (from base=%s)",
+                content_profile.content_type,
+            )
+        # Narrative → CINEMATIC_DIALOGUE promotion (only if not already
+        # routed to MULTI_SPEAKER_PANEL).
+        elif getattr(content_profile, "is_cinematic_dialogue", False):
             base_type = ClipContentType.CINEMATIC_DIALOGUE
         # Animated narrative → ANIMATION_DIALOGUE (talking anime characters).
         # Applies the same saliency downrank + attention-anchor fallback
@@ -406,6 +483,8 @@ def classify_clip(
         # (GAMEPLAY, STREAM, MUSIC_VIDEO) where the animation signal is
         # incidental and those layouts have their own rules.
         if getattr(content_profile, "is_animated", False):
+            # MULTI_SPEAKER_PANEL shouldn't flip to ANIMATION_DIALOGUE —
+            # a seated anime panel is still panel framing.
             if base_type in (
                 ClipContentType.GENERIC,
                 ClipContentType.CINEMATIC_DIALOGUE,

@@ -93,15 +93,20 @@ def _merge_overlapping_features(frame_regions: list) -> list:
 
 def _is_dialogue_mode(content_type) -> bool:
     """True for content types where faces are load-bearing and background
-    saliency should not compete: TALKING_HEAD, CINEMATIC_DIALOGUE, and
-    ANIMATION_DIALOGUE (talking anime characters).
+    saliency should not compete: TALKING_HEAD, CINEMATIC_DIALOGUE,
+    MULTI_SPEAKER_PANEL, and ANIMATION_DIALOGUE (talking anime characters).
     """
     if content_type is None:
         return False
     # Match by string value so this works whether content_type is the enum
     # or its .value — callers pass both forms.
     val = getattr(content_type, "value", content_type)
-    return val in ("talking_head", "cinematic_dialogue", "animation_dialogue")
+    return val in (
+        "talking_head",
+        "cinematic_dialogue",
+        "multi_speaker_panel",
+        "animation_dialogue",
+    )
 
 
 def _is_animated_mode(content_type) -> bool:
@@ -186,7 +191,12 @@ def _saliency_weight_for_content(content_type, sal_score: float):
         STREAM / MUSIC_VIDEO / GENERIC: 0.25 + 0.45·s, max 0.70, min_area 0.03
     """
     val = getattr(content_type, "value", content_type) if content_type is not None else None
-    if val in ("talking_head", "cinematic_dialogue", "animation_dialogue"):
+    if val in (
+        "talking_head",
+        "cinematic_dialogue",
+        "animation_dialogue",
+        "multi_speaker_panel",
+    ):
         return (min(0.40, 0.15 + 0.25 * sal_score), 0.04)
     if val in ("animation", "gameplay"):
         return (0.30 + 0.60 * sal_score, 0.02)

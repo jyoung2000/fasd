@@ -455,6 +455,153 @@ def build_face_registry(
     return registry
 
 
+def _merge_teleporting_embedding_slots(
+    slots: list,
+    slot_face_indices: dict,
+    embeddings_norm,
+) -> list:
+    """Collapse embedding slots that share a mean_x within ±8 %% AND whose
+    face embeddings are cosine-similar above 0.70.
+
+    Fix 1: seated-panel runs produced 11 embedding slots because SFace
+    split the same person across pose / lighting variations. Several of
+    those slots had x-ranges spanning 80%%+ of the frame width (e.g.
+    [14-97], [15-98], [14-95]) — a real person doesn't teleport, and
+    these are all the same identity. Merging them restores the actual
+    seat count (5 position-cluster slots).
+
+    Args:
+        slots: list[FaceSlot] from embedding clustering (already sorted
+            left-to-right with contiguous 0..N-1 slot_ids).
+        slot_face_indices: {slot_id → list of face indices into
+            embeddings_norm / all_faces} — the ORIGINAL embedding-group
+            membership, NOT a re-assignment by nearest x. Using nearest-x
+            reassignment breaks on stage/panel clips where multiple
+            identities traverse the same region: their true groups are
+            orthogonal in embedding space but re-assignment would lump
+            them together and produce false merges.
+        embeddings_norm: L2-normalized embedding matrix for cosine
+            similarity computation.
+
+    Returns:
+        list[FaceSlot] — merged, re-sorted, re-numbered left-to-right.
+    """
+    import numpy as np
+
+    if len(slots) < 2:
+        return slots
+
+    # Build per-slot centroid embeddings from the TRUE embedding-group
+    # membership (passed in from the caller).
+    slot_centroids: dict = {}
+    for sid, face_idxs in slot_face_indices.items():
+        if not face_idxs:
+            continue
+        embs = embeddings_norm[face_idxs]
+        centroid = embs.mean(axis=0)
+        c_norm = float(np.linalg.norm(centroid))
+        if c_norm > 1e-8:
+            centroid = centroid / c_norm
+        slot_centroids[sid] = centroid
+
+    # Union-find: merge any pair that satisfies BOTH conditions.
+    parent = {s.slot_id: s.slot_id for s in slots}
+
+    def _find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def _union(a, b):
+        ra, rb = _find(a), _find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    merges = 0
+    for i in range(len(slots)):
+        for j in range(i + 1, len(slots)):
+            a, b = slots[i], slots[j]
+            if abs(a.x_center - b.x_center) >= 8.0:
+                continue
+            ca = slot_centroids.get(a.slot_id)
+            cb = slot_centroids.get(b.slot_id)
+            if ca is None or cb is None:
+                continue
+            cos_sim = float(np.dot(ca, cb))
+            if cos_sim > 0.70:
+                _union(a.slot_id, b.slot_id)
+                merges += 1
+
+    if merges == 0:
+        return slots
+
+    # Rebuild slots by merged group.
+    group_members: dict = {}
+    for s in slots:
+        root = _find(s.slot_id)
+        group_members.setdefault(root, []).append(s)
+
+    merged: list = []
+    for root, members in group_members.items():
+        if len(members) == 1:
+            merged.append(members[0])
+            continue
+        total_frames = sum(m.frame_count for m in members)
+        # Weight each member's x_center by its frame_count.
+        x_center_w = sum(m.x_center * m.frame_count for m in members) / max(total_frames, 1)
+        x_min = min(m.x_min for m in members)
+        x_max = max(m.x_max for m in members)
+        avg_w = sum(m.avg_width * m.frame_count for m in members) / max(total_frames, 1)
+        avg_h = sum(m.avg_height * m.frame_count for m in members) / max(total_frames, 1)
+        merged.append(FaceSlot(
+            slot_id=members[0].slot_id,  # placeholder — re-numbered below
+            x_center=float(round(x_center_w, 1)),
+            x_min=float(round(x_min, 1)),
+            x_max=float(round(x_max, 1)),
+            frame_count=int(total_frames),
+            avg_width=float(round(avg_w, 1)),
+            avg_height=float(round(avg_h, 1)),
+        ))
+
+    merged.sort(key=lambda s: s.x_center)
+    for i, s in enumerate(merged):
+        s.slot_id = i
+
+    logger.info(
+        "[FaceRegistry] teleport-merge: collapsed %d slot pair(s) "
+        "→ %d slots (from %d)",
+        merges, len(merged), len(slots),
+    )
+    return merged
+
+
+def _detect_panel_mode(face_results: list) -> bool:
+    """Heuristic: does this clip look like a seated multi-speaker panel?
+
+    Used by build_face_registry_with_embeddings to decide whether
+    position-based clustering should override embedding-based clustering.
+    Panel signals:
+      - ≥25% of frames have 2+ faces simultaneously (multi-face frames)
+      - Average face count per populated frame ≥1.5
+
+    This is the same panel signature content_classifier.py later keys
+    on to emit content_type=multi_speaker_panel (Fix 3); we compute it
+    here early because the registry decision must happen before the
+    classifier runs.
+    """
+    if not face_results:
+        return False
+    populated = [fr for fr in face_results if fr.faces]
+    if len(populated) < 10:
+        return False
+    total = len(populated)
+    multi_face_frames = sum(1 for fr in populated if len(fr.faces) >= 2)
+    multi_face_pct = multi_face_frames / total
+    avg_faces = sum(len(fr.faces) for fr in populated) / total
+    return multi_face_pct >= 0.25 and avg_faces >= 1.5
+
+
 def build_face_registry_with_embeddings(
     face_results: list,
     min_appearances: int = 3,
@@ -590,8 +737,13 @@ def build_face_registry_with_embeddings(
         root = find(i)
         groups.setdefault(root, []).append(i)
 
-    # Build slots from groups
+    # Build slots from groups. Track each slot's ORIGINAL embedding-group
+    # membership so Fix 1's teleport-merge pass (below) can compute
+    # per-slot centroids from the true embedding groups instead of
+    # re-assigning faces by nearest x-center (which breaks on stage
+    # clips where multiple identities traverse the same region).
     slots = []
+    slot_to_group_indices: list = []  # parallel list; re-keyed after sort
     for group_indices in groups.values():
         unique_frames = len(set(all_faces[i][4] for i in group_indices))
         if unique_frames < min_appearances:
@@ -608,6 +760,7 @@ def build_face_registry_with_embeddings(
         else:
             median_x = x_positions[mid]
 
+        slot_to_group_indices.append(list(group_indices))
         slots.append(FaceSlot(
             slot_id=len(slots),
             x_center=float(round(median_x, 1)),
@@ -618,10 +771,19 @@ def build_face_registry_with_embeddings(
             avg_height=float(round(sum(heights) / len(heights), 1)),
         ))
 
-    # Sort left to right
-    slots.sort(key=lambda s: s.x_center)
+    # Sort left to right. We also sort slot_to_group_indices in lockstep
+    # so the parallel mapping survives — essential for the Fix 1
+    # teleport-merge pass below.
+    slot_order = sorted(range(len(slots)), key=lambda i: slots[i].x_center)
+    slots = [slots[i] for i in slot_order]
+    slot_to_group_indices = [slot_to_group_indices[i] for i in slot_order]
     for i, s in enumerate(slots):
         s.slot_id = i
+
+    # Build a dict keyed by the final post-sort slot_id.
+    slot_face_indices_by_id = {
+        s.slot_id: slot_to_group_indices[i] for i, s in enumerate(slots)
+    }
 
     registry = FaceRegistry(
         slots=slots,
@@ -713,10 +875,44 @@ def build_face_registry_with_embeddings(
             )
             return pos_reg
 
+    # ── Fix 1: teleport-merge pass ──
+    # Collapse embedding slots with similar mean_x + high cosine similarity.
+    # SFace over-splits stable identities under pose / lighting variation,
+    # producing slots that "teleport" across frame width. The merge pass
+    # uses the TRUE embedding-group membership (slot_face_indices_by_id)
+    # so per-slot centroids aren't contaminated by nearest-x reassignment
+    # — critical on stage clips where multiple identities traverse the
+    # same region and would otherwise get falsely merged.
+    slots = _merge_teleporting_embedding_slots(
+        slots, slot_face_indices_by_id, embeddings_norm,
+    )
+    # Re-apply to the registry object so downstream code sees the merged slots.
+    registry.slots = slots
+
     # Take max(embedding_count, position_count): whichever finds more identities wins.
     # Embeddings are the primary source of truth, but position-based may catch
     # speakers that the embedding clusterer missed (e.g., no embeddings available).
     pos_registry = build_face_registry(face_results, min_appearances)
+
+    # ── Fix 1: panel-aware arbitration ──
+    # When both methods run, prefer POSITION clusters if we're on a seated
+    # multi-speaker panel AND embedding clustering is fragmenting (producing
+    # substantially more slots than position clustering). Max-wins is wrong
+    # on panels because embedding splits happen on pose / lighting, not
+    # identity, and inflating the slot count cascades into misclassification
+    # (vlog vs multi_speaker_panel), mis-mapping speakers to phantom slots,
+    # and slot-snap being skipped as "continuous motion."
+    panel_mode = _detect_panel_mode(face_results)
+    if (panel_mode
+            and 2 <= len(pos_registry.slots) <= 6
+            and len(slots) > 1.8 * len(pos_registry.slots)):
+        logger.info(
+            "[FaceRegistry] panel_mode=True, pos=%d, emb=%d (fragmented) "
+            "— using position-based",
+            len(pos_registry.slots), len(slots),
+        )
+        return pos_registry
+
     if len(pos_registry.slots) > len(slots):
         logger.info(
             "Embedding registry found %d slots but position-based found %d — using position-based (max wins)",

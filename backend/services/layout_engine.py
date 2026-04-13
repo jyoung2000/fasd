@@ -429,6 +429,92 @@ def _plan_layout_impl(
     # frame means "wait", not "invent a saliency anchor".
     promote_preferred_to_required(regions, content_type=content_type)
 
+    # Fix 5: panel-aware short-shot override.
+    # For MULTI_SPEAKER_PANEL content, when a shot is <20 frames AND the
+    # active speaker is known for that shot's time range, skip the L1
+    # solver entirely and emit a static crop at the active-speaker
+    # slot's mean_x. Short cut-between-speakers shots were the dominant
+    # source of padded-fallback on the Verzuz run — 57%. A stationary
+    # crop on a known seat is always better than padded.
+    from backend.services.content_classifier import ClipContentType
+    from backend.services.camera_solver import (
+        ShotCamera as _ShotCamera,
+        CameraMode as _CameraMode,
+        CROP_ASPECT as _CROP_ASPECT,
+    )
+    is_panel = (
+        content_type == ClipContentType.MULTI_SPEAKER_PANEL
+        if content_type else False
+    )
+    _panel_short_shot_overrides: dict = {}
+    if is_panel and face_registry and getattr(face_registry, "slots", None):
+        _source_aspect = (
+            source_width / source_height if source_height > 0 else 16 / 9
+        )
+        _crop_half = (_CROP_ASPECT / _source_aspect) / 2.0
+
+        def _slot_center_normalized(slot_id: int):
+            for _s in face_registry.slots:
+                if _s.slot_id == slot_id:
+                    # FaceSlot.x_center is 0-100 percent; normalize to 0-1.
+                    return max(_crop_half, min(1.0 - _crop_half,
+                                                float(_s.x_center) / 100.0))
+            return None
+
+        def _active_slot_in_range(t_start: float, t_end: float):
+            if not active_speaker_events:
+                return None
+            # Pick the slot that covers the largest share of the shot.
+            coverage: dict = {}
+            for ev in active_speaker_events:
+                ov_start = max(t_start, ev.start)
+                ov_end = min(t_end, ev.end)
+                if ov_end > ov_start and ev.slot_id >= 0:
+                    coverage[ev.slot_id] = (
+                        coverage.get(ev.slot_id, 0.0) + (ov_end - ov_start)
+                    )
+            if not coverage:
+                return None
+            return max(coverage, key=coverage.get)
+
+        _panel_short_threshold_frames = 20
+        for _sh in shots:
+            _shot_duration = float(getattr(_sh, "end", 0.0)) - float(getattr(_sh, "start", 0.0))
+            if _shot_duration <= 0:
+                continue
+            # Count required-region frames inside this shot as "frames".
+            _shot_n = sum(
+                1 for regs in regions
+                if regs and _sh.start <= regs[0].timestamp <= _sh.end
+            )
+            if _shot_n >= _panel_short_threshold_frames:
+                continue
+            _active_slot = _active_slot_in_range(_sh.start, _sh.end)
+            if _active_slot is None:
+                continue
+            _cx_norm = _slot_center_normalized(_active_slot)
+            if _cx_norm is None:
+                continue
+            _panel_short_shot_overrides[_sh.index] = _ShotCamera(
+                shot_index=_sh.index,
+                start=_sh.start,
+                end=_sh.end,
+                mode=_CameraMode.STATIONARY,
+                keyframes=[
+                    (_sh.start, _cx_norm, 0.5),
+                    (_sh.end, _cx_norm, 0.5),
+                ],
+                reason=f"panel_short_shot_slot{_active_slot}",
+                zoom=1.0,
+            )
+        if _panel_short_shot_overrides:
+            logger.info(
+                "[%s] [Layout+Solver] panel short-shot override: %d shots "
+                "(< %d frames) mapped to active-speaker slot",
+                job_id, len(_panel_short_shot_overrides),
+                _panel_short_threshold_frames,
+            )
+
     # 3. Solve camera mode per shot (with content-type tuning)
     shot_cameras = solve_all_shots(
         shots, regions,
@@ -437,6 +523,15 @@ def _plan_layout_impl(
         content_type=content_type,
         job_id=job_id,
     )
+    # Fix 5: apply the precomputed panel short-shot overrides so they
+    # bypass the L1 solver entirely. Keeping the solve_all_shots call
+    # above lets us still log the full mode breakdown for the shots
+    # that DIDN'T qualify for the override.
+    if _panel_short_shot_overrides:
+        shot_cameras = [
+            _panel_short_shot_overrides.get(sc.shot_index, sc)
+            for sc in shot_cameras
+        ]
 
     # 4. Build LayoutSegments
     segments = []

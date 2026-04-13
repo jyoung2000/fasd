@@ -1042,15 +1042,46 @@ def map_speakers_to_face_slots(
     if not speaker_slot_votes:
         return {}
 
-    # Greedy assignment: speakers with most evidence first
-    result = {}
-    used_slots = set()
-    sorted_speakers = sorted(
-        speaker_slot_votes.keys(),
+    # Fix 4: confident-vote fast path.
+    # Before the hotfix, the greedy assignment dropped speakers to NONE
+    # when their top-voted slot was already claimed by an earlier
+    # speaker — even if the "claim" was a 0.4s vote and the dropped
+    # speaker had a 10.4s vote with 25× margin over runner-up. Result:
+    # two confident diarized speakers got "assigned slot NONE" in the
+    # Verzuz run and their airtime vanished from downstream routing.
+    #
+    # Policy: if a speaker's top vote is >= 3s absolute AND >= 2×
+    # runner-up, take it immediately — even if another speaker also
+    # wants that slot. Two speakers CAN share a slot legitimately
+    # (they sit close, or the registry fragmented real identities
+    # into overlapping slots). Unconfident speakers still go through
+    # the greedy path afterward with remaining slots.
+    result: dict = {}
+    used_slots: set = set()
+    confident_assignments: list = []
+
+    for speaker, slot_scores in speaker_slot_votes.items():
+        ordered = sorted(slot_scores.items(), key=lambda x: -x[1])
+        if not ordered:
+            continue
+        top_slot, top_score = ordered[0]
+        runner_score = ordered[1][1] if len(ordered) > 1 else 0.0
+        if top_score >= 3.0 and top_score >= 2.0 * runner_score:
+            result[speaker] = top_slot
+            used_slots.add(top_slot)
+            confident_assignments.append(speaker)
+
+    # Greedy assignment for the unconfident remainder: sort by total
+    # evidence, assign the best unused slot. Speakers without any
+    # unused slot stay unassigned (the original NONE behavior for the
+    # truly ambiguous cases only).
+    remaining = [sp for sp in speaker_slot_votes if sp not in result]
+    sorted_remaining = sorted(
+        remaining,
         key=lambda sp: sum(speaker_slot_votes[sp].values()),
         reverse=True,
     )
-    for speaker in sorted_speakers:
+    for speaker in sorted_remaining:
         slot_scores = speaker_slot_votes[speaker]
         for slot_id, _score in sorted(slot_scores.items(), key=lambda x: -x[1]):
             if slot_id not in used_slots:
@@ -1058,11 +1089,19 @@ def map_speakers_to_face_slots(
                 used_slots.add(slot_id)
                 break
 
-    logger.info("Speaker-to-slot mapping (dense face lip+size): %s", result)
+    logger.info(
+        "Speaker-to-slot mapping (dense face lip+size): %s "
+        "(confident=%d, greedy=%d)",
+        result, len(confident_assignments),
+        len(result) - len(confident_assignments),
+    )
     for sp, votes in speaker_slot_votes.items():
         top = sorted(votes.items(), key=lambda x: -x[1])[:3]
-        logger.info("  %s votes: %s → assigned slot %s",
-                    sp, top, result.get(sp, 'NONE'))
+        tag = "confident" if sp in confident_assignments else "greedy"
+        logger.info(
+            "  %s votes: %s → assigned slot %s (%s)",
+            sp, top, result.get(sp, 'NONE'), tag,
+        )
     return result
 
 

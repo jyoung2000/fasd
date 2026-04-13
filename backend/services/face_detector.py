@@ -646,16 +646,42 @@ def _verify_faces_in_results(results: list, frame_paths: list) -> list:
     # the face registry, which drops anime speakers below the saliency ceiling
     # and causes the crop to drift onto background motion.
     #
-    # Heuristic: if >50% of faces were rejected, this is almost certainly
-    # animated content. Reset every face back to is_human=True so the
-    # registry treats them all at full weight. Gated by the
-    # ALLOW_ANIMATED_AUTO_DETECT env var (default on) for rollback.
+    # Heuristic: if >50% of faces were rejected AND we have a reliable
+    # sample size, this is almost certainly animated content. Reset
+    # every face back to is_human=True so the registry treats them all
+    # at full weight. Gated by the ALLOW_ANIMATED_AUTO_DETECT env var
+    # (default on) for rollback.
+    #
+    # Fix 6: require at least MIN_FACES_FOR_ANIME_MODE verified faces
+    # before triggering. The sparse 60-frame pass was flipping AnimeMode
+    # on after seeing ~30 faces with 61% rejection — a statistical
+    # fluke driven by YuNet false positives, not a real anime signal.
+    # The dense 1212-frame pass then verified thousands of faces
+    # normally, but by then sparse-pass AnimeMode had already flipped
+    # is_human back to True for every face, polluting the registry
+    # weighting downstream. Gating on minimum sample size defers the
+    # decision to the dense pass where the statistics are reliable.
     import os as _os
     _allow_anim_auto = _os.environ.get(
         "ALLOW_ANIMATED_AUTO_DETECT", "true",
     ).lower() in ("true", "1", "yes")
+    MIN_FACES_FOR_ANIME_MODE = 100
     global ANIME_MODE_DETECTED
-    if _allow_anim_auto and verified > 0 and (non_human / verified) > 0.5:
+    rejection_rate = (non_human / verified) if verified > 0 else 0.0
+    if not _allow_anim_auto:
+        # Flag left as-is for rollback. Don't clobber.
+        pass
+    elif verified < MIN_FACES_FOR_ANIME_MODE:
+        logger.info(
+            "[AnimeMode] deferred: verified=%d < %d minimum for reliable "
+            "decision (rejection rate %.0f%%). AnimeMode decision will "
+            "be taken on the dense-pass call.",
+            verified, MIN_FACES_FOR_ANIME_MODE, rejection_rate * 100,
+        )
+        # Important: do NOT reset ANIME_MODE_DETECTED here — a previous
+        # (dense) call may already have set it to True, and a later
+        # sparse call should not unflip the reliable decision.
+    elif rejection_rate > 0.5:
         _restored = 0
         for fr in results:
             for face in fr.faces:
@@ -667,10 +693,15 @@ def _verify_faces_in_results(results: list, frame_paths: list) -> list:
         logger.info(
             "[AnimeMode] skipping human verifier, kept %d faces at weight=1.0 "
             "(rejection rate %.0f%% > 50%% — presumed animated content)",
-            verified, non_human / verified * 100,
+            verified, rejection_rate * 100,
         )
     else:
         ANIME_MODE_DETECTED = False
+        logger.info(
+            "[AnimeMode] not triggered: verified=%d, rejection rate %.0f%% "
+            "(<= 50%%)",
+            verified, rejection_rate * 100,
+        )
 
     return results
 

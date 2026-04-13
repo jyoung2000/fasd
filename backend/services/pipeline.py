@@ -624,6 +624,14 @@ async def run_analysis(job_id: str):
             _cancel_events.pop(job_id, None)
 
 
+# Fix 2: bimodality test for seated-panel subject_x distributions.
+# Extracted to backend.services.subject_motion so unit tests can import
+# it without pulling in fastapi / PIL / cv2 via the pipeline module.
+from backend.services.subject_motion import (
+    subject_xs_look_like_motion as _subject_xs_look_like_motion,
+)
+
+
 def _select_dominant_face(faces, last_x=None):
     """Pick the most prominent face from a list of FaceInfo objects.
 
@@ -1823,19 +1831,60 @@ async def _run_analysis_inner(job_id: str):
         # known face position. For multi-speaker, this eliminates dead-zone
         # values between speakers. SKIPPED for continuous-motion content
         # (cartoons, sports) where snapping destroys real position data.
-        _is_continuous = face_registry.is_continuous_motion if face_registry else False
+        # Fix 2: replace the coarse registry is_continuous_motion check
+        # with a bimodality test on the actual subject_x distribution.
+        # A seated 3-speaker panel has 2-4 histogram peaks even when the
+        # raw values span 0..100; the old check flagged that as motion
+        # and disabled slot snapping. If the bimodality test finds 1-4
+        # clear peaks we run slot snapping — and use the peak centers as
+        # the snap targets when face_registry is also fragmented.
+        _registry_says_motion = face_registry.is_continuous_motion if face_registry else False
+        _sxs = [s.subject_x for s in scenes_result] if scenes_result else []
+        _looks_motion, _peak_centers = _subject_xs_look_like_motion(_sxs)
+        # Final decision: if the bimodality test says NOT motion and we
+        # have plausible peaks, override the registry and run snap. Otherwise
+        # honor the registry's decision.
+        _is_continuous = _looks_motion if _peak_centers else _registry_says_motion
         if _is_continuous:
             logger.info(
                 "[%s] [SubjectTracking] Continuous motion detected — skipping slot snap (preserving raw positions)",
                 job_id,
             )
-        if face_registry and face_registry.slots and scenes_result and not _is_continuous and not _is_gameplay:
-            slot_centers = [s.x_center for s in face_registry.slots]
+        elif _registry_says_motion and not _looks_motion and _peak_centers:
+            logger.info(
+                "[%s] [SubjectTracking] registry=motion but subject_x bimodality "
+                "override: %d peak(s) at %s — running slot snap",
+                job_id, len(_peak_centers),
+                [round(p, 1) for p in _peak_centers],
+            )
+        if face_registry and scenes_result and not _is_continuous and not _is_gameplay:
+            # Prefer peak centers when the registry is empty OR fragmented
+            # into more slots than the bimodality peaks; otherwise use the
+            # registry slot centers. Peak centers are a reliable panel
+            # signal when face_registry.slots got over-split.
+            registry_centers = [s.x_center for s in face_registry.slots]
+            if (_peak_centers
+                    and 2 <= len(_peak_centers) <= 4
+                    and (not registry_centers
+                         or len(registry_centers) > len(_peak_centers) + 1)):
+                slot_centers = _peak_centers
+                logger.info(
+                    "[%s] [SubjectTracking] using %d bimodality peak(s) as snap "
+                    "targets (registry had %d slots)",
+                    job_id, len(_peak_centers), len(registry_centers),
+                )
+            else:
+                slot_centers = registry_centers
+            if not slot_centers:
+                # Nothing to snap to; skip the correction pass entirely.
+                slot_centers = []
             corrected = 0
             # For single-speaker, use a tighter threshold — any value far from
             # the one detected face is likely an AI error.
-            snap_threshold = 15 if face_registry.multi_speaker else 10
+            snap_threshold = 15 if (face_registry.multi_speaker or len(slot_centers) >= 2) else 10
             for scene in scenes_result:
+                if not slot_centers:
+                    break
                 sx = scene.subject_x
                 min_dist_to_slot = min(abs(sx - sc) for sc in slot_centers)
                 if min_dist_to_slot > snap_threshold:

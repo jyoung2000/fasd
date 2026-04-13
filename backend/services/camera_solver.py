@@ -685,10 +685,37 @@ def solve_all_shots(
         "short_bypass": 0,
         "median_fallback": 0,
     }
+    # Fix 5: padded-shot center inheritance.
+    # Track the most recent non-PADDED crop cx. When a shot falls through
+    # to PADDED, give it two keyframes at the previous shot's cx instead
+    # of default-centering at 0.5 (which yanks the crop back to the
+    # middle on every solver failure). Dramatically reduces visual
+    # disruption on clips with frequent short shots the LP rejects.
+    _last_cx_inherited: float | None = None
+    crop_half_width_solve = (CROP_ASPECT / source_aspect) / 2.0
     for shot in shots:
         camera = solve_shot(
             shot, regions_per_frame, source_aspect, params, job_id=job_id,
         )
+        if camera.mode == CameraMode.PADDED and _last_cx_inherited is not None:
+            inherited_cx = float(
+                max(crop_half_width_solve,
+                    min(1.0 - crop_half_width_solve, _last_cx_inherited))
+            )
+            camera = ShotCamera(
+                shot_index=camera.shot_index,
+                start=camera.start,
+                end=camera.end,
+                mode=CameraMode.STATIONARY,
+                keyframes=[
+                    (camera.start, inherited_cx, 0.5),
+                    (camera.end, inherited_cx, 0.5),
+                ],
+                reason=f"padded_inherited_cx_{inherited_cx:.3f}",
+                zoom=1.0,
+            )
+        if camera.mode != CameraMode.PADDED and camera.keyframes:
+            _last_cx_inherited = float(camera.keyframes[-1][1])
         results.append(camera)
         mode_counts[camera.mode.value] = mode_counts.get(camera.mode.value, 0) + 1
         # Parse status out of the reason string (encoded by solve_shot
