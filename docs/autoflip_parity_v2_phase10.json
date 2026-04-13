@@ -1,11 +1,11 @@
 {
   "schema": "autoflip_parity_v2_rollup/1",
-  "generated_at": "2026-04-13T16:09:03.226127+00:00",
+  "generated_at": "2026-04-13T16:54:21.927045+00:00",
   "fixture_count": 7,
   "combos": [
     {
       "schema": "autoflip_parity_v2_results/1",
-      "generated_at": "2026-04-13T16:08:50.763020+00:00",
+      "generated_at": "2026-04-13T16:54:08.564606+00:00",
       "dry_run": false,
       "fixture_count": 7,
       "results": [
@@ -274,7 +274,7 @@
     },
     {
       "schema": "autoflip_parity_v2_results/1",
-      "generated_at": "2026-04-13T16:08:52.653980+00:00",
+      "generated_at": "2026-04-13T16:54:10.497452+00:00",
       "dry_run": false,
       "fixture_count": 7,
       "results": [
@@ -592,7 +592,7 @@
     },
     {
       "schema": "autoflip_parity_v2_results/1",
-      "generated_at": "2026-04-13T16:08:54.371877+00:00",
+      "generated_at": "2026-04-13T16:54:12.434941+00:00",
       "dry_run": false,
       "fixture_count": 7,
       "results": [
@@ -910,7 +910,7 @@
     },
     {
       "schema": "autoflip_parity_v2_results/1",
-      "generated_at": "2026-04-13T16:08:56.073750+00:00",
+      "generated_at": "2026-04-13T16:54:14.282605+00:00",
       "dry_run": false,
       "fixture_count": 7,
       "results": [
@@ -1228,7 +1228,7 @@
     },
     {
       "schema": "autoflip_parity_v2_results/1",
-      "generated_at": "2026-04-13T16:08:57.789431+00:00",
+      "generated_at": "2026-04-13T16:54:16.152989+00:00",
       "dry_run": false,
       "fixture_count": 7,
       "results": [
@@ -1546,7 +1546,7 @@
     },
     {
       "schema": "autoflip_parity_v2_results/1",
-      "generated_at": "2026-04-13T16:08:59.609415+00:00",
+      "generated_at": "2026-04-13T16:54:18.115950+00:00",
       "dry_run": false,
       "fixture_count": 7,
       "results": [
@@ -1864,7 +1864,7 @@
     },
     {
       "schema": "autoflip_parity_v2_results/1",
-      "generated_at": "2026-04-13T16:09:01.450411+00:00",
+      "generated_at": "2026-04-13T16:54:20.004741+00:00",
       "dry_run": false,
       "fixture_count": 7,
       "results": [
@@ -2182,7 +2182,7 @@
     },
     {
       "schema": "autoflip_parity_v2_results/1",
-      "generated_at": "2026-04-13T16:09:03.148715+00:00",
+      "generated_at": "2026-04-13T16:54:21.856275+00:00",
       "dry_run": false,
       "fixture_count": 7,
       "results": [

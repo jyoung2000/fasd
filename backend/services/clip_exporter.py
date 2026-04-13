@@ -2633,6 +2633,26 @@ def _dense_face_detection_for_clip(
         return keyframes
 
 
+def _keyframes_from_cached_render_plan(
+    cached_plan: dict,
+    clip_start: float,
+    clip_end: float,
+) -> list[tuple[float, int]] | None:
+    """Thin wrapper around ``render_plan_keyframes.keyframes_from_cached_render_plan``.
+
+    Kept as a module-level alias so the call sites in ``export_clip``
+    stay unchanged and the test suite can import the helper without
+    pulling in the rest of ``clip_exporter``'s heavyweight dependency
+    graph (cv2 / MediaPipe / ffmpeg / pydantic_settings).
+    """
+    from backend.services.render_plan_keyframes import (
+        keyframes_from_cached_render_plan,
+    )
+    return keyframes_from_cached_render_plan(
+        cached_plan, clip_start=clip_start, clip_end=clip_end,
+    )
+
+
 def _extract_render_plan_segments(scenes: list):
     """Extract lightweight segment objects from SceneDescription data for the RenderPlan builder.
 
@@ -6471,7 +6491,83 @@ async def export_clip(
                         clip_id, subject_x,
                     )
 
-            elif subject_scenes and aspect_ratio and not all_tracking_off and not _using_solver_keyframes:
+            # ── Phase 10 follow-up: cached RenderPlan keyframes ──
+            #
+            # The preview player reads ``job.render_plan`` verbatim via
+            # ``GET /api/jobs/{id}/render_plan``. That cached dict is
+            # built from the full-fidelity ``ReframeSegment`` list at
+            # pipeline time and carries ``motion_path`` for walking
+            # vlog subjects, anime action pans, and any other Stage 10
+            # L1-solver-smoothed camera moves. The legacy export path
+            # re-derives its own RenderPlan from the stripped
+            # ``SceneDescription`` list (see
+            # ``_extract_render_plan_segments``) which hard-codes
+            # ``motion_path=None`` and so every tracking_crop
+            # degrades to a static crop in the MP4.
+            #
+            # This branch closes the preview/export parity gap for
+            # VLOG content (``allow_motion_tracking=True``). It runs
+            # only when none of the higher-priority keyframe sources
+            # fired, so solver keyframes and the Canvas frontend
+            # override both still win.
+            _using_cached_render_plan_keyframes = False
+            if (not _using_solver_keyframes
+                    and not _using_frontend_keyframes
+                    and aspect_ratio
+                    and not all_tracking_off
+                    and job_id
+                    and keyframes is None):
+                try:
+                    _job_for_rp = await database.load_job(job_id)
+                    _cached_rp_dict = (
+                        getattr(_job_for_rp, "render_plan", None)
+                        if _job_for_rp
+                        else None
+                    )
+                    if _cached_rp_dict:
+                        _rp_kfs = _keyframes_from_cached_render_plan(
+                            _cached_rp_dict,
+                            clip_start=start,
+                            clip_end=end,
+                        )
+                        if _rp_kfs and len(_rp_kfs) >= 2:
+                            keyframes = _rp_kfs
+                            _using_cached_render_plan_keyframes = True
+                            logger.info(
+                                "[SubjectTracking] clip %s: Using %d keyframes "
+                                "from cached RenderPlan (motion_path preserved — "
+                                "preview/export parity)",
+                                clip_id, len(keyframes),
+                            )
+                            for kf_t, kf_x in keyframes[:5]:
+                                logger.info("  t=%.1fs x=%d%%", kf_t, kf_x)
+                            if len(keyframes) > 5:
+                                logger.info("  ... (%d more)", len(keyframes) - 5)
+
+                            # Collapse to static when every keyframe has
+                            # the same x, matching the other keyframe
+                            # tiers' behaviour.
+                            unique_x = set(kf[1] for kf in keyframes)
+                            if len(unique_x) <= 1:
+                                subject_x = keyframes[0][1]
+                                keyframes = None
+                                logger.info(
+                                    "[SubjectTracking] clip %s: cached RenderPlan "
+                                    "keyframes all sx=%d — static crop",
+                                    clip_id, subject_x,
+                                )
+                except Exception as _rp_kf_err:
+                    logger.warning(
+                        "[SubjectTracking] clip %s: cached RenderPlan keyframe "
+                        "extraction failed (%s), falling back to SceneDescription",
+                        clip_id, _rp_kf_err,
+                    )
+                    _using_cached_render_plan_keyframes = False
+
+            if (subject_scenes and aspect_ratio and not all_tracking_off
+                    and not _using_solver_keyframes
+                    and not _using_frontend_keyframes
+                    and not _using_cached_render_plan_keyframes):
                 # ── PHASE 0: Build raw keyframes ──
                 raw_kf = _build_subject_keyframes(subject_scenes, start, end, src_ratio=_src_ratio, target_ratio=_target_ratio)
 
