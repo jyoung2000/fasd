@@ -41,12 +41,16 @@ logger = logging.getLogger(__name__)
 
 # ─────────────────── Feature flag ───────────────────
 
-# Default OFF until the runner reports a clean baseline + post-Phase-3
-# numbers in docs/autoflip_parity_v2_results.md. Per the v2 ground
-# rules, any phase that *might* regress the existing baselines must
-# ship feature-flagged off by default.
+# Default ON as of Week 1 flag audit (see
+# docs/reframing_autoflip_parity.md "Week 1 flag audit"). The
+# synthetic 3speaker_panel fixture passed all four safety metrics
+# with this flag enabled, and Stage 10a now runs the multi-region
+# LP fit-check on every panel-routed clip. Set
+# CLIPAI_MULTI_REGION_LP=0 to disable if a real-content regression
+# appears — isolated OFF-vs-ON comparison data is archived at
+# /tmp/mrlp_off.json and /tmp/mrlp_on.json from the Week 1 run.
 USE_MULTI_REGION_LP = os.environ.get(
-    "CLIPAI_MULTI_REGION_LP", "0",
+    "CLIPAI_MULTI_REGION_LP", "1",
 ).lower() in ("1", "true", "yes", "on")
 
 

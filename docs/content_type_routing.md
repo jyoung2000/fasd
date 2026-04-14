@@ -269,24 +269,46 @@ Notes:
 
 ## Feature flag inventory
 
-Every v2 feature ships behind a flag that defaults OFF. The
-in-docker validation run (Phase 10 follow-up) captures the
-post-flag-ON numbers and, if no regression, flips the flag
-defaults.
+Every v2 feature ships behind a flag. The ``Code default`` column is
+the value used when the env var is unset; ``Effective?`` tells you
+whether flipping the flag actually changes runtime behavior. A flag
+is "Yes (live)" when its module has ≥1 production call site outside
+its defining file; it is "No (dormant)" when the module is defined
+but no other pipeline code invokes it.
 
-| Flag | Phase | Default | Gates |
-|---|---|---|---|
-| `USE_CONTENT_AWARE_REFRAME` | 0+ | OFF | per-content-type tuning in the segmenter (Stage 8 lead-room, etc) |
-| `CLIPAI_MULTI_REGION_LP` | 3 | OFF | Stage 10a multi-region LP fit-check |
-| `CLIPAI_GAZE_LEAD_ROOM_V2` | 4 | OFF | Stage 8 + Stage 10c continuous-yaw lead room |
-| `CLIPAI_THIRDS_BIAS` | 4 | OFF | Stage 8 + Stage 10c thirds offset |
-| `CLIPAI_MUSIC_BEAT_SNAP` | 5 | OFF | Stage 11 music-video beat snap + pulse cuts |
-| `CLIPAI_ANIME_SHOT_DETECTOR` | 6 | OFF | (future wiring) anime shot detector in `shot_detector.py` |
-| `CLIPAI_ANIME_FACE_DETECTOR` | 6 | OFF | (future wiring) anime face detector in the dense face pipeline |
-| `CLIPAI_ANIME_ANCHOR` | 6 | OFF | Stage 7b anime saliency anchor override |
-| `CLIPAI_ANIME_CHARACTER_CLUSTERING` | 6 follow-up | OFF | (future wiring) face_registry cross-cut re-id |
-| `CLIPAI_GAMEPLAY_TRACKER` | 7 | OFF | Stage 7c gameplay subject tracker override |
-| `CLIPAI_EDITORIAL_PRIOR` | 8 | OFF | Stage 9b editorial J/L cuts + listener holds + reaction beats |
+Last reconciled: Week 1 flag audit (post-v4 universal reframing).
+See ``docs/reframing_autoflip_parity.md`` "Week 1 flag audit" section
+for the validation record.
+
+| Flag | Phase | Code default | Effective? | Gates |
+|---|---|---|---|---|
+| `USE_CONTENT_AWARE_REFRAME` | 0+ | ON | Yes (live) | per-content-type tuning in the segmenter (Stage 8 lead-room, etc) |
+| `CLIPAI_MULTI_REGION_LP` | 3 | ON (Week 1) | Yes (live) | Stage 10a multi-region LP fit-check |
+| `CLIPAI_GAZE_LEAD_ROOM_V2` | 4 | ON | Yes (live) | Stage 8 + Stage 10c continuous-yaw lead room |
+| `CLIPAI_THIRDS_BIAS` | 4 | ON | Yes (live) | Stage 8 + Stage 10c thirds offset |
+| `CLIPAI_MUSIC_BEAT_SNAP` | 5 | ON | Yes (live) | Stage 11 music-video beat snap + pulse cuts |
+| `CLIPAI_ANIME_SHOT_DETECTOR` | 6 | OFF | **No (dormant)** | module defined but 0 production call sites; Week 2 wires it into `shot_detector.py` |
+| `CLIPAI_ANIME_FACE_DETECTOR` | 6 | OFF | **No (dormant)** | module defined but 0 production call sites; Week 2 wires it into `face_detector.py` |
+| `CLIPAI_ANIME_ANCHOR` | 6 | ON | Yes (live) | Stage 7b anime saliency anchor override (pipeline.py + reframe_segmenter.py) |
+| `CLIPAI_ANIME_CHARACTER_CLUSTERING` | 6 follow-up | OFF | **No (dormant)** | module defined but 0 production call sites; Week 2 wires it into `face_registry.py` |
+| `CLIPAI_GAMEPLAY_TRACKER` | 7 | ON | Yes (live) | Stage 7c gameplay subject tracker override |
+| `CLIPAI_EDITORIAL_PRIOR` | 8 | ON | Yes (live) | Stage 9b editorial J/L cuts + listener holds + reaction beats |
+
+### Dormant code warning
+
+The three flags marked **No (dormant)** are gates on modules that
+exist in ``backend/services/`` but are not called from anywhere in
+the pipeline (grep for their public symbols returns only the defining
+module, the ``validate_v2_phases.py`` env-var setup, and per-module
+unit tests). Flipping them has no runtime effect today. The Week 2
+plan (``week2_anime_wiring_and_sports_subtype.md``) wires them. Until
+then, anime content relies on ``CLIPAI_ANIME_ANCHOR`` (saliency-based
+fallback) for subject tracking.
+
+The regression guard ``backend/tests/test_dormant_flags_labeled.py``
+asserts zero call sites for each dormant module, so any future commit
+that wires one will fail the test and force a coordinated update
+(flip the default + update this table + run ``validate_v2_phases``).
 
 ---
 
