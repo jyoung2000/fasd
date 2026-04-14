@@ -1132,54 +1132,65 @@ async def _run_analysis_inner(job_id: str):
         except Exception as e:
             logger.warning("[%s] Face detection failed (non-fatal): %s", job_id, e)
 
+    # ── Early anime hint (Week 2 Part A) ──
+    # Hoisted ABOVE the dense-pass gate so a pure-anime job (where the
+    # sparse FaceMesh pass returned ~zero faces) can still enter the
+    # dense block via the cascade-augmentation path. The hint controls
+    # whether detect_faces_dense runs its lbpcascade anime augmentation
+    # pass alongside the main YuNet / FaceMesh detectors. Sources, in
+    # priority order:
+    #   1. User dropdown override (`anime` / `cartoon`) — the most
+    #      reliable signal; trust it immediately.
+    #   2. ANIME_MODE_DETECTED — flipped by the sparse pass above when
+    #      the human-pose verifier rejected >50% of detections. Fires
+    #      for stylized content even when the user didn't pick anime
+    #      from the dropdown.
+    # When neither hint is available, the first dense pass runs
+    # live-action-only and the re-run fallback below (after
+    # classify_content) picks up the slack.
+    _early_anime_hint = False
+    try:
+        from backend.services.face_detector import ANIME_MODE_DETECTED
+    except ImportError:
+        ANIME_MODE_DETECTED = False
+    try:
+        from backend.services.content_type_strings import (
+            normalize_ui_content_type,
+        )
+        _early_ct_override = getattr(
+            job, "content_type_override", "",
+        ) or ""
+        _norm_early = (
+            normalize_ui_content_type(_early_ct_override)
+            if _early_ct_override else None
+        )
+        if _norm_early and _norm_early.is_animated:
+            _early_anime_hint = True
+            logger.info(
+                "[%s] Early anime hint = True (user override=%s)",
+                job_id, _norm_early.raw,
+            )
+    except Exception:
+        pass
+    if not _early_anime_hint and ANIME_MODE_DETECTED:
+        _early_anime_hint = True
+        logger.info(
+            "[%s] Early anime hint = True (ANIME_MODE_DETECTED)",
+            job_id,
+        )
+
     # ── Dense face detection (1fps, CPU-only) ──
     # Runs on CPU, no GPU conflict. For 4K VP9 this can take 3-5 minutes.
-    if settings.SUBJECT_TRACKING_ENABLED and face_results:
+    # Gate: enter the dense pass when EITHER the sparse pass found faces
+    # OR the early anime hint is set. On pure-anime content the sparse
+    # FaceMesh / YuNet pass commonly returns ~zero faces (the human-
+    # trained models reject stylized characters), and the dense pass
+    # is the only place that runs the lbpcascade_animeface augmentation
+    # — so without this gate-loosening, animated jobs got 0 dense face
+    # tracking and the L1 solver had no per-second face anchors.
+    if settings.SUBJECT_TRACKING_ENABLED and (face_results or _early_anime_hint):
         try:
-            from backend.services.face_detector import (
-                detect_faces_dense,
-                ANIME_MODE_DETECTED,
-            )
-
-            # ── Early anime hint (Week 2 Part A) ──
-            # The hint controls whether detect_faces_dense runs its
-            # lbpcascade anime augmentation pass alongside the main
-            # YuNet / FaceMesh detectors. Sources, in priority order:
-            #   1. User dropdown override (`anime` / `cartoon`) — the
-            #      most reliable signal; trust it immediately.
-            #   2. ANIME_MODE_DETECTED — flipped by the sparse pass
-            #      above when the human-pose verifier rejected >50%
-            #      of detections. Fires for stylized content even
-            #      when the user didn't pick anime from the dropdown.
-            # When neither hint is available, the first dense pass
-            # runs live-action-only and the re-run fallback below
-            # (after classify_content) picks up the slack.
-            _early_anime_hint = False
-            try:
-                from backend.services.content_type_strings import (
-                    normalize_ui_content_type,
-                )
-                _early_ct_override = getattr(
-                    job, "content_type_override", "",
-                ) or ""
-                _norm_early = (
-                    normalize_ui_content_type(_early_ct_override)
-                    if _early_ct_override else None
-                )
-                if _norm_early and _norm_early.is_animated:
-                    _early_anime_hint = True
-                    logger.info(
-                        "[%s] Early anime hint = True (user override=%s)",
-                        job_id, _norm_early.raw,
-                    )
-            except Exception:
-                pass
-            if not _early_anime_hint and ANIME_MODE_DETECTED:
-                _early_anime_hint = True
-                logger.info(
-                    "[%s] Early anime hint = True (ANIME_MODE_DETECTED)",
-                    job_id,
-                )
+            from backend.services.face_detector import detect_faces_dense
 
             video_duration = metadata.get("duration", 0)
             dense_sample_rate = settings.DENSE_FACE_SAMPLE_RATE

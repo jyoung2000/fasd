@@ -197,10 +197,19 @@ def _spans_for_metric(segments: list) -> list[tuple[float, float]]:
 
 # ─────────────── Per-fixture scoring ──────────────────────────
 
+# Acceptance SLAs for the --animated mode (Phase 6).
+ANIMATED_SLA = {
+    "dense_ratio_min": 0.30,
+    "mean_err_max": 4.0,
+    "p95_err_max": 8.0,
+}
+
+
 def score_one(
     spec: FixtureSpec,
     *,
     dry_run: bool = False,
+    animated: bool = False,
 ) -> dict:
     """Score a single fixture and return a JSON-friendly dict."""
 
@@ -270,6 +279,44 @@ def score_one(
     base["actual_switches"] = len(actual_switches)
     base["actual_boundaries"] = len(actual_boundaries)
     base["metrics"] = metrics_output
+
+    if animated:
+        anim = _animated_summary(spec, segments)
+        base["animated"] = anim
+        # Emit the one-line summary on stderr for CI parsing.
+        print(
+            "[anime-parity] dense_ratio=%.2f tracking_pct=%d%% "
+            "mean_err=%.1f%% p95_err=%.1f%%" % (
+                anim["dense_ratio"],
+                int(round(anim["tracking_pct"] * 100)),
+                anim["mean_err"],
+                anim["p95_err"],
+            ),
+            file=sys.stderr,
+        )
+        # SLA assertions: dense ratio and per-frame error caps.
+        sla_failures: list[str] = []
+        if anim["dense_ratio"] < ANIMATED_SLA["dense_ratio_min"]:
+            sla_failures.append(
+                f"dense_ratio={anim['dense_ratio']:.2f} < "
+                f"{ANIMATED_SLA['dense_ratio_min']:.2f}"
+            )
+        if anim["mean_err"] > ANIMATED_SLA["mean_err_max"]:
+            sla_failures.append(
+                f"mean_err={anim['mean_err']:.2f} > "
+                f"{ANIMATED_SLA['mean_err_max']:.2f}"
+            )
+        if anim["p95_err"] > ANIMATED_SLA["p95_err_max"]:
+            sla_failures.append(
+                f"p95_err={anim['p95_err']:.2f} > "
+                f"{ANIMATED_SLA['p95_err_max']:.2f}"
+            )
+        if sla_failures:
+            base["sla_status"] = "failed"
+            base["sla_failures"] = sla_failures
+        else:
+            base["sla_status"] = "passed"
+
     return base
 
 
@@ -285,22 +332,166 @@ def _gt_summary(gt: GroundTruth) -> dict:
     }
 
 
+def _animated_summary(spec: FixtureSpec, segments: list) -> dict:
+    """Phase 6 — compute the anime-parity SLA report for an animated fixture.
+
+    Walks the resulting segments and the fixture's dense face track to
+    measure:
+
+    - ``dense_ratio``  : fraction of dense-face frames that have at
+      least one face — proxy for how well the cascade augmentation
+      ran (target: ≥ 0.30).
+    - ``tracking_pct`` : fraction of segments with strategy=tracking
+      or panning — proxy for Phase 5's intra-shot motion override.
+    - ``mean_err``     : per-frame face-center error as % of frame
+      width (target: ≤ 4.0%).
+    - ``p95_err``      : 95th percentile of the same metric.
+
+    Returns a dict of metric name → numeric value.
+    """
+    if not segments:
+        return {
+            "dense_ratio": 0.0,
+            "tracking_pct": 0.0,
+            "mean_err": 0.0,
+            "p95_err": 0.0,
+            "by_strategy": {},
+        }
+
+    # ── Strategy mix ──
+    by_strategy: dict[str, int] = {}
+    n_tracking = 0
+    for seg in segments:
+        strat = getattr(seg, "strategy", "stationary") or "stationary"
+        by_strategy[strat] = by_strategy.get(strat, 0) + 1
+        if strat in ("tracking", "panning"):
+            n_tracking += 1
+    tracking_pct = (n_tracking / len(segments)) if segments else 0.0
+
+    # ── Dense face ratio ──
+    kwargs = spec.build()
+    dense_faces = kwargs.get("dense_faces") or []
+    if dense_faces:
+        with_faces = sum(
+            1 for df in dense_faces
+            if getattr(df, "faces", None)
+        )
+        dense_ratio = with_faces / len(dense_faces)
+    else:
+        dense_ratio = 0.0
+
+    # ── Per-frame face-center error ──
+    # For each dense face frame, find the segment that owns it and
+    # compute |face_nose_x - segment.crop_center|. Skip frames with no
+    # face. We subtract the per-segment MEAN offset (thirds-bias /
+    # lead-room) so the metric measures whether the path's MOTION
+    # tracks the face's motion, not the absolute centering. Without
+    # this subtraction the legitimate Phase 4 V2 thirds-bias would
+    # show up as ~6% of constant error and falsely fail the SLA.
+    raw_pairs: list[tuple[object, float, float, float]] = []
+    err_by_strategy: dict[str, list[float]] = {}
+    for df in dense_faces:
+        ts = float(getattr(df, "timestamp", -1.0))
+        faces = getattr(df, "faces", None) or []
+        if not faces:
+            continue
+        # Pick the first face's nose_x as the reference target.
+        nose_x = None
+        for face in faces:
+            nx = getattr(face, "nose_x", None)
+            if nx is not None:
+                nose_x = float(nx)
+                break
+        if nose_x is None:
+            continue
+        # Find owning segment
+        owning = None
+        for seg in segments:
+            if float(seg.start) <= ts < float(seg.end):
+                owning = seg
+                break
+        if owning is None:
+            continue
+        # For tracking / panning segments the per-frame crop center
+        # is the motion_path entry nearest to the timestamp; for
+        # stationary segments fall back to subject_x.
+        sx_px: float
+        motion_path = getattr(owning, "motion_path", None) or []
+        if motion_path:
+            best_entry = min(
+                motion_path,
+                key=lambda entry: abs(float(entry[0]) - ts),
+            )
+            sx_px = float(best_entry[1])
+        else:
+            sx_px = float(getattr(owning, "subject_x", spec.source_width / 2.0))
+        sx_pct = sx_px / max(spec.source_width, 1) * 100.0
+        raw_pairs.append((owning, ts, nose_x, sx_pct))
+
+    # Compute per-segment mean offset and subtract so we measure path
+    # SHAPE (not constant lead-room / thirds-bias absolute offset).
+    by_seg: dict[int, list[tuple[float, float]]] = {}
+    for owning, _ts, nose_x, sx_pct in raw_pairs:
+        by_seg.setdefault(id(owning), []).append((nose_x, sx_pct))
+    seg_offset: dict[int, float] = {}
+    for sid, pairs in by_seg.items():
+        # mean of (sx_pct - nose_x) — this is the constant bias the
+        # post-process applied.
+        offs = [b - a for a, b in pairs]
+        seg_offset[sid] = sum(offs) / len(offs) if offs else 0.0
+
+    errors_pct: list[float] = []
+    for owning, _ts, nose_x, sx_pct in raw_pairs:
+        offset = seg_offset.get(id(owning), 0.0)
+        err = abs(nose_x - (sx_pct - offset))
+        errors_pct.append(err)
+        strat = getattr(owning, "strategy", "stationary") or "stationary"
+        err_by_strategy.setdefault(strat, []).append(err)
+
+    if errors_pct:
+        errors_sorted = sorted(errors_pct)
+        mean_err = sum(errors_sorted) / len(errors_sorted)
+        p95_idx = max(0, int(0.95 * (len(errors_sorted) - 1)))
+        p95_err = errors_sorted[p95_idx]
+    else:
+        mean_err = 0.0
+        p95_err = 0.0
+
+    summary_by_strategy = {
+        s: round(sum(v) / max(len(v), 1), 3)
+        for s, v in err_by_strategy.items()
+    }
+
+    return {
+        "dense_ratio": round(dense_ratio, 3),
+        "tracking_pct": round(tracking_pct, 3),
+        "mean_err": round(mean_err, 3),
+        "p95_err": round(p95_err, 3),
+        "by_strategy": {
+            "counts": by_strategy,
+            "mean_err_pct": summary_by_strategy,
+        },
+    }
+
+
 # ─────────────── Top-level runner ─────────────────────────────
 
 def run_all(
     fixture_names: Optional[list[str]] = None,
     *,
     dry_run: bool = False,
+    animated: bool = False,
 ) -> dict:
     names = fixture_names if fixture_names else list_fixture_names()
     rows = []
     for name in names:
         spec = get_fixture(name)
-        rows.append(score_one(spec, dry_run=dry_run))
+        rows.append(score_one(spec, dry_run=dry_run, animated=animated))
     return {
         "schema": "autoflip_parity_v2_results/1",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "dry_run": dry_run,
+        "animated": animated,
         "fixture_count": len(rows),
         "results": rows,
     }
@@ -350,6 +541,15 @@ def _build_argparser() -> argparse.ArgumentParser:
         action="store_true",
         help="Suppress info-level logs.",
     )
+    p.add_argument(
+        "--animated",
+        action="store_true",
+        help=(
+            "Phase 6 anime SLA mode. Asserts dense-face ratio ≥ 0.30, "
+            "mean per-frame face error ≤ 4%, p95 ≤ 8%, and prints a "
+            "[anime-parity] one-line summary suitable for CI."
+        ),
+    )
     return p
 
 
@@ -367,7 +567,9 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(f"{name:30s} {spec.description}")
         return 0
 
-    payload = run_all(args.fixture, dry_run=args.dry_run)
+    payload = run_all(
+        args.fixture, dry_run=args.dry_run, animated=args.animated,
+    )
     if args.phase:
         payload["phase"] = args.phase
 

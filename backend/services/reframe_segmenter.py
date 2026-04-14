@@ -58,6 +58,69 @@ EASE_SPEAKER_TURN_MS = 200
 EASE_SUBJECT_WALK_MS = 250
 
 
+def intra_shot_face_motion_pct(
+    dense_faces: list,
+    slot_id,
+    start: float,
+    end: float,
+) -> float:
+    """Return ``max(nose_x) - min(nose_x)`` across dense faces in a shot.
+
+    Phase 5 — used by the segmenter to decide whether a `stationary`
+    L1 result should be overridden to `tracking`. Returns 0.0 when
+    there are no dense face samples in the time range.
+
+    Args:
+        dense_faces: list[FrameFaces] from dense face detection.
+        slot_id: the active slot id, or None to consider any face.
+        start, end: shot time range in seconds.
+
+    Returns:
+        The face motion within the shot, in *percent of frame width*.
+    """
+    if not dense_faces or end <= start:
+        return 0.0
+    xs: list[float] = []
+    for df in dense_faces:
+        ts = float(getattr(df, "timestamp", -1.0))
+        if ts < start or ts >= end:
+            continue
+        for face in getattr(df, "faces", []) or []:
+            sid = getattr(face, "identity_id", -1)
+            if slot_id is not None and sid != slot_id:
+                continue
+            nx = getattr(face, "nose_x", None)
+            if nx is None:
+                continue
+            xs.append(float(nx))
+            break
+    if len(xs) < 2:
+        return 0.0
+    return max(xs) - min(xs)
+
+
+def should_force_tracking_for_motion(
+    dense_faces: list,
+    slot_id,
+    start: float,
+    end: float,
+    *,
+    motion_pct_threshold: float = 6.0,
+    min_shot_seconds: float = 1.0,
+) -> bool:
+    """True when intra-shot face motion exceeds the override threshold.
+
+    Phase 5 — when a shot's L1 solver result is `stationary` but the
+    underlying face panned across the frame by more than
+    ``motion_pct_threshold`` percent of frame width AND the shot is
+    at least ``min_shot_seconds`` long, override to `tracking` so
+    the L1 solver's per-frame anchors actually drive the camera.
+    """
+    if (end - start) < min_shot_seconds:
+        return False
+    return intra_shot_face_motion_pct(dense_faces, slot_id, start, end) > motion_pct_threshold
+
+
 def _is_formation_frame(
     frame_faces,
     min_faces: int = 3,
@@ -1476,6 +1539,13 @@ def build_reframe_segments(
                     source_height=source_height,
                     lam=_shot_lam_frac * source_width,
                     job_id=job_id,
+                    # Phase 4: animated content with a populated dense
+                    # face track switches the L1 unary from the
+                    # propagated slot center to per-frame nose_x with a
+                    # higher data-fidelity weight. Gated to anime so
+                    # live-action behavior is unchanged.
+                    is_animated=bool(_is_animated_content),
+                    dense_faces_for_anchors=dense_faces if _is_animated_content else None,
                 )
             except Exception as shot_exc:
                 # A single shot failing must not abort Stage 10 — skip
@@ -1492,7 +1562,37 @@ def build_reframe_segments(
                 seg = raw_segments[seg_i]
                 seg.strategy = result["mode"]
 
-                if result["mode"] == "stationary":
+                # Phase 5: Force tracking on intra-shot face motion.
+                # On animated content the L1 solver sometimes settles
+                # on `stationary` for a shot whose face pans across
+                # the frame — the face center error within close-ups
+                # is what makes the subject drift off-center. Override
+                # to `tracking` (and reuse the L1 path) when the dense
+                # face data shows >6% intra-shot motion.
+                if (
+                    result["mode"] == "stationary"
+                    and _is_animated_content
+                    and dense_faces
+                    and should_force_tracking_for_motion(
+                        dense_faces, seg.active_slot, seg.start, seg.end,
+                    )
+                ):
+                    if result.get("path"):
+                        seg.strategy = "tracking"
+                        seg.subject_x = result["path"][0][1]
+                        seg.motion_path = result["path"]
+                    elif result.get("center") is not None:
+                        # Solver collapsed to a constant; build a flat
+                        # motion_path so downstream tracking-aware
+                        # post-processing fires.
+                        seg.strategy = "tracking"
+                        center = float(result["center"])
+                        seg.subject_x = center
+                        seg.motion_path = [
+                            (float(seg.start), center),
+                            (float(seg.end), center),
+                        ]
+                elif result["mode"] == "stationary":
                     # Keep face-registry-based subject_x (more stable)
                     pass
                 elif result["mode"] in ("tracking", "panning"):

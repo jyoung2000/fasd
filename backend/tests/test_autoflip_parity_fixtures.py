@@ -46,11 +46,12 @@ REQUIRED_KEYS = {
 # ───────────────── Registry-level invariants ─────────────────
 
 class TestRegistryInvariants:
-    def test_seven_fixtures_present(self):
-        # The Phase 9 spec calls out 7 fixtures. If a future contributor
-        # drops one or adds without updating the docs table, this
-        # tripwire fires.
-        assert len(FIXTURES) == 7
+    def test_eight_fixtures_present(self):
+        # The Phase 9 spec calls out 7 fixtures; the anime reframe gap
+        # close added an 8th (anime_panning_close_up). If a future
+        # contributor drops one or adds without updating the docs
+        # table, this tripwire fires.
+        assert len(FIXTURES) == 8
 
     def test_every_spec_in_registry_matches_its_key(self):
         for key, spec in FIXTURES.items():

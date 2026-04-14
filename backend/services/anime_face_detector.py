@@ -79,12 +79,27 @@ DEFAULT_CASCADE_PATH = os.path.join(
 
 # Minimum face size as a fraction of frame width. Anime cuts often
 # have full-frame face close-ups — the lower bound on bbox size
-# kills false positives from background characters.
-MIN_FACE_FRAC = 0.05
+# kills false positives from background characters. Phase 3
+# loosened from 0.05 → 0.025 so profile shots, 3/4 turns, and
+# medium-distance characters survive (0.05 of 1080p is a 96px
+# floor — anything smaller fell off a cliff).
+MIN_FACE_FRAC = 0.025
 
 # Max face size as a fraction of frame width. Anything larger is
 # almost certainly a foreground prop or a logo, not a face.
 MAX_FACE_FRAC = 0.95
+
+# ── Phase 3: env-tunable cascade params ──
+# Lower minNeighbors and tighter scaleFactor produce more candidate
+# windows on motion frames where the anime cascade was previously
+# rejecting profile / 3-quarter views. Defaults are 3 and 1.05; the
+# old hardcoded values (5 / 1.1) were tuned for stills, not motion.
+ANIME_CASCADE_MIN_NEIGHBORS = int(
+    os.environ.get("ANIME_CASCADE_MIN_NEIGHBORS", "3")
+)
+ANIME_CASCADE_SCALE_FACTOR = float(
+    os.environ.get("ANIME_CASCADE_SCALE_FACTOR", "1.05")
+)
 
 
 # ──────────────────── Result dataclass ────────────────────
@@ -214,8 +229,8 @@ def detect_anime_faces(
     cascade_path: Optional[str] = None,
     min_face_frac: float = MIN_FACE_FRAC,
     max_face_frac: float = MAX_FACE_FRAC,
-    scale_factor: float = 1.1,
-    min_neighbors: int = 5,
+    scale_factor: Optional[float] = None,
+    min_neighbors: Optional[int] = None,
 ) -> AnimeDetectionResult:
     """Run the lbpcascade_animeface detector on a single frame.
 
@@ -276,30 +291,71 @@ def detect_anime_faces(
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     gray = cv2.equalizeHist(gray)
 
-    min_side = max(int(w * min_face_frac), 8)
-    max_side = max(int(w * max_face_frac), min_side + 1)
-    rects = cascade.detectMultiScale(
-        gray,
-        scaleFactor=float(scale_factor),
-        minNeighbors=int(min_neighbors),
-        minSize=(min_side, min_side),
-        maxSize=(max_side, max_side),
+    eff_scale = (
+        float(scale_factor) if scale_factor is not None
+        else float(ANIME_CASCADE_SCALE_FACTOR)
+    )
+    eff_neighbors = (
+        int(min_neighbors) if min_neighbors is not None
+        else int(ANIME_CASCADE_MIN_NEIGHBORS)
     )
 
+    min_side = max(int(w * min_face_frac), 8)
+    max_side = max(int(w * max_face_frac), min_side + 1)
+
+    # Phase 3: detectMultiScale3 returns per-detection level weights
+    # (unbounded reals from the cascade's stage scoring). We normalize
+    # to a [0, 1] confidence as ``min(1.0, level_weight / 10.0)`` —
+    # strong detections come out around 0.8–0.95 and weaker ones
+    # around 0.3–0.5, which lines up with the YuNet confidence range
+    # so the registry's confidence-weighted aggregation can compare
+    # them apples-to-apples. Falls back to detectMultiScale when the
+    # OpenCV build doesn't expose detectMultiScale3 (older bindings).
+    rects = []
+    weights = []
+    try:
+        rects_arr, _reject_levels, level_weights = cascade.detectMultiScale3(
+            gray,
+            scaleFactor=eff_scale,
+            minNeighbors=eff_neighbors,
+            minSize=(min_side, min_side),
+            maxSize=(max_side, max_side),
+            outputRejectLevels=True,
+        )
+        for r, lw in zip(rects_arr, level_weights):
+            rects.append(tuple(int(v) for v in r))
+            try:
+                weights.append(float(lw))
+            except Exception:
+                weights.append(8.5)  # 0.85 default
+    except Exception:
+        # Older OpenCV without detectMultiScale3 — fall back, using
+        # a conservative constant level weight that maps to 0.85.
+        rects_arr = cascade.detectMultiScale(
+            gray,
+            scaleFactor=eff_scale,
+            minNeighbors=eff_neighbors,
+            minSize=(min_side, min_side),
+            maxSize=(max_side, max_side),
+        )
+        for r in rects_arr:
+            rects.append(tuple(int(v) for v in r))
+            weights.append(8.5)
+
     detections: list[AnimeFaceDetection] = []
-    for x, y, fw, fh in rects:
+    for (x, y, fw, fh), lw in zip(rects, weights):
         cx = (x + fw / 2.0) / w * 100.0
         cy = (y + fh / 2.0) / h * 100.0
-        # Cascade detectors don't expose a per-detection confidence
-        # but ``detectMultiScale3`` does. For Phase 6 minimal we
-        # use a conservative constant; the production wiring can
-        # switch to detectMultiScale3 once the integration lands.
+        # Normalize the level weight to [0, 1]. The cascade's
+        # ``levelWeights`` are unbounded positive reals; divide by 10
+        # so a typical "strong" stage score of ~9 lands at 0.9.
+        conf = max(0.0, min(1.0, float(lw) / 10.0))
         detections.append(AnimeFaceDetection(
             x_center=cx,
             y_center=cy,
             width=fw / w * 100.0,
             height=fh / h * 100.0,
-            confidence=0.85,
+            confidence=conf,
         ))
 
     return AnimeDetectionResult(timestamp=timestamp, detections=detections)

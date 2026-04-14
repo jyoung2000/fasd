@@ -324,6 +324,213 @@ def test_to_face_info_exception_is_swallowed():
     assert len(results[0].faces) == 1  # only the successful conversion
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Phase 2 — anime-priority cascade tests
+
+
+def test_anime_priority_runs_cascade_on_strong_yunet_frames():
+    """With ``anime_priority=True`` the cascade runs on every frame,
+    even when YuNet locked in a strong (>0.55) detection on a mascot
+    or eye-shaped patch.
+    """
+    from backend.services import face_detector
+
+    # YuNet picked up a strong-confidence false positive (mascot/eye)
+    # at x=20. The cascade finds the real character at x=70.
+    results = [
+        _StubFrameFaces(
+            timestamp=0.0,
+            frame_path="/tmp/f.jpg",
+            faces=[_StubFace(confidence=0.85, x_center=20.0, is_human=True)],
+        ),
+    ]
+    frame_paths = [(0.0, "/tmp/f.jpg")]
+
+    def _fake_one_cascade(frame_path, *, timestamp=0.0):
+        return _StubAnimeResult(
+            timestamp=timestamp,
+            detections=[
+                _StubAnimeDetection(
+                    x_center=70.0, y_center=50.0,
+                    width=12.0, height=15.0, confidence=0.85,
+                ),
+            ],
+        )
+
+    with patch(
+        "backend.services.anime_face_detector.detect_anime_faces",
+        side_effect=_fake_one_cascade,
+    ), patch(
+        "backend.services.anime_face_detector.to_face_info",
+        side_effect=_fake_to_face_info,
+    ), patch(
+        "backend.services.anime_face_detector.USE_ANIME_FACE_DETECTOR",
+        True,
+    ):
+        n_frames, n_faces = face_detector._augment_dense_with_anime(
+            results, frame_paths, anime_priority=True,
+        )
+
+    # The cascade must have run despite the strong YuNet face,
+    # adding the real character.
+    assert n_frames == 1
+    assert n_faces == 1
+    assert len(results[0].faces) == 2  # original YuNet + cascade
+
+    # The YuNet false positive (no embedding → no match) should be
+    # demoted (confidence × 0.3). However our stub face has no
+    # identity_embedding so the demotion helper short-circuits and
+    # leaves it at 0.85. That's the conservative behavior — without
+    # embeddings we can't reliably tell true from false. The cascade
+    # detection should be present at confidence 0.85 (from the
+    # to_face_info stub).
+    cascade_faces = [f for f in results[0].faces if not f.is_human]
+    assert len(cascade_faces) == 1
+    assert abs(cascade_faces[0].x_center - 70.0) < 1e-6
+    assert cascade_faces[0].confidence == 0.85
+
+
+def test_anime_priority_demotes_unmatched_yunet_face():
+    """A live-action face whose embedding has NO cluster match within
+    ±5 frames is demoted to 0.3× its confidence on anime-priority runs.
+    """
+    from backend.services import face_detector
+
+    # We need real-ish embeddings for the demotion helper to fire.
+    # Build two frames: one with a YuNet false positive that has a
+    # unique embedding (no cluster), and one with a cascade detection
+    # (no embedding, untouched).
+    try:
+        import numpy as np
+    except ImportError:
+        import pytest
+        pytest.skip("numpy not available")
+
+    @dataclass
+    class _EmbedFace:
+        confidence: float = 0.0
+        is_human: bool = True
+        x_center: float = 50.0
+        y_center: float = 50.0
+        width: float = 10.0
+        height: float = 12.0
+        identity_embedding: object = None
+
+    rng = np.random.RandomState(0)
+    yunet_face = _EmbedFace(
+        confidence=0.85,
+        is_human=True,
+        x_center=20.0,
+        identity_embedding=rng.randn(128).tolist(),
+    )
+    # A second YuNet hit in a far-away frame with a totally different
+    # embedding — represents a different mascot / patch. Together they
+    # form a "no two faces ever cluster" scenario, so both get demoted.
+    other_face = _EmbedFace(
+        confidence=0.85,
+        is_human=True,
+        x_center=80.0,
+        identity_embedding=rng.randn(128).tolist(),
+    )
+
+    results = [
+        _StubFrameFaces(
+            timestamp=0.0,
+            frame_path="/tmp/f.jpg",
+            faces=[yunet_face],
+        ),
+        _StubFrameFaces(
+            timestamp=10.0,
+            frame_path="/tmp/g.jpg",
+            faces=[other_face],
+        ),
+    ]
+    frame_paths = [(0.0, "/tmp/f.jpg"), (10.0, "/tmp/g.jpg")]
+
+    def _empty_cascade(frame_path, *, timestamp=0.0):
+        return _StubAnimeResult(timestamp=timestamp, detections=[])
+
+    with patch(
+        "backend.services.anime_face_detector.detect_anime_faces",
+        side_effect=_empty_cascade,
+    ), patch(
+        "backend.services.anime_face_detector.to_face_info",
+        side_effect=_fake_to_face_info,
+    ), patch(
+        "backend.services.anime_face_detector.USE_ANIME_FACE_DETECTOR",
+        True,
+    ):
+        face_detector._augment_dense_with_anime(
+            results, frame_paths, anime_priority=True,
+        )
+
+    # The unmatched YuNet face should be demoted: 0.85 × 0.3 = 0.255
+    assert abs(yunet_face.confidence - 0.255) < 1e-3, (
+        f"Expected demoted confidence ≈ 0.255, got {yunet_face.confidence}"
+    )
+
+
+def test_anime_priority_keeps_clustered_live_action_face():
+    """A live-action face that DOES match another live-action face in
+    a nearby frame (same person, two consecutive frames) should NOT be
+    demoted — it's a real human/character that the cascade missed.
+    """
+    from backend.services import face_detector
+
+    try:
+        import numpy as np
+    except ImportError:
+        import pytest
+        pytest.skip("numpy not available")
+
+    @dataclass
+    class _EmbedFace:
+        confidence: float = 0.0
+        is_human: bool = True
+        x_center: float = 50.0
+        y_center: float = 50.0
+        width: float = 10.0
+        height: float = 12.0
+        identity_embedding: object = None
+
+    rng = np.random.RandomState(42)
+    base_embed = rng.randn(128)
+    base_embed = base_embed / float(np.linalg.norm(base_embed))
+    # Two near-identical embeddings (same character across frames)
+    embed_a = (base_embed + 0.05 * rng.randn(128)).tolist()
+    embed_b = (base_embed + 0.05 * rng.randn(128)).tolist()
+
+    face_a = _EmbedFace(confidence=0.85, x_center=50.0, identity_embedding=embed_a)
+    face_b = _EmbedFace(confidence=0.85, x_center=50.0, identity_embedding=embed_b)
+
+    results = [
+        _StubFrameFaces(timestamp=0.0, frame_path="/tmp/a.jpg", faces=[face_a]),
+        _StubFrameFaces(timestamp=0.5, frame_path="/tmp/b.jpg", faces=[face_b]),
+    ]
+    frame_paths = [(0.0, "/tmp/a.jpg"), (0.5, "/tmp/b.jpg")]
+
+    def _empty_cascade(frame_path, *, timestamp=0.0):
+        return _StubAnimeResult(timestamp=timestamp, detections=[])
+
+    with patch(
+        "backend.services.anime_face_detector.detect_anime_faces",
+        side_effect=_empty_cascade,
+    ), patch(
+        "backend.services.anime_face_detector.to_face_info",
+        side_effect=_fake_to_face_info,
+    ), patch(
+        "backend.services.anime_face_detector.USE_ANIME_FACE_DETECTOR",
+        True,
+    ):
+        face_detector._augment_dense_with_anime(
+            results, frame_paths, anime_priority=True,
+        )
+
+    # Neither face should be demoted — they cluster.
+    assert face_a.confidence == 0.85
+    assert face_b.confidence == 0.85
+
+
 def test_log_line_fires_with_counts(caplog):
     """The summary log line must include both counts."""
     import logging

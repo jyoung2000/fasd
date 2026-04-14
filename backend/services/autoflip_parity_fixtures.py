@@ -430,6 +430,81 @@ def _build_anime_hard_cuts() -> dict:
     )
 
 
+def _build_anime_panning_close_up() -> dict:
+    """Anime close-up shot whose face pans across the frame.
+
+    Phase 6 — exercises the full anime reframe gap close: dense face
+    track is populated (ratio = 1.0), the face nose_x pans 45 → 60 over
+    8 seconds within a single shot. Phase 5's intra-shot motion override
+    must flip the strategy from `stationary` to `tracking` (15 % motion
+    is well above the 6 % threshold), and the Phase 4 per-frame anchor
+    signal must keep the L1 path within ~4 % of the per-frame nose_x.
+
+    Mirrors the production AoT job ``f218fad4-…`` where
+    ``fetchJob: 614 scenes (0 dense face tracking, 614 AI)`` reduced
+    the L1 solver to slot-center medians and faces drifted off-center
+    in close-up shots.
+    """
+    registry = _FaceRegistry(
+        slots=[_FaceSlot(slot_id=0, x_center=52.5, x_min=45.0, x_max=60.0)],
+        is_continuous_motion=True,
+    )
+    speaker_to_slot = {"Speaker 1": 0}
+
+    duration = 8.0
+    fps = 2.0  # matches DENSE_FACE_SAMPLE_RATE = 0.5s
+    n = int(duration * fps)
+    dense: list[_FrameFaces] = []
+    for i in range(n):
+        t = i / fps
+        # Linear pan from 45 → 60 percent over the shot
+        x = 45.0 + (60.0 - 45.0) * (i / max(n - 1, 1))
+        dense.append(_FrameFaces(
+            timestamp=round(t, 4),
+            faces=[_FaceInfo(
+                identity_id=0, nose_x=x, x_center=x, y_center=50.0,
+            )],
+        ))
+
+    transcript = [
+        _TranscriptSeg(start=0.0, end=duration, speaker="Speaker 1"),
+    ]
+    as_events = [
+        _SpeakerEvent(start=0.0, end=duration, slot_id=0, confidence=0.92),
+    ]
+
+    return dict(
+        shot_cuts=[],
+        face_registry=registry,
+        active_speaker_events=as_events,
+        dense_faces=dense,
+        transcript_segments=transcript,
+        speaker_to_slot=speaker_to_slot,
+        video_duration=duration,
+    )
+
+
+def _gt_anime_panning_close_up() -> GroundTruth:
+    """Per-frame ground truth for the panning close-up fixture.
+
+    Required region per frame is the face bbox at the panning x.
+    Face width is 12 % so the region tracks the face exactly.
+    """
+    duration = 8.0
+    fps = 2.0
+    n = int(duration * fps)
+    face_w = 12.0
+    half = face_w / 2.0
+    regions: list[list[tuple[float, float]]] = []
+    for i in range(n):
+        x = 45.0 + (60.0 - 45.0) * (i / max(n - 1, 1))
+        regions.append([(x - half, x + half)])
+    return GroundTruth(
+        expected_switches=[],
+        required_regions_per_frame=regions,
+    )
+
+
 def _build_tps_character_offset() -> dict:
     """TPS gameplay: player character at x=40 / y=55, HUD in corners.
 
@@ -765,6 +840,24 @@ FIXTURES: dict[str, FixtureSpec] = {
         ],
         ground_truth=_gt_anime_hard_cuts(),
         build=_build_anime_hard_cuts,
+    ),
+    "anime_panning_close_up": FixtureSpec(
+        name="anime_panning_close_up",
+        description=(
+            "Anime close-up where the face pans 35→75 % over 8 s — "
+            "exercises the Phase 5 intra-shot tracking override + "
+            "Phase 4 per-frame face anchors"
+        ),
+        content_type_override="anime",
+        anime_subtype="dialogue",
+        video_duration=8.0,
+        metrics=[
+            "max_acceleration",
+            "max_jerk",
+            "required_region_miss_rate",
+        ],
+        ground_truth=_gt_anime_panning_close_up(),
+        build=_build_anime_panning_close_up,
     ),
     "tps_character_offset": FixtureSpec(
         name="tps_character_offset",

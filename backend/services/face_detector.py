@@ -813,6 +813,7 @@ def _augment_dense_with_anime(
     *,
     strong_conf_threshold: float = 0.55,
     job_log_prefix: str = "",
+    anime_priority: bool = False,
 ) -> tuple[int, int]:
     """Augment ``results`` with anime-cascade detections on weak frames.
 
@@ -838,6 +839,15 @@ def _augment_dense_with_anime(
             skipped. Default 0.55 matches the YuNet / FaceMesh
             production threshold.
         job_log_prefix: Optional "[job_id] " string for log lines.
+        anime_priority: When True, run the cascade on EVERY frame
+            (not just sub-threshold ones). On anime content YuNet
+            routinely scores mascots / eye-shaped patterns / hair
+            highlights at 0.7–0.9 and locks out the cascade on the
+            very frames where we need it. With the flag set we run
+            the cascade unconditionally and demote any pre-existing
+            live-action face that lacks an SFace embedding cluster
+            match within ±5 frames (those are the YuNet anime false
+            positives) so the registry weighting drops them.
 
     Returns:
         ``(augmented_frames, augmented_faces)`` counts. Both zero when
@@ -860,13 +870,16 @@ def _augment_dense_with_anime(
     augmented_faces = 0
 
     for i, fr in enumerate(results):
-        # Skip frames where live-action already found a confident face.
-        strong_faces = [
-            f for f in fr.faces
-            if getattr(f, "confidence", 0.0) >= strong_conf_threshold
-        ]
-        if strong_faces:
-            continue
+        # Skip frames where live-action already found a confident face,
+        # UNLESS anime_priority is set — on anime content YuNet locks
+        # in false positives we need to displace.
+        if not anime_priority:
+            strong_faces = [
+                f for f in fr.faces
+                if getattr(f, "confidence", 0.0) >= strong_conf_threshold
+            ]
+            if strong_faces:
+                continue
 
         if i >= len(frame_paths):
             continue
@@ -887,12 +900,104 @@ def _augment_dense_with_anime(
         augmented_frames += 1
         augmented_faces += len(anime_result.detections)
 
+    # ── Demote YuNet false positives on anime-priority runs ──
+    # When anime_priority=True, any live-action face that does NOT have
+    # an SFace embedding-cluster match within ±5 frames is almost
+    # certainly a YuNet hit on a mascot / eye-shaped patch / hair
+    # highlight. We don't drop it (the dense-propagator still wants the
+    # bbox), but we scale its confidence by 0.3 so the registry's
+    # confidence-weighted aggregation drops it relative to the cascade
+    # detections.
+    if anime_priority:
+        _demoted = _demote_unmatched_live_action(results, window=5)
+        if _demoted:
+            logger.info(
+                "%s[DenseFaces] Anime priority: demoted %d unmatched "
+                "live-action detections",
+                job_log_prefix, _demoted,
+            )
+
     if augmented_frames:
         logger.info(
             "%s[DenseFaces] Anime augmentation: +%d faces across %d frames",
             job_log_prefix, augmented_faces, augmented_frames,
         )
     return (augmented_frames, augmented_faces)
+
+
+def _demote_unmatched_live_action(results: list, *, window: int = 5) -> int:
+    """Demote live-action faces that have no SFace cluster match nearby.
+
+    For the anime-priority pass, any face with ``is_human=True`` whose
+    identity_embedding cannot be matched (cosine similarity > 0.4) to
+    another live-action face within ``±window`` frames is treated as a
+    YuNet false positive on a mascot / hair highlight / eye-shaped
+    background patch. We multiply its confidence by 0.3 in place so
+    the downstream face_registry drops it without losing the bbox.
+
+    Returns the number of demoted faces.
+    """
+    if not results:
+        return 0
+
+    # Build a lightweight index of (frame_idx, face_idx, embedding) for
+    # all live-action faces with embeddings. Cascade detections are
+    # marked is_human=False so they're naturally excluded.
+    indexed = []
+    for fi, fr in enumerate(results):
+        for face in getattr(fr, "faces", []) or []:
+            if not getattr(face, "is_human", True):
+                continue
+            emb = getattr(face, "identity_embedding", None)
+            if emb is None:
+                continue
+            indexed.append((fi, face, emb))
+
+    if len(indexed) < 2:
+        return 0
+
+    try:
+        import numpy as _np
+    except ImportError:
+        return 0
+
+    # Pre-normalize embeddings for cosine similarity.
+    def _norm(v):
+        arr = _np.asarray(v, dtype=_np.float32).flatten()
+        n = float(_np.linalg.norm(arr))
+        if n <= 1e-9:
+            return None
+        return arr / n
+
+    normed = []
+    for fi, face, emb in indexed:
+        ne = _norm(emb)
+        if ne is None:
+            continue
+        normed.append((fi, face, ne))
+
+    if len(normed) < 2:
+        return 0
+
+    demoted = 0
+    for i, (fi, face, ne) in enumerate(normed):
+        matched = False
+        for j, (fj, _other_face, oe) in enumerate(normed):
+            if i == j:
+                continue
+            if abs(fj - fi) > window:
+                continue
+            sim = float(_np.dot(ne, oe))
+            if sim > 0.4:
+                matched = True
+                break
+        if not matched:
+            try:
+                face.confidence = float(face.confidence) * 0.3
+                demoted += 1
+            except Exception:
+                continue
+    return demoted
 
 
 def detect_faces_dense(
@@ -1048,7 +1153,9 @@ def detect_faces_dense(
         # verifier skips them. Runs inside the TemporaryDirectory scope
         # so the per-frame paths in frame_paths are still valid.
         if is_animated:
-            _augment_dense_with_anime(results, frame_paths)
+            _augment_dense_with_anime(
+                results, frame_paths, anime_priority=True,
+            )
 
         if progress_callback:
             progress_callback("complete", len(results), len(frame_paths))

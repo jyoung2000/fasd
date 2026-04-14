@@ -79,6 +79,181 @@ DEADZONE_FRAC = 0.018
 # Stationary threshold: if total movement < this fraction of source width, static crop
 # 0.08 = ~154px on 1920 — covers normal face-detection noise without triggering
 STATIONARY_THRESHOLD = 0.08
+
+# Phase 4: per-frame face-unary weight multiplier. When an animated
+# content profile + dense face anchors (density ≥ 40%) are available
+# we override the slot-center unary with the actual per-frame nose_x
+# and scale its data-fidelity weight by this factor relative to the
+# slot-center fallback (which keeps weight 1.0). 1.5 is enough to pull
+# the L1 solver onto the real face position within close-up shots
+# without overwhelming the velocity / accel terms.
+W_FACE_UNARY = float(os.environ.get("CLIPAI_W_FACE_UNARY", "1.5"))
+
+# Phase 4: density floor for swapping to per-frame face anchors.
+# Below this fraction of frames having a real face, the per-frame
+# signal would be more noise than signal — fall back to slot-center.
+FACE_ANCHOR_DENSITY_FLOOR = float(
+    os.environ.get("CLIPAI_FACE_ANCHOR_DENSITY", "0.4")
+)
+
+
+def build_face_anchor_targets(
+    dense_faces: list,
+    slot_id: Optional[int],
+    slot_center_pct: float,
+    start: float,
+    end: float,
+    *,
+    target_fps: float = 30.0,
+    is_animated: bool = False,
+    face_unary_weight: float = W_FACE_UNARY,
+    density_floor: float = FACE_ANCHOR_DENSITY_FLOOR,
+) -> tuple[list[tuple[float, float]], list[float], bool]:
+    """Build a uniform-fps per-frame anchor signal + weights for the L1 solver.
+
+    Phase 4 — animated content with dense face data switches the unary
+    anchor from the static slot-center to the actual per-frame
+    ``dense_face.nose_x``. Frames with a real face anchor get
+    ``face_unary_weight`` (default 1.5×); frames with no face anchor
+    fall back to ``slot_center_pct`` with weight 1.0.
+
+    The swap is gated behind:
+
+      1. ``is_animated`` is True (caller passes
+         ``_content_profile.is_animated``)
+      2. The per-shot density of frames-with-face for the requested slot
+         is at least ``density_floor`` (default 0.4)
+
+    When either gate fails the helper returns the legacy slot-center
+    signal at unit weights AND ``False`` for ``used_face_anchors`` so
+    the caller can log/branch on that.
+
+    Args:
+        dense_faces: list of FrameFaces objects (one per dense sample).
+        slot_id: face registry slot to track. ``None`` = any face.
+        slot_center_pct: fallback x-position in percent.
+        start, end: shot time range in seconds.
+        target_fps: uniform sampling rate.
+        is_animated: anime/cartoon gate.
+        face_unary_weight: weight multiplier for face anchor frames.
+        density_floor: min frames-with-face ratio to enable the swap.
+
+    Returns:
+        ``(positions, weights, used_face_anchors)`` where ``positions``
+        is a list of ``(timestamp, x_pct)`` pairs at uniform spacing
+        and ``weights`` is parallel — ``face_unary_weight`` for real
+        face frames, ``1.0`` for slot-center fallback frames.
+    """
+    if end <= start:
+        return [], [], False
+
+    dt = 1.0 / target_fps
+    n_frames = max(1, int((end - start) * target_fps))
+
+    # Step 1: collect per-frame face nose_x for the requested slot.
+    face_x_by_t: dict[float, float] = {}
+    if dense_faces:
+        for df in dense_faces:
+            ts = float(getattr(df, "timestamp", -1.0))
+            if ts < start or ts >= end:
+                continue
+            faces = getattr(df, "faces", []) or []
+            chosen_x: Optional[float] = None
+            for face in faces:
+                sid = getattr(face, "identity_id", -1)
+                if slot_id is not None and sid != slot_id:
+                    continue
+                nx = getattr(face, "nose_x", None)
+                if nx is None:
+                    continue
+                chosen_x = float(nx)
+                break
+            if chosen_x is None and slot_id is None and faces:
+                nx = getattr(faces[0], "nose_x", None)
+                if nx is not None:
+                    chosen_x = float(nx)
+            if chosen_x is not None:
+                face_x_by_t[round(ts, 4)] = chosen_x
+
+    # Step 2: compute density (fraction of dense samples in [start,end)
+    # that contributed a face_x). If we don't have ANY face data we
+    # implicitly hit density 0.0 and skip the swap.
+    density_window = [
+        df for df in (dense_faces or [])
+        if start <= float(getattr(df, "timestamp", -1.0)) < end
+    ]
+    n_window = max(len(density_window), 1)
+    density = len(face_x_by_t) / n_window
+
+    use_anchors = bool(
+        is_animated
+        and face_x_by_t
+        and density >= density_floor
+    )
+
+    # Step 3: build the uniform-fps signal. For each frame timestamp
+    # interpolate linearly between the two nearest face samples (so a
+    # 1 Hz dense stream still drives the unary at 30 fps); when the
+    # uniform timestamp is outside the face range, hold the nearest
+    # endpoint. Frames within ``±max_gap`` of a real face sample carry
+    # ``face_unary_weight``; outside that window we fall back to the
+    # slot center at unit weight. When the gate is closed every frame
+    # falls back to slot.
+    positions: list[tuple[float, float]] = []
+    weights: list[float] = []
+    sorted_face_keys = sorted(face_x_by_t.keys()) if face_x_by_t else []
+    # Extrapolation window: face data at production-default 1 Hz with
+    # ±0.6s window covers every uniform-fps target between successive
+    # face frames. Animated content tends to hold faces for ≥1s so
+    # this is rarely the limiting factor.
+    max_gap = 0.6
+    raw_idx = 0
+
+    for i in range(n_frames):
+        t = start + i * dt
+        if t >= end:
+            break
+        anchor_x: Optional[float] = None
+        is_real_anchor = False
+        if use_anchors and sorted_face_keys:
+            # Bracket t between sorted_face_keys[raw_idx] and [raw_idx+1]
+            while (
+                raw_idx < len(sorted_face_keys) - 1
+                and sorted_face_keys[raw_idx + 1] <= t
+            ):
+                raw_idx += 1
+
+            t0 = sorted_face_keys[raw_idx]
+            x0 = face_x_by_t[t0]
+            if raw_idx >= len(sorted_face_keys) - 1:
+                # Past the last face sample — hold last known if within gap.
+                if abs(t - t0) <= max_gap:
+                    anchor_x = x0
+                    is_real_anchor = True
+            elif sorted_face_keys[raw_idx] >= t:
+                # Before the first relevant sample.
+                if abs(t0 - t) <= max_gap:
+                    anchor_x = x0
+                    is_real_anchor = True
+            else:
+                t1 = sorted_face_keys[raw_idx + 1]
+                x1 = face_x_by_t[t1]
+                # Linear interpolation between bracketing face frames.
+                # Allow it as long as t is "near" either bracket.
+                if (t - t0) <= max_gap and (t1 - t) <= max_gap:
+                    span = t1 - t0
+                    alpha = (t - t0) / span if span > 0 else 0.0
+                    anchor_x = x0 + alpha * (x1 - x0)
+                    is_real_anchor = True
+
+        if is_real_anchor and anchor_x is not None:
+            positions.append((round(t, 6), float(anchor_x)))
+            weights.append(float(face_unary_weight))
+        else:
+            positions.append((round(t, 6), float(slot_center_pct)))
+            weights.append(1.0)
+
+    return positions, weights, use_anchors
 # Panning R^2 threshold for linear-fit detection (0.90 for pre-solve noisy data)
 PANNING_R2_THRESHOLD = 0.90
 # Minimum slope (pixels per second) to qualify as a pan
@@ -759,6 +934,9 @@ def solve_camera_path_for_shot(
     lam: float = TV_LAMBDA,
     hard_features: Optional[list] = None,
     job_id: str = "",
+    *,
+    is_animated: bool = False,
+    dense_faces_for_anchors: Optional[list] = None,
 ) -> list[dict]:
     """Solve L1-optimal camera path for an entire shot, then slice per segment.
 
@@ -800,17 +978,74 @@ def solve_camera_path_for_shot(
     all_targets = []
     segment_boundaries = []  # [(start_idx, end_idx)] into the arrays
 
+    all_weights: list[float] = []
+    _used_face_anchors_any = False
+
     for seg in segments_in_shot:
         seg_start_idx = len(all_times)
-        positions = get_propagated_positions_for_segment(
-            propagated_path, seg.active_slot, seg.start, seg.end,
-            source_width=source_width, target_fps=target_fps,
-        )
-        for t, x in positions:
+        seg_positions: list[tuple[float, float]] = []
+        seg_weights: list[float] = []
+
+        # Phase 4: animated content with a dense face track switches the
+        # unary to per-frame nose_x with a higher data-fidelity weight.
+        # Falls through to the legacy propagated-positions extraction
+        # when the gate is closed (live action, sparse face data).
+        if is_animated and dense_faces_for_anchors:
+            slot_center_pct = 50.0
+            try:
+                if seg.active_slot is not None:
+                    # Look up the slot's nose_x from any frame that has it
+                    for df in dense_faces_for_anchors:
+                        for face in getattr(df, "faces", []) or []:
+                            if getattr(face, "identity_id", -1) == seg.active_slot:
+                                nx = getattr(face, "nose_x", None)
+                                if nx is not None:
+                                    slot_center_pct = float(nx)
+                                    break
+                        else:
+                            continue
+                        break
+            except Exception:
+                pass
+
+            anchor_pos, anchor_w, used = build_face_anchor_targets(
+                dense_faces_for_anchors,
+                slot_id=seg.active_slot,
+                slot_center_pct=slot_center_pct,
+                start=seg.start,
+                end=seg.end,
+                target_fps=target_fps,
+                is_animated=True,
+            )
+            if used and anchor_pos:
+                # Convert percent → pixel for the solver
+                seg_positions = [
+                    (t, x / 100.0 * source_width)
+                    for t, x in anchor_pos
+                ]
+                seg_weights = list(anchor_w)
+                _used_face_anchors_any = True
+
+        if not seg_positions:
+            positions = get_propagated_positions_for_segment(
+                propagated_path, seg.active_slot, seg.start, seg.end,
+                source_width=source_width, target_fps=target_fps,
+            )
+            seg_positions = list(positions)
+            seg_weights = [1.0] * len(seg_positions)
+
+        for (t, x), w in zip(seg_positions, seg_weights):
             all_times.append(t)
             all_targets.append(x)
+            all_weights.append(w)
         seg_end_idx = len(all_times)
         segment_boundaries.append((seg_start_idx, seg_end_idx))
+
+    if _used_face_anchors_any:
+        logger.info(
+            "[%s] L1 shot solver: face-anchor unary in use (anime gate open)",
+            job_id,
+        )
 
     if len(all_targets) < 2:
         # Not enough data — fall back to per-segment solving
