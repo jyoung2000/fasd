@@ -185,6 +185,25 @@ class JobResult(BaseModel):
     filler_events: list[dict] = []  # [{start, end, type, text}] from filler word detection
     emphasis_keywords: list[str] = []  # Words to highlight in captions
     thumbnail_path: Optional[str] = None  # Absolute path to OG preview thumbnail JPG
+    # Phase 1 — transcription coverage audit report. Produced by
+    # backend.services.coverage_audit.audit_transcription_coverage after the
+    # Whisper pass completes. Shape matches CoverageReport.to_dict():
+    #   {
+    #     "total_speech_seconds": float,
+    #     "covered_seconds": float,
+    #     "coverage_pct": float,            # 0-100, 100 = no gaps / no speech
+    #     "gaps": [{start, end, duration, energy_rms}, ...],
+    #     "vad_segment_count": int,
+    #     "transcript_segment_count": int,
+    #     "audio_duration": float,
+    #     "sample_rate": int,
+    #     "vad_backend": "silero" | "unavailable",
+    #     "status": "ok" | "skipped" | "error",
+    #     "error": Optional[str],
+    #   }
+    # Stored as a raw dict (not a nested model) so schema evolution in
+    # Phase 2 / Phase 3 doesn't require migrations on historical jobs.
+    coverage_report: Optional[dict] = None
 
 
 class ClipSEO(BaseModel):

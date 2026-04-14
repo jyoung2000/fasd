@@ -28,3 +28,8 @@ ultralytics>=8.0.0
 mcp>=1.8.0
 pyannote.audio>=3.1.0
 torch>=2.0.0
+# Standalone Silero VAD (Phase 1 transcription coverage audit). Independent
+# from faster-whisper's internal silero copy so we get a second opinion
+# about what is speech — the basis for detecting missed dialogue in
+# `backend.services.coverage_audit`.
+silero-vad>=5.0.0

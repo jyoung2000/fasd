@@ -1,5 +1,6 @@
 import React, { useState, useMemo, useCallback, useRef, useEffect } from 'react';
 import useResponsive from '../hooks/useResponsive';
+import TranscriptionCoverageBadge from './TranscriptionCoverageBadge';
 
 const SPEAKER_COLORS_LIST = [
   'var(--accent-cyan)',
@@ -516,6 +517,10 @@ export default function TranscriptViewer({ transcript, onSeek, jobId, onSpeakerR
 
   return (
     <div>
+      {/* Phase 1 — transcription coverage audit badge. Shows coverage %,
+          and clicking expands an actionable gap list that seeks the
+          preview to any suspected missed-dialogue timestamp. */}
+      <TranscriptionCoverageBadge jobId={jobId} onSeek={onSeek} />
       {/* Speaker legend — click to rename */}
       <div
         style={{

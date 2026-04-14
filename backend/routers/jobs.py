@@ -55,6 +55,32 @@ async def get_job(job_id: str):
     return data
 
 
+@router.get("/jobs/{job_id}/coverage")
+async def get_job_coverage(job_id: str):
+    """Return the transcription coverage audit report for a job.
+
+    Shape matches ``backend.services.coverage_audit.CoverageReport.to_dict()``.
+    Returns 404 if the job does not exist, and a "not_available" payload
+    (HTTP 200) if the job exists but no audit has been run yet — that way
+    the frontend doesn't need to treat "no report yet" as an error.
+    """
+    job = await database.load_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    report = getattr(job, "coverage_report", None)
+    if not report:
+        return {
+            "job_id": job_id,
+            "status": "not_available",
+            "coverage_report": None,
+        }
+    return {
+        "job_id": job_id,
+        "status": "ok",
+        "coverage_report": report,
+    }
+
+
 @router.post("/jobs/{job_id}/cancel")
 async def cancel_job(job_id: str):
     """Cancel a running or queued job. Also cancels active exports/clip-generation

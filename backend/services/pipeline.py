@@ -1965,6 +1965,45 @@ async def _run_analysis_inner(job_id: str):
             diar_label = f"{speaker_count} speaker{'s' if speaker_count != 1 else ''} detected via neural (pyannote)"
         else:
             diar_label = f"{speaker_count} speaker{'s' if speaker_count != 1 else ''} detected via heuristic (pause-based)"
+
+        # ── Phase 1: Transcription coverage audit ───────────────────────────
+        # Run an independent Silero VAD pass and diff against the transcript
+        # segments. Failures here are strictly non-fatal — we never want the
+        # audit to block a job from completing.
+        try:
+            from backend.services.coverage_audit import audit_transcription_coverage
+
+            coverage_report = await audit_transcription_coverage(
+                audio_path=audio_path,
+                segments=result,
+            )
+            logger.info(
+                "[%s] Transcription coverage: %.1f%% — %d gaps >0.8s "
+                "(speech=%.1fs covered=%.1fs vad_segs=%d transcript_segs=%d backend=%s status=%s)",
+                job_id,
+                coverage_report.coverage_pct,
+                len(coverage_report.gaps),
+                coverage_report.total_speech_seconds,
+                coverage_report.covered_seconds,
+                coverage_report.vad_segment_count,
+                coverage_report.transcript_segment_count,
+                coverage_report.vad_backend,
+                coverage_report.status,
+            )
+            # Log up to 20 gaps so the first few missed utterances are
+            # discoverable from job logs without opening the UI.
+            for gap in coverage_report.gaps[:20]:
+                logger.warning(
+                    "[%s] COVERAGE GAP: %.1fs → %.1fs (%.1fs, rms=%.4f)",
+                    job_id, gap.start, gap.end, gap.duration, gap.energy_rms,
+                )
+            # Persist on the job record so the UI can surface it.
+            await database.update_job_status(
+                job_id, coverage_report=coverage_report.to_dict()
+            )
+        except Exception as e:
+            logger.warning("[%s] Coverage audit failed (non-fatal): %s", job_id, e)
+
         # Record phase timing for ETA estimation of remaining phases
         if _transcription_phase_start[0] > 0:
             _phase_timings["transcription"] = _time.monotonic() - _transcription_phase_start[0]
