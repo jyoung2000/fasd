@@ -293,3 +293,58 @@ def test_overall_confidence_never_exceeds_1():
         candidate_slot=0, candidate_x=30,
     )
     assert 0.0 <= conf <= 1.0
+
+
+# ─────────── Gap 5c per-content-type integration (3 tests) ───────────
+
+
+def test_estimator_uses_panel_weights():
+    """Panel content type → lip=0.12, diar=0.13 in breakdown."""
+    est = _make_estimator(
+        diarization_segments=[
+            DiarizationSegment(0.0, 2.0, cluster_id=0, confidence=0.85),
+        ],
+        cluster_to_slot={0: 0},
+        content_type="multi_speaker_panel",
+    )
+    conf, _reason, breakdown = est.evaluate_with_breakdown(
+        seg_start=0.0, seg_end=2.0,
+        candidate_slot=0, candidate_x=30,
+    )
+    assert breakdown["speaker_agree"] == pytest.approx(0.12)
+    assert breakdown["diarization_agree"] == pytest.approx(0.13)
+
+
+def test_estimator_uses_vlog_weights():
+    """Vlog → lip=0.18, diar=0.07 (lip-favored)."""
+    est = _make_estimator(
+        diarization_segments=[
+            DiarizationSegment(0.0, 2.0, cluster_id=0, confidence=0.85),
+        ],
+        cluster_to_slot={0: 0},
+        content_type="vlog",
+    )
+    conf, _reason, breakdown = est.evaluate_with_breakdown(
+        seg_start=0.0, seg_end=2.0,
+        candidate_slot=0, candidate_x=30,
+    )
+    assert breakdown["speaker_agree"] == pytest.approx(0.18)
+    assert breakdown["diarization_agree"] == pytest.approx(0.07)
+
+
+def test_estimator_unknown_type_defaults_to_generic_split():
+    """Unrecognized content type with diarization present → legacy
+    0.15 / 0.10 generic split, not the no-diar (0.20, 0.0) path."""
+    est = _make_estimator(
+        diarization_segments=[
+            DiarizationSegment(0.0, 2.0, cluster_id=0, confidence=0.85),
+        ],
+        cluster_to_slot={0: 0},
+        content_type="totally_made_up",
+    )
+    conf, _reason, breakdown = est.evaluate_with_breakdown(
+        seg_start=0.0, seg_end=2.0,
+        candidate_slot=0, candidate_x=30,
+    )
+    assert breakdown["speaker_agree"] == pytest.approx(0.15)
+    assert breakdown["diarization_agree"] == pytest.approx(0.10)

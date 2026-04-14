@@ -201,14 +201,15 @@ class SubjectConfidenceEstimator:
             and any(v >= 0 for v in self.cluster_to_slot.values())
         )
         self.content_type = content_type or "unknown"
-        # Phase B: hard-coded split. Phase C replaces this block with
-        # a ``get_vote_weights(content_type, has_diarization)`` call.
-        if self._has_diarization:
-            self._lip_weight = 0.15
-            self._diar_weight = 0.10
-        else:
-            self._lip_weight = 0.20
-            self._diar_weight = 0.0
+        # Gap 5c: per-content-type vote weight split. Looks up the
+        # ``ACTIVE_SPEAKER_VOTE_WEIGHTS`` table and caches the pair
+        # for the lifetime of this estimator instance. Legacy mode
+        # (no diarization) returns (0.20, 0.0), preserving
+        # bit-identical behavior with the pre-Gap-5 estimator.
+        from backend.services.content_type_config import get_vote_weights
+        self._lip_weight, self._diar_weight = get_vote_weights(
+            self.content_type, self._has_diarization,
+        )
 
     def evaluate(
         self,

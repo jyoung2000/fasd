@@ -310,6 +310,69 @@ def get_config(content_type: str) -> dict:
     return CONTENT_TYPE_CONFIG.get(ct, CONTENT_TYPE_CONFIG[ContentType.UNKNOWN])
 
 
+# ──────────────────── Gap 5c — per-content-type vote split ────────────
+#
+# When a diarization pass ran in the pipeline (Gap 5a) AND at least
+# one cluster mapped to a face slot, the ``SubjectConfidenceEstimator``
+# treats the audio-side vote as an independent Check 2b alongside the
+# lip-motion vote. The combined ``(lip_weight, diar_weight)`` pair is
+# the total "speaker_agree" budget — the two values sum to 0.25,
+# which is the same budget the legacy 0.20 lip slice occupied plus
+# the 0.05 reallocated from ``transcript`` in the Phase B wiring.
+#
+# Signal-reliability rationale (per the Gap 5c tuning table in the
+# task prompt):
+#
+#   * Multi-speaker panel — crosstalk is the failure mode for lip
+#     motion; diarization gets a slight edge.
+#   * Anime / animation dialogue — stylized mouth flaps produce
+#     constant low-confidence lip motion; diarization (voice actors
+#     have distinctive timbre) gets the edge.
+#   * Vlog — close-up single face makes lip motion near-perfect;
+#     B-roll audio contaminates the diarization side.
+#   * Music video — studio-track lipsync is clean but the audio is
+#     effectively a single vocal cluster, so lip dominates.
+#   * Narrative — ADR / foley contaminates audio, lip is reliable
+#     on professional close-ups.
+#   * Sports / gaming / unknown — no specific signal; keep the
+#     generic 0.15 / 0.10 default.
+ACTIVE_SPEAKER_VOTE_WEIGHTS = {
+    ContentType.MULTI_SPEAKER_PANEL: (0.12, 0.13),
+    ContentType.PODCAST:             (0.14, 0.11),
+    ContentType.NARRATIVE:           (0.17, 0.08),
+    ContentType.VLOG:                (0.18, 0.07),
+    ContentType.ANIME:               (0.12, 0.13),
+    ContentType.ANIMATION_DIALOGUE:  (0.12, 0.13),
+    ContentType.GAMING:              (0.15, 0.10),
+    ContentType.MUSIC_VIDEO:         (0.18, 0.07),
+    ContentType.SPORTS:              (0.15, 0.10),
+    ContentType.SPORTS_BASKETBALL:   (0.15, 0.10),
+    ContentType.SPORTS_RACING:       (0.15, 0.10),
+    ContentType.UNKNOWN:             (0.15, 0.10),
+}
+
+
+def get_vote_weights(content_type: str, has_diarization: bool) -> tuple:
+    """Return ``(lip_weight, diar_weight)`` for the given content type.
+
+    When ``has_diarization`` is False, returns ``(0.20, 0.0)`` — the
+    legacy lip-only budget, preserving bit-identical pre-Gap-5
+    behavior. When True, looks up
+    ``ACTIVE_SPEAKER_VOTE_WEIGHTS[content_type]``, falling back to
+    the ``ContentType.UNKNOWN`` row when the content_type string
+    isn't in the enum.
+    """
+    if not has_diarization:
+        return (0.20, 0.0)
+    try:
+        ct = ContentType(content_type)
+    except ValueError:
+        ct = ContentType.UNKNOWN
+    return ACTIVE_SPEAKER_VOTE_WEIGHTS.get(
+        ct, ACTIVE_SPEAKER_VOTE_WEIGHTS[ContentType.UNKNOWN],
+    )
+
+
 class TuningConfig:
     """Structured access to per-content-type tuning parameters.
 
