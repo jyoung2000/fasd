@@ -42,28 +42,72 @@ Design notes:
     the supported comparison input. A missing cache file is a
     reported "skipped" row, not a failure.
 
-  - The ClipAI pipeline invocation is a seam that can be plugged in
-    three different ways (inline extractor → segmenter, cached
-    extractor → segmenter, or backend HTTP call). This file calls a
-    ``run_clipai_on_clip(clip, video_path)`` helper that is a
-    placeholder in the current revision: it dry-runs for every
-    clip and emits a timeline of one-segment-per-clip so the
-    scoring layer has something to chew on. The real implementation
-    lives in a follow-up that wires ``measure_autoflip_parity.py``'s
-    inline-segmenter path to a real-video input.
+  - The ClipAI pipeline invocation goes through
+    ``run_clipai_on_clip(clip, video_path, cache_dir=…)`` which
+    runs the full extraction stack (shots → dense faces → face
+    registry → transcript → active speaker → content profile →
+    anime anchors → reframe segments) against the resolved video
+    path. The extracted features are cached by sha256 under
+    ``$CLIPAI_REAL_CONTENT_CACHE/extractions/<sha>/`` so a second
+    run against the same clip short-circuits to the cached segment
+    list. When the manifest's video is missing on disk the clip is
+    reported as ``clipai_skipped``; when ``--dry-run`` is passed the
+    helper falls back to a synthetic one-frame-per-source-frame
+    timeline for scoring-layer iteration.
 """
 from __future__ import annotations
 
 import argparse
 import fnmatch
+import hashlib
 import json
 import logging
+import os
+import shutil
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
 logger = logging.getLogger("compare_autoflip_vs_clipai")
+
+
+# ─────────────────── Extraction cache contract ───────────────────
+#
+# Bump this when the extraction contract changes so stale caches
+# get invalidated automatically. See ``run_clipai_on_clip`` for the
+# cache layout and file list.
+EXTRACTION_CACHE_VERSION = 1
+
+# Modules whose mtime participates in cache invalidation. If any of
+# these files is newer than the cache's ``cache_version.txt`` then
+# the cache is considered stale and gets rebuilt from scratch.
+_EXTRACTOR_MODULES_FOR_CACHE = (
+    "backend/services/face_detector.py",
+    "backend/services/shot_detector.py",
+    "backend/services/transcription.py",
+    "backend/services/face_registry.py",
+    "backend/services/active_speaker.py",
+    "backend/services/content_classifier.py",
+    "backend/services/anime_anchor.py",
+    "backend/services/reframe_segmenter.py",
+)
+
+# Required files inside ``$CACHE/<sha>/`` for a cache hit. The
+# presence of every one of these (plus ``cache_version.txt``) is a
+# necessary — but not sufficient — condition for cache validity.
+_REQUIRED_CACHE_FILES = (
+    "metadata.json",
+    "shots.json",
+    "dense_faces.json",
+    "face_registry.json",
+    "transcript.json",
+    "speaker_events.json",
+    "content_profile.json",
+    "anime_anchors.json",
+    "segments.json",
+    "cache_version.txt",
+)
 
 
 # ─────────────────── Target zones (Part D6) ───────────────────
@@ -224,51 +268,749 @@ def verdict_for(metrics: dict[str, Any], zone: Optional[dict[str, float]]) -> st
 # ─────────────────── Pipeline invocation seam ───────────────────
 
 
+# ─────────────────── Cache / extraction helpers ───────────────────
+#
+# All of the helpers below do heavy imports lazily inside their own
+# bodies so the ``--dry-run`` path of this module stays importable
+# in a sandbox without numpy / cv2 / scenedetect / MediaPipe / whisper.
+
+
+def _synthetic_events_for_clip(clip: dict) -> list[dict]:
+    """The legacy ``dry_run`` output: one synthetic event per frame
+    at the centered 9:16 crop over the clip's declared duration.
+
+    Kept for backward compatibility with ``--dry-run`` iteration on
+    the scoring layer and with the existing harness tests.
+    """
+    duration = float(clip.get("duration_sec") or 10.0)
+    fps = 30.0
+    events = []
+    n = max(1, int(duration * fps))
+    for fi in range(n):
+        events.append({
+            "frame": fi,
+            "t": fi / fps,
+            "crop_cx": 0.5,
+            "crop_cy": 0.5,
+            "crop_w": 0.3164,
+            "crop_h": 1.0,
+            "scene_change": fi == 0,
+        })
+    return events
+
+
+def _default_extraction_cache_dir() -> Path:
+    base = os.environ.get(
+        "CLIPAI_REAL_CONTENT_CACHE", "/var/cache/clipai/real_content",
+    )
+    return Path(base) / "extractions"
+
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _repo_root_for_cache() -> Path:
+    """Walk up from this file to find the repo root (has ``backend/``)."""
+    here = Path(__file__).resolve()
+    for p in (here, *here.parents):
+        if (p / "backend" / "services").is_dir():
+            return p
+    return here.parents[2]
+
+
+def _extractor_module_mtime() -> float:
+    """Max mtime across the extractor modules that participate in
+    cache invalidation. Missing modules are ignored (0.0 fallback)."""
+    root = _repo_root_for_cache()
+    latest = 0.0
+    for rel in _EXTRACTOR_MODULES_FOR_CACHE:
+        p = root / rel
+        try:
+            mt = p.stat().st_mtime
+            if mt > latest:
+                latest = mt
+        except OSError:
+            continue
+    return latest
+
+
+def _cache_is_valid(clip_cache: Path) -> bool:
+    """Cache is valid iff:
+      * the directory exists
+      * every required file is present
+      * ``cache_version.txt`` matches the current contract version
+      * the cache is at least as new as the extractor modules
+    """
+    if not clip_cache.is_dir():
+        return False
+    for name in _REQUIRED_CACHE_FILES:
+        if not (clip_cache / name).is_file():
+            return False
+    try:
+        version_raw = (clip_cache / "cache_version.txt").read_text().strip()
+        if int(version_raw) != EXTRACTION_CACHE_VERSION:
+            return False
+    except (OSError, ValueError):
+        return False
+    try:
+        cache_mtime = (clip_cache / "cache_version.txt").stat().st_mtime
+    except OSError:
+        return False
+    if cache_mtime < _extractor_module_mtime():
+        return False
+    return True
+
+
+def _serialize_shots(shots: list) -> list[dict]:
+    return [
+        {"index": int(getattr(s, "index", i)),
+         "start": float(getattr(s, "start", 0.0)),
+         "end": float(getattr(s, "end", 0.0))}
+        for i, s in enumerate(shots or [])
+    ]
+
+
+def _serialize_dense_faces(
+    dense_faces: list, *, include_embeddings: bool,
+) -> list[dict]:
+    out: list[dict] = []
+    for fr in dense_faces or []:
+        row = {
+            "timestamp": float(getattr(fr, "timestamp", 0.0)),
+            "faces": [],
+        }
+        for f in getattr(fr, "faces", None) or []:
+            face_dict = {
+                "nose_x": float(getattr(f, "nose_x", 50.0)),
+                "nose_y": float(getattr(f, "nose_y", 50.0)),
+                "x": float(getattr(f, "x_center", 50.0)),
+                "y": float(getattr(f, "y_center", 50.0)),
+                "width": float(getattr(f, "width", 0.0)),
+                "height": float(getattr(f, "height", 0.0)),
+                "confidence": float(getattr(f, "confidence", 0.0)),
+                "lip_aperture": float(getattr(f, "lip_aperture", 0.0)),
+                "identity_id": int(getattr(f, "identity_id", -1) or -1),
+            }
+            if include_embeddings:
+                emb = getattr(f, "identity_embedding", None)
+                if emb is not None:
+                    face_dict["embedding"] = [float(x) for x in emb]
+            row["faces"].append(face_dict)
+        out.append(row)
+    return out
+
+
+def _serialize_face_registry(face_registry) -> dict:
+    if face_registry is None:
+        return {"slots": [], "total_frames": 0, "frames_with_faces": 0}
+    return {
+        "slots": [
+            {
+                "slot_id": int(getattr(s, "slot_id", i)),
+                "nose_x": float(getattr(s, "x_center", 50.0)),
+                "width": float(getattr(s, "avg_width", 0.0)),
+                "appearances": int(getattr(s, "frame_count", 0)),
+            }
+            for i, s in enumerate(getattr(face_registry, "slots", []) or [])
+        ],
+        "total_frames": int(getattr(face_registry, "total_frames", 0)),
+        "frames_with_faces": int(
+            getattr(face_registry, "frames_with_faces", 0),
+        ),
+    }
+
+
+def _serialize_transcript(transcript: list) -> list[dict]:
+    out: list[dict] = []
+    for seg in transcript or []:
+        row = {
+            "start": float(getattr(seg, "start", 0.0)),
+            "end": float(getattr(seg, "end", 0.0)),
+            "text": str(getattr(seg, "text", "") or ""),
+            "speaker_id": str(getattr(seg, "speaker", "") or ""),
+        }
+        words = getattr(seg, "words", None)
+        if words:
+            row["words"] = [
+                {
+                    "start": float(getattr(w, "start", 0.0)),
+                    "end": float(getattr(w, "end", 0.0)),
+                    "word": str(getattr(w, "word", "") or ""),
+                }
+                for w in words
+            ]
+        out.append(row)
+    return out
+
+
+def _serialize_speaker_events(events: list) -> list[dict]:
+    return [
+        {
+            "start": float(getattr(e, "start", 0.0)),
+            "end": float(getattr(e, "end", 0.0)),
+            "slot_id": int(getattr(e, "slot_id", -1) or -1),
+            "confidence": float(getattr(e, "confidence", 0.0) or 0.0),
+            "on_screen": bool(getattr(e, "on_screen", True)),
+        }
+        for e in events or []
+    ]
+
+
+def _serialize_content_profile(profile) -> dict:
+    if profile is None:
+        return {
+            "content_type": "unknown",
+            "confidence": 0.0,
+            "is_multi_speaker_panel": False,
+            "is_animated": False,
+            "anime_subtype": None,
+            "music_subtype": None,
+            "gameplay_subtype": None,
+            "game_type": "",
+        }
+    return {
+        "content_type": str(
+            getattr(profile, "content_type", "unknown") or "unknown",
+        ),
+        "confidence": float(getattr(profile, "confidence", 0.0) or 0.0),
+        "is_multi_speaker_panel": bool(
+            getattr(profile, "is_multi_speaker_panel", False),
+        ),
+        "is_animated": bool(getattr(profile, "is_animated", False)),
+        "anime_subtype": getattr(profile, "anime_subtype", None),
+        "music_subtype": getattr(profile, "music_subtype", None),
+        "gameplay_subtype": getattr(profile, "gameplay_subtype", None),
+        "game_type": str(getattr(profile, "game_type", "") or ""),
+    }
+
+
+def _serialize_anime_anchors(anchors: list) -> list[dict]:
+    return [
+        {
+            "timestamp": float(getattr(a, "timestamp", 0.0)),
+            "x": float(getattr(a, "x_pct", 50.0)),
+            "y": float(getattr(a, "y_pct", 50.0)),
+            "score": float(getattr(a, "score", 0.0)),
+            "source": str(getattr(a, "source", "fallback")),
+        }
+        for a in anchors or []
+    ]
+
+
+def _serialize_reframe_segments(segments: list) -> list[dict]:
+    """Emit a JSON-friendly list of dicts for ``segments.json``. Only
+    the fields the translator + scoring layer care about are pinned;
+    the rest are dropped so embeddings / numpy arrays never leak
+    into the cache blob.
+    """
+    out: list[dict] = []
+    for s in segments or []:
+        out.append({
+            "start": float(getattr(s, "start", 0.0)),
+            "end": float(getattr(s, "end", 0.0)),
+            "subject_x": float(getattr(s, "subject_x", 0.0)),
+            "subject_y": float(getattr(s, "subject_y", 0.0)),
+            "layout": str(getattr(s, "layout", "single") or "single"),
+            "active_slot": getattr(s, "active_slot", None),
+            "confidence": float(getattr(s, "confidence", 0.0) or 0.0),
+            "reason": str(getattr(s, "reason", "") or ""),
+            "ease_in_ms": int(getattr(s, "ease_in_ms", 0) or 0),
+            "strategy": str(getattr(s, "strategy", "stationary") or "stationary"),
+            "content_type": str(getattr(s, "content_type", "unknown") or "unknown"),
+        })
+    return out
+
+
+def _probe_source_metadata(video_path: Path) -> dict:
+    """Return ``{width, height, fps, duration}`` via ffprobe. Lazy
+    import + subprocess so the module stays sandbox-safe."""
+    import subprocess
+
+    cmd = [
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=width,height,r_frame_rate",
+        "-show_entries", "format=duration",
+        "-of", "json", str(video_path),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    payload = json.loads(result.stdout or "{}")
+    stream = (payload.get("streams") or [{}])[0]
+    fmt = payload.get("format") or {}
+    width = int(stream.get("width") or 0)
+    height = int(stream.get("height") or 0)
+    r_frame_rate = stream.get("r_frame_rate") or "30/1"
+    if "/" in str(r_frame_rate):
+        num, den = str(r_frame_rate).split("/")
+        denf = float(den)
+        fps = float(num) / denf if denf else float(num)
+    else:
+        fps = float(r_frame_rate)
+    duration = float(fmt.get("duration") or 0.0)
+    return {
+        "width": width, "height": height, "fps": fps, "duration": duration,
+    }
+
+
+def _extract_audio_wav(video_path: Path, cache_dir: Path) -> Path:
+    """Extract mono 16kHz WAV to ``cache_dir/audio.wav`` via ffmpeg.
+    Returns the output path. Lazy subprocess so sandbox-safe.
+    """
+    import subprocess
+
+    out = cache_dir / "audio.wav"
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-i", str(video_path),
+        "-ac", "1", "-ar", "16000",
+        str(out),
+    ]
+    subprocess.run(cmd, check=True, capture_output=True)
+    return out
+
+
+def _transcribe_sync(audio_path: Path) -> list:
+    """Synchronous wrapper around ``transcribe_audio``. Lazy import so
+    the module stays sandbox-safe; monkeypatched in unit tests so
+    whisper doesn't fire."""
+    import asyncio
+    from backend.services.transcription import transcribe_audio
+    return asyncio.run(transcribe_audio(str(audio_path)))
+
+
+def _classifier_metadata_from_clip(clip: dict) -> dict:
+    """Build the ``classify_content`` metadata dict from a manifest
+    clip entry, mirroring the mapping ``_run_segmenter`` in
+    ``measure_autoflip_parity.py`` uses."""
+    metadata: dict = {}
+    ct = clip.get("content_type") or ""
+    if ct:
+        metadata["content_type_override"] = ct
+    sub = clip.get("subtype")
+    if sub:
+        if ct == "anime":
+            metadata["anime_subtype"] = sub
+        elif ct == "music_video":
+            metadata["music_subtype"] = sub
+        elif ct in ("gameplay", "stream"):
+            metadata["game_type"] = sub
+        elif ct == "sports":
+            metadata["sports_subtype"] = sub
+    return metadata
+
+
+def _build_anime_features_seq(dense_faces: list) -> list:
+    """Build ``AnimeFrameFeatures`` stream from dense face results.
+    Mirrors the pipeline's v4 path (face pick + frame-to-frame
+    motion delta), minus the OpenCV contrast / saturation cascade.
+    """
+    from backend.services.anime_anchor import AnimeFrameFeatures
+
+    out: list = []
+    prev_x: Optional[float] = None
+    prev_y: Optional[float] = None
+    for df in dense_faces or []:
+        best = None
+        best_score = -1.0
+        for f in getattr(df, "faces", None) or []:
+            conf = float(getattr(f, "confidence", 0.0) or 0.0)
+            if conf > best_score:
+                best_score = conf
+                best = f
+        face_x = float(getattr(best, "nose_x", 50.0)) if best else 50.0
+        face_y = float(getattr(best, "nose_y", 50.0)) if best else 50.0
+        face_score = (
+            max(0.0, min(1.0, best_score)) if best is not None else 0.0
+        )
+        if prev_x is None:
+            motion = 0.0
+        else:
+            motion = min(1.0, (abs(face_x - prev_x) + abs(face_y - prev_y)) / 20.0)
+        prev_x, prev_y = face_x, face_y
+        out.append(AnimeFrameFeatures(
+            timestamp=float(getattr(df, "timestamp", 0.0)),
+            face_x_pct=face_x,
+            face_y_pct=face_y,
+            face_score=face_score,
+            motion_energy=motion,
+        ))
+    return out
+
+
+def _assert_content_type_routes_to_target(
+    clip: dict, content_profile, slug: str,
+) -> None:
+    """Run ``classify_clip`` and log a warning (not an abort) if the
+    classifier's output diverges from the manifest's editorial
+    ``target_clipcontenttype``. The divergence itself is a signal
+    worth capturing in the harness output."""
+    target = str(clip.get("target_clipcontenttype") or "").strip()
+    if not target:
+        return
+    try:
+        from backend.services.content_classifier import classify_clip
+        got = classify_clip(content_profile=content_profile)
+        got_val = getattr(got, "value", str(got))
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning(
+            "[%s] classify_clip raised %s — skipping divergence check",
+            slug, type(exc).__name__,
+        )
+        return
+    if got_val != target:
+        logger.warning(
+            "[%s] classify_clip divergence: manifest target=%s "
+            "classifier=%s (profile content_type=%s "
+            "is_multi_speaker_panel=%s is_animated=%s)",
+            slug, target, got_val,
+            getattr(content_profile, "content_type", None),
+            getattr(content_profile, "is_multi_speaker_panel", None),
+            getattr(content_profile, "is_animated", None),
+        )
+
+
+def _extract_and_cache(
+    clip: dict,
+    video_path: Path,
+    clip_cache: Path,
+    *,
+    cache_embeddings: bool,
+) -> dict:
+    """Full extraction + segmenter run + cache population.
+
+    Wipes the destination directory before rebuilding so partial
+    caches can't leak across runs. Returns the in-memory extraction
+    payload so the caller doesn't need a second round trip to disk.
+    """
+    # Wipe and recreate so partial caches can't leak.
+    if clip_cache.exists():
+        shutil.rmtree(clip_cache)
+    clip_cache.mkdir(parents=True, exist_ok=True)
+
+    slug = str(clip.get("slug") or video_path.stem)
+    sha = _sha256_file(video_path)
+
+    # Lazy imports so sandbox stays clean.
+    from backend.services.shot_detector import detect_shots
+    from backend.services.face_detector import detect_faces_dense
+    from backend.services.face_registry import (
+        build_face_registry_with_embeddings,
+        FaceRegistry,
+    )
+    from backend.services.content_classifier import classify_content
+    from backend.services.active_speaker import (
+        build_active_speaker_timeline,
+        build_active_speaker_timeline_v2,
+    )
+    from backend.services.reframe_segmenter import build_reframe_segments
+    from backend.services.anime_anchor import (
+        USE_ANIME_ANCHOR,
+        score_anime_sequence,
+    )
+
+    # ── Source metadata via ffprobe ──
+    source_meta = _probe_source_metadata(video_path)
+    duration = float(source_meta["duration"])
+    width = int(source_meta["width"])
+    height = int(source_meta["height"])
+    fps = float(source_meta["fps"])
+    metadata = {
+        "slug": slug,
+        "sha256": sha,
+        "width": width,
+        "height": height,
+        "fps": fps,
+        "duration": duration,
+    }
+    (clip_cache / "metadata.json").write_text(json.dumps(metadata, indent=2))
+
+    # ── Shots ──
+    shots = detect_shots(str(video_path), video_duration=duration) or []
+    (clip_cache / "shots.json").write_text(
+        json.dumps(_serialize_shots(shots), indent=2),
+    )
+    shot_cuts = [float(getattr(s, "start", 0.0)) for s in shots]
+
+    # ── Dense faces ──
+    dense_faces = detect_faces_dense(
+        str(video_path),
+        start=0.0,
+        end=duration,
+        sample_rate=0.5,
+        min_confidence=0.4,
+        extract_embeddings=True,
+    ) or []
+    (clip_cache / "dense_faces.json").write_text(
+        json.dumps(
+            _serialize_dense_faces(
+                dense_faces, include_embeddings=cache_embeddings,
+            ),
+            indent=2,
+        ),
+    )
+
+    # ── Face registry (embedding-based when we have dense data) ──
+    if dense_faces:
+        face_registry = build_face_registry_with_embeddings(
+            dense_faces, min_appearances=3, cosine_threshold=0.25,
+        )
+    else:
+        face_registry = FaceRegistry()
+    (clip_cache / "face_registry.json").write_text(
+        json.dumps(_serialize_face_registry(face_registry), indent=2),
+    )
+
+    # ── Audio + transcript ──
+    # The audio WAV lives alongside the extraction artifacts so the
+    # v2 active-speaker path can reuse it without re-extracting.
+    transcript: list = []
+    audio_path: Optional[Path] = None
+    try:
+        audio_path = _extract_audio_wav(video_path, clip_cache)
+        transcript = _transcribe_sync(audio_path) or []
+    except Exception as exc:
+        logger.warning(
+            "[%s] audio extraction / transcription failed (non-fatal): %s",
+            slug, exc,
+        )
+        transcript = []
+    (clip_cache / "transcript.json").write_text(
+        json.dumps(_serialize_transcript(transcript), indent=2),
+    )
+
+    # ── Active speaker events ──
+    # Mirrors the pipeline gate (pipeline.py:2672-2695): use v2 when
+    # dense face data is available, fall back to v1 otherwise.
+    speaker_events: list = []
+    try:
+        if (
+            face_registry
+            and getattr(face_registry, "multi_speaker", False)
+            and transcript
+            and dense_faces
+        ):
+            speaker_events = build_active_speaker_timeline_v2(
+                dense_faces, transcript, face_registry,
+                window_seconds=0.5,
+                shot_cuts=shot_cuts,
+                audio_path=str(audio_path) if audio_path else None,
+            ) or []
+        elif (
+            face_registry
+            and getattr(face_registry, "multi_speaker", False)
+            and transcript
+        ):
+            speaker_events = build_active_speaker_timeline(
+                dense_faces, transcript, face_registry,
+                window_seconds=2.0,
+                shot_cuts=shot_cuts,
+                audio_path=str(audio_path) if audio_path else None,
+            ) or []
+    except Exception as exc:
+        logger.warning(
+            "[%s] active speaker timeline failed (non-fatal): %s",
+            slug, exc,
+        )
+        speaker_events = []
+    (clip_cache / "speaker_events.json").write_text(
+        json.dumps(_serialize_speaker_events(speaker_events), indent=2),
+    )
+
+    # ── Content profile ──
+    classifier_meta = _classifier_metadata_from_clip(clip)
+    content_profile = None
+    try:
+        content_profile = classify_content(
+            shot_cuts=shot_cuts,
+            face_registry=face_registry,
+            dense_faces=dense_faces,
+            scenes=[],
+            video_duration=duration,
+            metadata=classifier_meta,
+            transcript_segments=transcript,
+        )
+    except Exception as exc:
+        logger.warning(
+            "[%s] classify_content failed (non-fatal): %s", slug, exc,
+        )
+    (clip_cache / "content_profile.json").write_text(
+        json.dumps(_serialize_content_profile(content_profile), indent=2),
+    )
+
+    _assert_content_type_routes_to_target(clip, content_profile, slug)
+
+    # ── Anime anchors (gated) ──
+    anime_anchors: list = []
+    if (
+        content_profile is not None
+        and getattr(content_profile, "is_animated", False)
+        and USE_ANIME_ANCHOR
+    ):
+        try:
+            features_seq = _build_anime_features_seq(dense_faces)
+            anime_anchors = list(score_anime_sequence(
+                features_seq,
+                anime_subtype=getattr(content_profile, "anime_subtype", None),
+            ))
+        except Exception as exc:
+            logger.warning(
+                "[%s] anime anchor extraction failed (non-fatal): %s",
+                slug, exc,
+            )
+            anime_anchors = []
+    (clip_cache / "anime_anchors.json").write_text(
+        json.dumps(_serialize_anime_anchors(anime_anchors), indent=2),
+    )
+
+    # ── Reframe segments ──
+    segments = build_reframe_segments(
+        shot_cuts=shot_cuts,
+        face_registry=face_registry,
+        active_speaker_events=speaker_events,
+        dense_faces=dense_faces,
+        transcript_segments=transcript,
+        speaker_to_slot={},
+        video_duration=duration,
+        source_width=width or 1920,
+        source_height=height or 1080,
+        job_id=slug,
+        content_profile=content_profile,
+        persistent_regions=None,
+        pacing_estimator=None,
+        interpolated_timeline=None,
+        frame_saliency=None,
+        music_beat_grid=None,
+        anime_anchors=anime_anchors or None,
+        debug_out={},
+    ) or []
+    segments_serialized = _serialize_reframe_segments(segments)
+    (clip_cache / "segments.json").write_text(
+        json.dumps(segments_serialized, indent=2),
+    )
+
+    # Stamp the cache version LAST so a crash partway through leaves
+    # the directory invalid (required-file check fails).
+    (clip_cache / "cache_version.txt").write_text(
+        str(EXTRACTION_CACHE_VERSION),
+    )
+
+    return {
+        "metadata": metadata,
+        "segments": segments_serialized,
+    }
+
+
+def _load_cached_extraction(clip_cache: Path) -> dict:
+    metadata = json.loads((clip_cache / "metadata.json").read_text())
+    segments = json.loads((clip_cache / "segments.json").read_text())
+    return {"metadata": metadata, "segments": segments}
+
+
 def run_clipai_on_clip(
     clip: dict,
     video_path: Optional[Path],
     *,
     dry_run: bool = False,
+    cache_dir: Optional[Path] = None,
+    cache_embeddings: bool = False,
+    force_reextract: bool = False,
 ) -> Optional[list[dict]]:
     """Produce a ClipAI timeline event list for a clip.
 
-    **Current revision is a stub.** The real implementation will
-    crib from ``measure_autoflip_parity.py``'s inline segmenter
-    path — build a fake ``FaceRegistry`` + dense ``FrameFaces``
-    list from a real extraction cache, call
-    ``build_reframe_segments``, and translate with
-    ``export_autoflip_compatible.reframe_segments_to_events``.
+    Two operating modes:
 
-    For now, the stub emits a one-segment timeline covering
-    ``[0, clip.duration_sec]`` so the scoring layer has a
-    well-formed input to chew on and produces a coherent markdown
-    rollup. When the real invocation lands, this stub becomes
-    obsolete and the harness actually measures ClipAI.
+    1. ``dry_run=True`` or ``video_path is None`` — returns the
+       legacy synthetic one-frame-per-frame timeline so the
+       ``--dry-run`` iteration path (scoring-layer-only work)
+       stays fast and sandbox-safe. This is the same shape the
+       existing harness tests pin.
+
+    2. Real invocation — resolves the extraction cache under
+       ``cache_dir`` (or ``$CLIPAI_REAL_CONTENT_CACHE/extractions``),
+       runs the full extraction stack (shots → dense faces →
+       registry → transcript → active speaker → content profile →
+       anime anchors → reframe segments) when the cache is cold,
+       and translates the segment list via
+       ``export_autoflip_compatible.reframe_segments_to_events``.
+
+    Returns ``None`` when the video path is supplied but does not
+    exist on disk — the harness reports that row as
+    ``clipai_skipped``.
     """
+    # ── Synthetic / dry-run path ──
     if dry_run or video_path is None:
-        duration = float(clip.get("duration_sec") or 10.0)
-        fps = 30.0
-        events = []
-        n = max(1, int(duration * fps))
-        for fi in range(n):
-            events.append({
-                "frame": fi,
-                "t": fi / fps,
-                "crop_cx": 0.5,
-                "crop_cy": 0.5,
-                "crop_w": 0.3164,
-                "crop_h": 1.0,
-                "scene_change": fi == 0,
-            })
-        return events
+        return _synthetic_events_for_clip(clip)
 
-    # Real invocation path — TODO in a follow-up session.
-    logger.warning(
-        "[%s] run_clipai_on_clip: real invocation not yet wired; "
-        "returning None so the harness reports 'clipai_skipped'.",
-        clip.get("slug"),
+    slug = str(clip.get("slug") or "")
+
+    # ── Missing file → skipped row ──
+    video_path = Path(video_path)
+    if not video_path.is_file():
+        logger.warning(
+            "[%s] run_clipai_on_clip: video not found at %s — returning None",
+            slug, video_path,
+        )
+        return None
+
+    # ── Resolve cache dir ──
+    resolved_cache_dir = (
+        Path(cache_dir) if cache_dir is not None
+        else _default_extraction_cache_dir()
     )
-    return None
+
+    try:
+        sha = _sha256_file(video_path)
+    except OSError as exc:
+        logger.warning(
+            "[%s] failed to hash %s: %s — returning None",
+            slug, video_path, exc,
+        )
+        return None
+
+    clip_cache = resolved_cache_dir / sha
+
+    if not force_reextract and _cache_is_valid(clip_cache):
+        logger.info(
+            "[%s] extraction cache HIT at %s", slug, clip_cache,
+        )
+        payload = _load_cached_extraction(clip_cache)
+    else:
+        logger.info(
+            "[%s] extraction cache MISS at %s — running full extraction",
+            slug, clip_cache,
+        )
+        try:
+            payload = _extract_and_cache(
+                clip, video_path, clip_cache,
+                cache_embeddings=cache_embeddings,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[%s] extraction failed: %s — returning None",
+                slug, exc,
+            )
+            return None
+
+    metadata = payload.get("metadata") or {}
+    segments = payload.get("segments") or []
+    src_w = int(metadata.get("width") or 1920)
+    src_h = int(metadata.get("height") or 1080)
+    fps = float(metadata.get("fps") or 30.0)
+
+    # Lazy import of the translator so the dry-run path stays
+    # sandbox-safe (the translator itself is pure, but the import
+    # sits next to the ffprobe helper we DON'T want to drag along).
+    from backend.scripts.export_autoflip_compatible import (
+        reframe_segments_to_events,
+    )
+    events = reframe_segments_to_events(
+        segments, src_w, src_h, fps, aspect_ratio="9:16",
+    )
+    return events
 
 
 def load_autoflip_timeline(
@@ -442,6 +1184,29 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="Emit stubbed ClipAI timelines without invoking the pipeline",
     )
     parser.add_argument(
+        "--real-content-dir", default=None,
+        help=(
+            "Directory containing the resolved clip videos. Defaults "
+            "to $CLIPAI_REAL_CONTENT_CACHE (/var/cache/clipai/real_content "
+            "if unset). Each clip is looked up as <dir>/<slug>.<ext>."
+        ),
+    )
+    parser.add_argument(
+        "--extraction-cache-dir", default=None,
+        help=(
+            "Directory for the per-clip extraction cache "
+            "($CLIPAI_REAL_CONTENT_CACHE/extractions by default)."
+        ),
+    )
+    parser.add_argument(
+        "--cache-embeddings", action="store_true",
+        help="Persist identity embeddings in dense_faces.json (large).",
+    )
+    parser.add_argument(
+        "--force-reextract", action="store_true",
+        help="Ignore the extraction cache and rebuild every clip.",
+    )
+    parser.add_argument(
         "--quiet", action="store_true",
     )
     args = parser.parse_args(argv)
@@ -459,6 +1224,18 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     autoflip_dir = Path(args.autoflip_outputs)
     gt_dir = Path(args.ground_truth_dir)
+
+    # ── Resolve real-content + extraction cache roots ──
+    real_content_dir = (
+        Path(args.real_content_dir) if args.real_content_dir
+        else Path(os.environ.get(
+            "CLIPAI_REAL_CONTENT_CACHE", "/var/cache/clipai/real_content",
+        ))
+    )
+    extraction_cache_dir = (
+        Path(args.extraction_cache_dir) if args.extraction_cache_dir
+        else _default_extraction_cache_dir()
+    )
 
     results: list[ClipResult] = []
     filter_glob = args.filter
@@ -488,11 +1265,32 @@ def main(argv: Optional[list[str]] = None) -> int:
                 result.autoflip = score_timeline(af_events)
 
         # ClipAI timeline
+        # Resolve the on-disk video path from the real-content dir,
+        # using the manifest's slug + ext. In dry-run mode we pass
+        # None so the synthetic path fires regardless.
+        if args.dry_run:
+            _video_path = None
+        else:
+            _ext = str(clip.get("ext") or "mp4")
+            _candidate = real_content_dir / f"{slug}.{_ext}"
+            _video_path = _candidate if _candidate.is_file() else None
+            if _video_path is None:
+                result.notes.append(
+                    f"no clip at {_candidate}"
+                )
         ca_events = run_clipai_on_clip(
-            clip, video_path=None, dry_run=args.dry_run,
+            clip,
+            video_path=_video_path,
+            dry_run=args.dry_run,
+            cache_dir=extraction_cache_dir,
+            cache_embeddings=args.cache_embeddings,
+            force_reextract=args.force_reextract,
         )
         if ca_events is None:
-            result.notes.append("clipai pipeline invocation not wired")
+            if args.dry_run:
+                result.notes.append("clipai pipeline invocation not wired")
+            else:
+                result.notes.append("clipai_skipped")
         else:
             result.clipai = score_timeline(ca_events)
 
@@ -516,8 +1314,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         results,
         autoflip_outputs_dir=autoflip_dir,
         clipai_invocation=(
-            "stub (dry_run=%s)" % args.dry_run
-            if args.dry_run else "real (not yet wired)"
+            "stub (dry_run=True)" if args.dry_run
+            else f"real (cache={extraction_cache_dir})"
         ),
     )
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
