@@ -18,7 +18,6 @@ import logging
 import os
 import time
 import uuid
-from datetime import datetime, timezone
 from typing import Optional
 
 import aiofiles
@@ -26,10 +25,8 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, UploadFi
 from pydantic import BaseModel
 
 from backend.config import settings
-from backend.models import JobResult, JobStatus
-from backend import database
-from backend.services.pipeline import run_analysis
 from backend.services.upload_state import upload_state
+from backend.services.ingest import IngestMetadata, ingest_video_from_path
 
 logger = logging.getLogger(__name__)
 
@@ -532,45 +529,43 @@ async def _assemble_and_finalize(upload_id: str, job_id: str, file_hash: str):
 
     file_size_mb = round(info["file_size"] / (1024 * 1024), 2)
     filename = info["filename"]
-    lang = info["language"].strip().lower()
-    subtitle_lang = info.get("subtitle_language", "").strip().lower()
-    ct_override = info.get("content_type_override", "").strip().lower()
-    gt = info.get("game_type", "").strip().lower()
-    anime_sub = info.get("anime_subtype", "").strip().lower()
-    music_sub = info.get("music_subtype", "").strip().lower()
-    sports_sub = info.get("sports_subtype", "").strip().lower()
 
     logger.info("[%s] Upload complete: %s → %s (%.1f MB, QA: %s)",
                 upload_id, filename, video_path, file_size_mb,
                 "PASS" if all_passed else "FAIL")
 
-    now = datetime.now(timezone.utc).isoformat()
-    job = JobResult(
-        job_id=job_id,
-        filename=filename,
-        file_path=video_path,
-        file_size_mb=file_size_mb,
-        language=lang,
-        subtitle_language=subtitle_lang,
-        content_type_override=ct_override,
-        game_type=gt,
-        anime_subtype=anime_sub,
-        music_subtype=music_sub,
-        sports_subtype=sports_sub,
-        status=JobStatus.QUEUED,
-        progress=0,
-        progress_message="Uploaded, waiting for analysis",
-        created_at=now,
-        updated_at=now,
+    # Hand the already-validated file to the shared ingest entry point.
+    # The file is already at the canonical ``/data/uploads/<job_id>/video.<ext>``
+    # path so we pass ``move_into_job_dir=False``. The ingest helper
+    # still re-runs header validation (cheap, ~ms) and is the single
+    # point of convergence with the cloud-storage importer and the
+    # non-chunked local upload path.
+    metadata = IngestMetadata.from_form(
+        language=info.get("language", ""),
+        subtitle_language=info.get("subtitle_language", ""),
+        content_type_override=info.get("content_type_override", ""),
+        game_type=info.get("game_type", ""),
+        anime_subtype=info.get("anime_subtype", ""),
+        music_subtype=info.get("music_subtype", ""),
+        sports_subtype=info.get("sports_subtype", ""),
+        source="chunked",
     )
-    await database.save_job(job)
+    try:
+        await ingest_video_from_path(
+            video_path,
+            filename=filename,
+            file_size_bytes=info["file_size"],
+            metadata=metadata,
+            job_id=job_id,
+            move_into_job_dir=False,
+        )
+    except Exception as exc:
+        logger.exception("[%s] Ingest failed for chunked upload", upload_id)
+        info["state"] = "error"
+        info["error"] = str(exc)
+        return
     info["job_id"] = job_id
-
-    if settings.AUTO_ANALYZE:
-        job.progress_message = "Analysis starting..."
-        await database.save_job(job)
-        asyncio.create_task(run_analysis(job_id))
-        logger.info("[%s] Analysis task created for %s", upload_id, job_id)
+    logger.info("[%s] Handed off to ingest (job_id=%s)", upload_id, job_id)
 
 
 @router.post("/complete", response_model=CompleteResponse)

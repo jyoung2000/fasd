@@ -3,6 +3,7 @@ import { useSearchParams } from 'react-router-dom';
 import ModelBrowser from '../components/ModelBrowser';
 import PipelineDiagnostics from '../components/PipelineDiagnostics';
 import CostTracker from '../components/CostTracker';
+import CloudStorageSection from '../components/cloud/CloudStorageSection';
 import { showToast } from '../components/Toast';
 import useResponsive from '../hooks/useResponsive';
 import { loadAllPresets, deletePreset as deleteTrackPreset, renamePreset as renameTrackPreset } from '../utils/trackPresets';
@@ -1951,6 +1952,12 @@ export default function Settings() {
       {settingsTab === 4 && (
         <div>
           <div style={{ maxWidth: isMobile ? '100%' : 480 }}>
+
+            {/* ── Cloud Storage ── */}
+            <div style={{ marginBottom: 32 }}>
+              <h3 style={{ fontSize: 14, marginBottom: 16, color: 'var(--text-secondary)' }}>Cloud Storage</h3>
+              <CloudStorageSection />
+            </div>
 
             {/* ── GPU Hardware Acceleration ── */}
             <div style={{ marginBottom: 32 }}>

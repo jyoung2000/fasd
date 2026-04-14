@@ -3,23 +3,16 @@ import errno
 import logging
 import os
 import uuid
-from datetime import datetime, timezone
 
 import aiofiles
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
 
-from backend.config import settings
-from backend.models import JobResult, JobStatus
-from backend import database
-from backend.services.pipeline import run_analysis
+from backend.models import JobStatus
+from backend.services.ingest import IngestError, IngestMetadata, ingest_video_from_path
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["upload"])
-
-ALLOWED_EXTENSIONS = {"mp4", "mov", "avi", "mkv", "webm", "m4v", "3gp"}
-
-from backend.services.video_validation import validate_video_header as _validate_video_header
 
 
 def _parse_content_type(header: str) -> tuple[str, str]:
@@ -283,63 +276,36 @@ async def upload_video(
         _cleanup(tmp_path)
         raise
 
-    # Validate extension
-    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
-    if ext not in ALLOWED_EXTENSIONS:
-        _cleanup(tmp_path)
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported format. Allowed: {', '.join(ALLOWED_EXTENSIONS)}",
-        )
-
-    video_path = os.path.join(job_dir, f"video.{ext}")
-    await asyncio.to_thread(os.rename, tmp_path, video_path)
-
     if total_bytes == 0:
-        _cleanup(video_path)
+        _cleanup(tmp_path)
         raise HTTPException(status_code=400, detail="Uploaded file is empty")
 
-    # Validate file header — catch corrupt / incomplete files before analysis
-    header_err = await asyncio.to_thread(_validate_video_header, video_path, ext)
-    if header_err:
-        logger.warning(f"Rejected upload {filename} ({total_bytes} bytes): {header_err}")
-        _cleanup(video_path)
-        raise HTTPException(status_code=422, detail=header_err)
-
-    logger.info(f"Upload accepted: {video_path} ({total_bytes} bytes)")
-
-    lang = language.strip().lower() if language else ""
-    sub_lang = subtitle_language.strip().lower() if subtitle_language else ""
-    ct_override = content_type_override.strip().lower() if content_type_override else ""
-    gt = game_type.strip().lower() if game_type else ""
-    anime_sub = anime_subtype.strip().lower() if anime_subtype else ""
-    music_sub = music_subtype.strip().lower() if music_subtype else ""
-    sports_sub = sports_subtype.strip().lower() if sports_subtype else ""
-
-    now = datetime.now(timezone.utc).isoformat()
-    job = JobResult(
-        job_id=job_id,
-        filename=filename,
-        file_path=video_path,
-        file_size_mb=round(total_bytes / (1024 * 1024), 2),
-        language=lang,
-        subtitle_language=sub_lang,
-        content_type_override=ct_override,
-        game_type=gt,
-        anime_subtype=anime_sub,
-        music_subtype=music_sub,
-        sports_subtype=sports_sub,
-        status=JobStatus.QUEUED,
-        progress=0,
-        progress_message="Uploaded, waiting for analysis",
-        created_at=now,
-        updated_at=now,
+    # Hand the file off to the shared ingest entry point. This is the
+    # same code path the chunked upload and cloud-storage importer take,
+    # so every ingestion flow converges on one function — no downstream
+    # behavior can diverge between them.
+    metadata = IngestMetadata.from_form(
+        language=language,
+        subtitle_language=subtitle_language,
+        content_type_override=content_type_override,
+        game_type=game_type,
+        anime_subtype=anime_subtype,
+        music_subtype=music_subtype,
+        sports_subtype=sports_subtype,
+        source="local",
     )
-    await database.save_job(job)
+    try:
+        final_job_id = await ingest_video_from_path(
+            tmp_path,
+            filename=filename,
+            file_size_bytes=total_bytes,
+            metadata=metadata,
+            job_id=job_id,
+            move_into_job_dir=True,
+        )
+    except IngestError as exc:
+        _cleanup(tmp_path)
+        raise HTTPException(status_code=exc.status_code, detail=str(exc))
 
-    if settings.AUTO_ANALYZE:
-        background_tasks.add_task(run_analysis, job_id)
-        job.progress_message = "Analysis starting..."
-        await database.save_job(job)
-
-    return {"job_id": job_id, "status": job.status, "filename": filename}
+    logger.info("Upload accepted: job_id=%s filename=%s bytes=%d", final_job_id, filename, total_bytes)
+    return {"job_id": final_job_id, "status": JobStatus.QUEUED, "filename": filename}

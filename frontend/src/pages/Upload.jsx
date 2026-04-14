@@ -2,6 +2,7 @@ import React, { useState, useRef, useCallback, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import ProgressBar from '../components/ProgressBar';
 import useResponsive from '../hooks/useResponsive';
+import CloudSourceTabs from '../components/cloud/CloudSourceTabs';
 
 const ACCEPTED = 'video/*,.mp4,.mov,.avi,.mkv,.webm,.m4v,.3gp';
 const ACCEPTED_DISPLAY = 'MP4 \u00B7 MOV \u00B7 AVI \u00B7 MKV \u00B7 WEBM \u00B7 M4V \u00B7 3GP';
@@ -953,9 +954,38 @@ export default function Upload() {
           ? 'Finishing upload...'
           : 'Uploading...';
 
+  // Cloud import hook-in: when the user picks a file from Google Drive or
+  // Box, the import endpoint returns a job_id immediately and the
+  // existing /analysis/<job_id> route takes over (it opens the same
+  // websocket channel the local upload progress UI uses).
+  const handleCloudJobStart = useCallback(
+    (jobId) => {
+      if (!jobId) return;
+      navigate(`/analysis/${jobId}`);
+    },
+    [navigate]
+  );
+
   return (
     <div style={{ maxWidth: isMobile ? '100%' : 640, margin: '0 auto' }}>
       <h2 style={{ fontSize: isMobile ? 18 : 20, marginBottom: isMobile ? 20 : 24 }}>Upload Video</h2>
+
+      {/* Cloud storage tabs — hidden entirely when the feature flag is off
+          or the operator hasn't configured any cloud provider. */}
+      {!uploading && (
+        <CloudSourceTabs
+          uploadMetadata={{
+            language,
+            subtitle_language: subtitleLanguage,
+            content_type_override: contentTypeOverride,
+            game_type: gameType,
+            anime_subtype: animeSubtype,
+            music_subtype: musicSubtype,
+            sports_subtype: sportsSubtype,
+          }}
+          onJobStart={handleCloudJobStart}
+        />
+      )}
 
       {/* Drop zone */}
       <div

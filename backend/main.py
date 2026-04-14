@@ -24,11 +24,18 @@ from backend.routers import upload, jobs, clips, fonts, presets, settings as set
 from backend.routers import agent as agent_router
 from backend.routers import media as media_router
 from backend.routers import chunked_upload
+from backend.routers import cloud as cloud_router
 from backend.routers import diagnostics as diagnostics_router
 from backend.routers import render_plan as render_plan_router
 from backend.routers import thumbnails as thumbnails_router
 from backend.routers import share as share_router
 from backend.routers.api_v1 import router as api_v1_router
+from backend.app.cloud.logging_filter import install_redaction_filter
+
+# Cloud storage tokens / OAuth credentials must never leak into logs.
+# The redaction filter runs before anything else so even stray
+# logger.debug() calls in third-party libraries get scrubbed.
+install_redaction_filter()
 
 LOG_FILE = "/data/logs/app.log"
 
@@ -481,6 +488,7 @@ async def start_cleanup_task():
 # Register API routers
 app.include_router(upload.router)
 app.include_router(chunked_upload.router)
+app.include_router(cloud_router.router)
 app.include_router(jobs.router)
 app.include_router(clips.router)
 app.include_router(fonts.router)

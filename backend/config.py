@@ -79,6 +79,27 @@ class Settings(BaseSettings):
     CLIPAI_CONTENT_ROUTING: str = "off"  # "on" | "off" — env CLIPAI_CONTENT_ROUTING
     CLIPAI_CONTENT_TYPES_ENABLED: str = ""  # comma-separated: "talking_head,stream" — empty = all
 
+    # ── Cloud storage integration (Google Drive + Box) ───────────────────────
+    # Feature flag — default on, flip to "false" in the Unraid template to
+    # kill the entire feature if something goes wrong in production.
+    CLIPAI_CLOUD_STORAGE_ENABLED: bool = True
+
+    # Fernet key (32 url-safe base64 bytes) used to encrypt stored OAuth
+    # tokens at rest. If missing, a loud warning is logged and an ephemeral
+    # key is generated (which means every container restart drops stored
+    # cloud sessions — set this in your Unraid template).
+    CLIPAI_TOKEN_ENC_KEY: str = ""
+
+    # Google Drive OAuth client credentials.
+    GOOGLE_DRIVE_CLIENT_ID: str = ""
+    GOOGLE_DRIVE_CLIENT_SECRET: str = ""
+    GOOGLE_DRIVE_REDIRECT_URI: str = "http://localhost:8000/api/cloud/google_drive/callback"
+
+    # Box OAuth client credentials.
+    BOX_CLIENT_ID: str = ""
+    BOX_CLIENT_SECRET: str = ""
+    BOX_REDIRECT_URI: str = "http://localhost:8000/api/cloud/box/callback"
+
     @property
     def active_provider_chain(self) -> list[str]:
         return [p.strip() for p in self.AI_FALLBACK_CHAIN.split(",") if p.strip()]
