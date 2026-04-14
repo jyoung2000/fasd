@@ -1,0 +1,40 @@
+# `backend/models/`
+
+Binary model files that ship with the ClipAI backend. These are
+committed to the repo rather than downloaded at build time so the
+Docker image is self-contained and deterministic.
+
+## Files
+
+### `lbpcascade_animeface.xml`
+
+- **Size:** ~250 KB
+- **Source:** <https://github.com/nagadomi/lbpcascade_animeface>
+- **License:** Public domain (per Nagadomi's stated terms on the
+  upstream repo).
+- **Used by:** `backend/services/anime_face_detector.py` via the
+  `DEFAULT_CASCADE_PATH` module constant. Loaded lazily by
+  `detect_anime_faces()` on the first anime-classified clip.
+- **Why it's needed:** YuNet / FaceMesh / OpenCV DNN all struggle on
+  stylized anime faces because they're trained on human-face
+  distributions. The lbpcascade was trained specifically on anime /
+  cartoon character data and catches the stylized eyes + simplified
+  nose geometry that the human detectors drop. Week 2 wiring
+  (`CLIPAI_ANIME_FACE_DETECTOR=1`) augments the live-action dense
+  face stream with these detections on frames where the live-action
+  detector found nothing or only low-confidence boxes.
+
+If you find this file and wonder why it's here, it's because the
+anime face detector no-ops without it — `detect_anime_faces()`
+returns `AnimeDetectionResult(skipped_reason="cascade not found: ...")`
+when the XML is missing. Do **not** delete it.
+
+## How to re-download
+
+```bash
+curl -L -o backend/models/lbpcascade_animeface.xml \
+  https://github.com/nagadomi/lbpcascade_animeface/raw/master/lbpcascade_animeface.xml
+# Verify
+head -c 32 backend/models/lbpcascade_animeface.xml  # should start with <?xml
+wc -l backend/models/lbpcascade_animeface.xml       # should be ~6693 lines
+```

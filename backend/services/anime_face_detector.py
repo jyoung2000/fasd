@@ -43,8 +43,12 @@ so anime detections AUGMENT the live-action stream rather than
 replacing it. The face_registry's identity-clustering step then
 folds them into the same slot system.
 
-Feature flag: ``CLIPAI_ANIME_FACE_DETECTOR`` env var, default OFF
-until in-docker validation lands the post-Phase-6 numbers.
+Feature flag: ``CLIPAI_ANIME_FACE_DETECTOR`` env var, default ON as
+of Week 2. The dense-face augmentation call site lives in
+``face_detector._augment_dense_with_anime``; set the env var to ``0``
+to disable the augmentation pass without touching the rest of the
+anime pipeline (shot detector, character clustering, saliency anchor
+all have their own flags).
 """
 
 from __future__ import annotations
@@ -60,7 +64,7 @@ logger = logging.getLogger(__name__)
 # ──────────────────── Feature flag ────────────────────
 
 USE_ANIME_FACE_DETECTOR = os.environ.get(
-    "CLIPAI_ANIME_FACE_DETECTOR", "0",
+    "CLIPAI_ANIME_FACE_DETECTOR", "1",
 ).lower() in ("1", "true", "yes", "on")
 
 

@@ -125,6 +125,136 @@ class ContentProfile:
     game_type: str = ""
 
 
+def _infer_sports_subtype_from_objects(
+    frame_objects,
+    *,
+    ball_ratio_threshold: float = 0.15,
+    vehicle_ratio_threshold: float = 0.10,
+    vehicle_min_area_pct: float = 5.0,
+) -> Optional[tuple[str, float, float]]:
+    """Return ``(subtype, ball_ratio, vehicle_ratio)`` or ``None``.
+
+    Pure function. Accepts either shape the pipeline might pass:
+
+    1. **Flat list** of ``ObjectDetection``-shaped records (one entry
+       per detection, each with ``.timestamp``, ``.class_name``,
+       ``.w``, ``.h`` attributes). This is what ``_object_detections``
+       is at call time in ``pipeline.py``. The helper groups by
+       rounded timestamp internally.
+
+    2. **Per-frame list** where each element has an ``.objects``
+       attribute listing the per-frame detections (future-proof for
+       a FrameObjects shape).
+
+    Decision rule:
+      - basketball wins when ``ball_ratio >= 0.15`` AND > ``vehicle_ratio``
+      - racing wins when ``vehicle_ratio >= 0.10`` AND > ``ball_ratio``
+      - otherwise no promotion (``None``)
+
+    Vehicle detections must additionally span ``>= 5%`` of frame area
+    to count — background cars in a wide running shot are dropped.
+    ``width`` and ``height`` are assumed to be in percent of frame
+    (0-100, matching the rest of the codebase).
+    """
+    if not frame_objects:
+        return None
+
+    # Shape detection: if the first element has ``.objects``, treat
+    # it as a per-frame list; otherwise group the flat list by
+    # rounded timestamp.
+    _first = frame_objects[0]
+    if hasattr(_first, "objects"):
+        grouped = [list(getattr(fo, "objects", []) or []) for fo in frame_objects]
+    else:
+        by_ts: dict = {}
+        for det in frame_objects:
+            ts = round(float(getattr(det, "timestamp", 0.0) or 0.0), 2)
+            by_ts.setdefault(ts, []).append(det)
+        grouped = list(by_ts.values())
+
+    n_frames = len(grouped)
+    if n_frames == 0:
+        return None
+
+    ball_frames = 0
+    vehicle_frames = 0
+    area_gate = float(vehicle_min_area_pct) * 100.0  # 5% × 100 = 500
+
+    for objs in grouped:
+        if any(getattr(o, "class_name", "") == "sports ball" for o in objs):
+            ball_frames += 1
+        for o in objs:
+            cn = getattr(o, "class_name", "")
+            if cn not in ("car", "truck", "motorcycle"):
+                continue
+            w = float(getattr(o, "w", 0.0) or 0.0)
+            h = float(getattr(o, "h", 0.0) or 0.0)
+            if (w * h) >= area_gate:
+                vehicle_frames += 1
+                break  # one vehicle hit per frame is enough
+
+    ball_ratio = ball_frames / n_frames
+    vehicle_ratio = vehicle_frames / n_frames
+
+    if ball_ratio >= ball_ratio_threshold and ball_ratio > vehicle_ratio:
+        return ("basketball", ball_ratio, vehicle_ratio)
+    if vehicle_ratio >= vehicle_ratio_threshold and vehicle_ratio > ball_ratio:
+        return ("racing", ball_ratio, vehicle_ratio)
+    return None
+
+
+def _infer_music_subtype_from_formation_and_beat(
+    dense_faces,
+    beat_grid,
+    *,
+    formation_ratio_threshold: float = 0.08,
+    beat_confidence_threshold: float = 0.6,
+) -> Optional[tuple[str, float, float]]:
+    """Return ``(subtype, formation_ratio, beat_confidence)`` or ``None``.
+
+    Pure function. ``dense_faces`` is a list of ``FrameFaces`` from
+    the dense detector; the helper runs ``_is_formation_frame`` on
+    each (imported lazily to avoid a circular import at module
+    load time). ``beat_grid`` is the ``BeatGrid`` object from the
+    beat detector — its ``.confidence`` drives the promotion.
+
+    Decision rule:
+      - "performance" when formation_ratio >= 0.08 AND beat_conf >= 0.6
+      - otherwise no promotion (``None``)
+    """
+    if not dense_faces:
+        return None
+    beat_conf = 0.0
+    if beat_grid is not None:
+        # Prefer effective_confidence() which zeros out empty grids;
+        # fall back to a raw `confidence` attribute for stub shapes
+        # the tests might pass.
+        _eff = getattr(beat_grid, "effective_confidence", None)
+        if callable(_eff):
+            beat_conf = float(_eff())
+        else:
+            beat_conf = float(getattr(beat_grid, "confidence", 0.0) or 0.0)
+
+    try:
+        from backend.services.reframe_segmenter import _is_formation_frame
+    except ImportError:
+        return None
+
+    n_frames = len(dense_faces)
+    if n_frames == 0:
+        return None
+    formation_ratio = sum(
+        1 for fr in dense_faces if _is_formation_frame(fr)
+    ) / n_frames
+
+    if (
+        formation_ratio >= formation_ratio_threshold
+        and beat_conf >= beat_confidence_threshold
+    ):
+        return ("performance", formation_ratio, beat_conf)
+    return None
+
+
 def classify_content(
     shot_cuts: list[float],
     face_registry,
@@ -472,6 +602,75 @@ def classify_content(
     else:
         profile.content_type = best_type
         profile.confidence = min(1.0, confidence)
+
+    # ── Sports subtype auto-promotion (Week 2 Part D) ──
+    # When the classifier landed on "sports" but the user didn't
+    # provide a subtype via the upload dropdown, infer the subtype
+    # from COCO object frequency. Basketball clips have a "sports ball"
+    # object in ≥15% of frames; racing clips have a "car" / "truck" /
+    # "motorcycle" at ≥10% of frames with ≥5% frame area. These
+    # thresholds are tuned to fire on a half-court basketball clip
+    # and a broadcaster-frame F1 clip but NOT on a generic running-
+    # through-a-street shot where background vehicles are incidental.
+    if (
+        profile.content_type == ContentType.SPORTS.value
+        and not profile.sports_subtype
+    ):
+        try:
+            _sub = _infer_sports_subtype_from_objects(
+                metadata.get("frame_objects") if metadata else None
+            )
+            if _sub is not None:
+                sub_name, ball_ratio, vehicle_ratio = _sub
+                profile.sports_subtype = sub_name
+                signals["sports_subtype_autoprom"] = sub_name
+                signals["sports_ball_frame_ratio"] = round(ball_ratio, 3)
+                signals["sports_vehicle_frame_ratio"] = round(vehicle_ratio, 3)
+                _log(
+                    "sports → %s auto-promoted (ball=%.2f, vehicle=%.2f)",
+                    sub_name, ball_ratio, vehicle_ratio,
+                )
+        except Exception as e:
+            logger.warning(
+                "[%s] Sports subtype auto-promotion failed: %s",
+                job_id, e,
+            )
+
+    # ── Music video subtype auto-promotion (Week 2 Part E) ──
+    # User picked "music_video" but no subtype: auto-promote to
+    # "performance" when formation density + beat confidence are
+    # both high. Formation frames come from dense_faces via
+    # _is_formation_frame; beat confidence comes from the BeatGrid
+    # populated upstream when librosa beat-tracking succeeded. If
+    # the beat grid isn't available (music_beat_grid not in metadata),
+    # we default to "narrative"-equivalent (leave subtype empty).
+    if (
+        profile.content_type == ContentType.MUSIC_VIDEO.value
+        and not profile.music_subtype
+    ):
+        try:
+            _music_sub = _infer_music_subtype_from_formation_and_beat(
+                dense_faces=dense_faces,
+                beat_grid=(
+                    metadata.get("music_beat_grid") if metadata else None
+                ),
+            )
+            if _music_sub is not None:
+                sub_name, formation_ratio, beat_conf = _music_sub
+                profile.music_subtype = sub_name
+                signals["music_subtype_autoprom"] = sub_name
+                signals["formation_ratio"] = round(formation_ratio, 3)
+                signals["beat_confidence"] = round(beat_conf, 3)
+                _log(
+                    "music_video → %s auto-promoted "
+                    "(formation=%.2f, beat_conf=%.2f)",
+                    sub_name, formation_ratio, beat_conf,
+                )
+        except Exception as e:
+            logger.warning(
+                "[%s] Music subtype auto-promotion failed: %s",
+                job_id, e,
+            )
 
     # ── Cinematic dialogue detection ──
     # Promote NARRATIVE → CINEMATIC_DIALOGUE when we have ≥2 face slots AND

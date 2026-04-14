@@ -276,9 +276,10 @@ is "Yes (live)" when its module has ≥1 production call site outside
 its defining file; it is "No (dormant)" when the module is defined
 but no other pipeline code invokes it.
 
-Last reconciled: Week 1 flag audit (post-v4 universal reframing).
-See ``docs/reframing_autoflip_parity.md`` "Week 1 flag audit" section
-for the validation record.
+Last reconciled: Week 2 anime wiring + sports/music subtype
+auto-promotion. See ``docs/reframing_autoflip_parity.md`` "Week 1
+flag audit" + "Week 2 — anime wiring and subtype auto-promotion"
+sections for the validation record.
 
 | Flag | Phase | Code default | Effective? | Gates |
 |---|---|---|---|---|
@@ -286,29 +287,48 @@ for the validation record.
 | `CLIPAI_MULTI_REGION_LP` | 3 | ON (Week 1) | Yes (live) | Stage 10a multi-region LP fit-check |
 | `CLIPAI_GAZE_LEAD_ROOM_V2` | 4 | ON | Yes (live) | Stage 8 + Stage 10c continuous-yaw lead room |
 | `CLIPAI_THIRDS_BIAS` | 4 | ON | Yes (live) | Stage 8 + Stage 10c thirds offset |
-| `CLIPAI_MUSIC_BEAT_SNAP` | 5 | ON | Yes (live) | Stage 11 music-video beat snap + pulse cuts |
-| `CLIPAI_ANIME_SHOT_DETECTOR` | 6 | OFF | **No (dormant)** | module defined but 0 production call sites; Week 2 wires it into `shot_detector.py` |
-| `CLIPAI_ANIME_FACE_DETECTOR` | 6 | OFF | **No (dormant)** | module defined but 0 production call sites; Week 2 wires it into `face_detector.py` |
+| `CLIPAI_MUSIC_BEAT_SNAP` | 5 | ON | Yes (live) | Stage 11 music-video beat snap + pulse cuts + **formation→downbeat snap (Week 2 Part E)** |
+| `CLIPAI_ANIME_SHOT_DETECTOR` | 6 | ON (Week 2) | Yes (live) | pipeline.py cut-time merge + layout_engine.py Shot split — histogram / edge-density shot detection for anime action cuts |
+| `CLIPAI_ANIME_FACE_DETECTOR` | 6 | ON (Week 2) | Yes (live) | `face_detector._augment_dense_with_anime` — lbpcascade anime face augmentation on weak/empty dense frames |
 | `CLIPAI_ANIME_ANCHOR` | 6 | ON | Yes (live) | Stage 7b anime saliency anchor override (pipeline.py + reframe_segmenter.py) |
-| `CLIPAI_ANIME_CHARACTER_CLUSTERING` | 6 follow-up | OFF | **No (dormant)** | module defined but 0 production call sites; Week 2 wires it into `face_registry.py` |
+| `CLIPAI_ANIME_CHARACTER_CLUSTERING` | 6 follow-up | ON (Week 2) | Yes (live) | pipeline.py post-face-registry HSV re-ID — merges registry slots whose color fingerprints collide within chi-squared threshold |
 | `CLIPAI_GAMEPLAY_TRACKER` | 7 | ON | Yes (live) | Stage 7c gameplay subject tracker override |
 | `CLIPAI_EDITORIAL_PRIOR` | 8 | ON | Yes (live) | Stage 9b editorial J/L cuts + listener holds + reaction beats |
 
+### Auto-promoted subtypes (Week 2 Parts D + E)
+
+Week 2 added heuristic subtype auto-promotion so the dropdown sub-
+selection is optional on the upload form:
+
+- **Sports → basketball / racing.** When the classifier lands on
+  ``ContentType.SPORTS`` and the user didn't pick a subtype, the
+  ``content_classifier._infer_sports_subtype_from_objects`` helper
+  counts ``sports ball`` / ``car`` / ``truck`` / ``motorcycle``
+  detections across the sampled frames. Basketball fires when
+  ``ball_ratio ≥ 0.15``; racing fires when ``vehicle_ratio ≥ 0.10``
+  AND each vehicle spans ``≥ 5%`` of frame area. The higher ratio
+  wins. A user dropdown pick always overrides the auto-promotion.
+
+- **Music video → performance.** When ``ContentType.MUSIC_VIDEO`` +
+  no subtype, ``_infer_music_subtype_from_formation_and_beat`` checks
+  two signals: formation-frame density (≥3 faces spanning ≥55% of
+  frame width, via ``_is_formation_frame``) and the BeatGrid's
+  ``effective_confidence()`` (non-zero only when the librosa beat
+  detector produced a valid downbeat stream). Promotion fires when
+  ``formation_ratio ≥ 0.08`` AND ``beat_conf ≥ 0.6``. Tuned to fire
+  on MJ "Thriller" / Chris Brown performance clips but NOT on
+  narrative music videos with sparse formation density.
+
 ### Dormant code warning
 
-The three flags marked **No (dormant)** are gates on modules that
-exist in ``backend/services/`` but are not called from anywhere in
-the pipeline (grep for their public symbols returns only the defining
-module, the ``validate_v2_phases.py`` env-var setup, and per-module
-unit tests). Flipping them has no runtime effect today. The Week 2
-plan (``week2_anime_wiring_and_sports_subtype.md``) wires them. Until
-then, anime content relies on ``CLIPAI_ANIME_ANCHOR`` (saliency-based
-fallback) for subject tracking.
-
-The regression guard ``backend/tests/test_dormant_flags_labeled.py``
-asserts zero call sites for each dormant module, so any future commit
-that wires one will fail the test and force a coordinated update
-(flip the default + update this table + run ``validate_v2_phases``).
+As of Week 2 there are **no dormant v2 flags** — every ``CLIPAI_*``
+flag in the inventory table above has at least one production call
+site in ``backend/services/``. The Week-2 guard
+``backend/tests/test_dormant_flags_labeled.py`` still exists but its
+``DORMANT_MODULES`` dict is empty; the guard is kept so future
+dormant modules have a landing spot and so the pattern of "add a
+symbol to DORMANT_MODULES → wire it → flip the default → doc update"
+stays enforceable.
 
 ---
 

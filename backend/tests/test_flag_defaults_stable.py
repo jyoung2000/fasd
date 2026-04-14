@@ -33,6 +33,24 @@ ON_BY_DEFAULT = [
         "USE_ANIME_ANCHOR",
         "CLIPAI_ANIME_ANCHOR",
     ),
+    # Week 2 Part A flip:
+    (
+        "backend.services.anime_face_detector",
+        "USE_ANIME_FACE_DETECTOR",
+        "CLIPAI_ANIME_FACE_DETECTOR",
+    ),
+    # Week 2 Part B flip:
+    (
+        "backend.services.anime_shot_detector",
+        "USE_ANIME_SHOT_DETECTOR",
+        "CLIPAI_ANIME_SHOT_DETECTOR",
+    ),
+    # Week 2 Part C flip:
+    (
+        "backend.services.anime_character_clustering",
+        "USE_ANIME_CHARACTER_CLUSTERING",
+        "CLIPAI_ANIME_CHARACTER_CLUSTERING",
+    ),
     (
         "backend.services.beat_detector",
         "USE_MUSIC_BEAT_SNAP",

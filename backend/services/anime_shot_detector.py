@@ -59,7 +59,7 @@ logger = logging.getLogger(__name__)
 # ──────────────────── Feature flag ────────────────────
 
 USE_ANIME_SHOT_DETECTOR = os.environ.get(
-    "CLIPAI_ANIME_SHOT_DETECTOR", "0",
+    "CLIPAI_ANIME_SHOT_DETECTOR", "1",
 ).lower() in ("1", "true", "yes", "on")
 
 

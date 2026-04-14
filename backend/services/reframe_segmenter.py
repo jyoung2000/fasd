@@ -1744,6 +1744,7 @@ def build_reframe_segments(
     # drift introduced by these mutations.
     music_snap_count = 0
     pulse_cut_count = 0
+    formation_snap_count = 0
     try:
         from backend.services.beat_detector import (
             USE_MUSIC_BEAT_SNAP,
@@ -1838,16 +1839,60 @@ def build_reframe_segments(
                         pulse_cut_count += 1
                     new_segments.append(last_template)
                 raw_segments = new_segments
+
+            # ── Pass C: formation → downbeat snap (Week 2 Part E) ──
+            # For any segment whose LAST probeable frame is a formation
+            # shot (3+ faces spanning >=55% of frame width), extend the
+            # cut point to the next downbeat (up to 1.5s out) so the
+            # camera holds the formation wide past the natural boundary
+            # and lands the tight crop on the beat. Only applies when
+            # the downbeat falls inside the NEXT segment and extending
+            # it doesn't shrink the next segment below 0.30s.
+            if dense_faces:
+                faces_by_t: dict = {}
+                for _df in dense_faces:
+                    _ts = getattr(_df, "timestamp", None)
+                    if _ts is not None:
+                        faces_by_t[round(float(_ts), 2)] = _df
+                _downbeats = (
+                    music_beat_grid.downbeat_times
+                    if music_beat_grid is not None else []
+                )
+                for i, seg in enumerate(raw_segments[:-1]):
+                    end_probe_t = round(max(0.0, seg.end - 0.15), 2)
+                    _fr = faces_by_t.get(end_probe_t)
+                    if _fr is None or not _is_formation_frame(_fr):
+                        continue
+                    # Find the next downbeat strictly after seg.end.
+                    next_db = None
+                    for db in _downbeats:
+                        if db > seg.end + 0.05:
+                            next_db = db
+                            break
+                    if next_db is None or (next_db - seg.end) > 1.5:
+                        continue
+                    nxt = raw_segments[i + 1]
+                    if not (nxt.start < next_db < nxt.end):
+                        continue
+                    if (nxt.end - next_db) < 0.30:
+                        continue
+                    seg.end = float(next_db)
+                    nxt.start = float(next_db)
+                    formation_snap_count += 1
     except Exception as e:
         logger.warning(
             "[%s] Music-video beat snap failed (non-fatal): %s",
             job_id, e,
         )
 
-    if music_snap_count > 0 or pulse_cut_count > 0:
+    if (
+        music_snap_count > 0
+        or pulse_cut_count > 0
+        or formation_snap_count > 0
+    ):
         _log(
-            "MusicBeatSnap: %d boundary snaps, %d pulse cuts",
-            music_snap_count, pulse_cut_count,
+            "MusicBeatSnap: %d boundary snaps, %d pulse cuts, %d formation snaps",
+            music_snap_count, pulse_cut_count, formation_snap_count,
         )
 
     # ── Exit: enforce half-open [start, end) contiguity ──

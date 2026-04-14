@@ -47,12 +47,17 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
 # appear in another backend/ file (excluding tests + scripts), the
 # module is no longer dormant.
 DORMANT_MODULES: dict[str, set[str]] = {
-    "anime_face_detector": {"detect_anime_faces"},
-    "anime_shot_detector": {"detect_anime_shots"},
-    "anime_character_clustering": {
-        "cluster_fingerprints",
-        "extract_color_fingerprint",
-    },
+    # All three anime modules wired in Week 2:
+    #   Part A — anime_face_detector:
+    #     backend/services/face_detector.py::_augment_dense_with_anime
+    #   Part B — anime_shot_detector:
+    #     backend/services/pipeline.py (post-classify cut merge) +
+    #     backend/services/layout_engine.py (Shot-object split)
+    #   Part C — anime_character_clustering:
+    #     backend/services/pipeline.py (post-face-registry re-ID)
+    # All three removed from this guard on 2026-04-14; flags flipped
+    # to "1" in the same change. The guard is kept in place (even
+    # though empty) so future dormant modules have a landing spot.
 }
 
 
@@ -161,22 +166,11 @@ def test_dormant_module_flags_default_off() -> None:
     code path reads it. Catch that here so the error is explicit.
     """
     import importlib
-    cases = [
-        (
-            "backend.services.anime_face_detector",
-            "USE_ANIME_FACE_DETECTOR",
-            "CLIPAI_ANIME_FACE_DETECTOR",
-        ),
-        (
-            "backend.services.anime_shot_detector",
-            "USE_ANIME_SHOT_DETECTOR",
-            "CLIPAI_ANIME_SHOT_DETECTOR",
-        ),
-        (
-            "backend.services.anime_character_clustering",
-            "USE_ANIME_CHARACTER_CLUSTERING",
-            "CLIPAI_ANIME_CHARACTER_CLUSTERING",
-        ),
+    cases: list[tuple[str, str, str]] = [
+        # All three anime flags moved to test_flag_defaults_stable.py
+        # in Week 2 Parts A + B + C. If a new dormant module appears
+        # in the future, add its (module_path, attr, env_var) tuple
+        # here.
     ]
 
     import os

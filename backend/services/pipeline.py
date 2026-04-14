@@ -1136,7 +1136,51 @@ async def _run_analysis_inner(job_id: str):
     # Runs on CPU, no GPU conflict. For 4K VP9 this can take 3-5 minutes.
     if settings.SUBJECT_TRACKING_ENABLED and face_results:
         try:
-            from backend.services.face_detector import detect_faces_dense
+            from backend.services.face_detector import (
+                detect_faces_dense,
+                ANIME_MODE_DETECTED,
+            )
+
+            # ── Early anime hint (Week 2 Part A) ──
+            # The hint controls whether detect_faces_dense runs its
+            # lbpcascade anime augmentation pass alongside the main
+            # YuNet / FaceMesh detectors. Sources, in priority order:
+            #   1. User dropdown override (`anime` / `cartoon`) — the
+            #      most reliable signal; trust it immediately.
+            #   2. ANIME_MODE_DETECTED — flipped by the sparse pass
+            #      above when the human-pose verifier rejected >50%
+            #      of detections. Fires for stylized content even
+            #      when the user didn't pick anime from the dropdown.
+            # When neither hint is available, the first dense pass
+            # runs live-action-only and the re-run fallback below
+            # (after classify_content) picks up the slack.
+            _early_anime_hint = False
+            try:
+                from backend.services.content_type_strings import (
+                    normalize_ui_content_type,
+                )
+                _early_ct_override = getattr(
+                    job, "content_type_override", "",
+                ) or ""
+                _norm_early = (
+                    normalize_ui_content_type(_early_ct_override)
+                    if _early_ct_override else None
+                )
+                if _norm_early and _norm_early.is_animated:
+                    _early_anime_hint = True
+                    logger.info(
+                        "[%s] Early anime hint = True (user override=%s)",
+                        job_id, _norm_early.raw,
+                    )
+            except Exception:
+                pass
+            if not _early_anime_hint and ANIME_MODE_DETECTED:
+                _early_anime_hint = True
+                logger.info(
+                    "[%s] Early anime hint = True (ANIME_MODE_DETECTED)",
+                    job_id,
+                )
+
             video_duration = metadata.get("duration", 0)
             dense_sample_rate = settings.DENSE_FACE_SAMPLE_RATE
 
@@ -1204,6 +1248,7 @@ async def _run_analysis_inner(job_id: str):
                     min_confidence=0.4,
                     extract_embeddings=True,
                     progress_callback=_dense_progress,
+                    is_animated=_early_anime_hint,
                 ),
             )
             dense_with_faces = sum(1 for r in dense_face_results if r.faces)
@@ -1319,6 +1364,155 @@ async def _run_analysis_inner(job_id: str):
                     "[%s] Face registry built from %d sparse frames (position-based fallback)",
                     job_id, len(face_results),
                 )
+
+            # ── Anime character clustering re-ID (Week 2 Part C) ──
+            # When the content is animated (per the early hint from the
+            # dense-detection stage) and the face registry has ≥2 slots,
+            # run HSV color fingerprinting over the anime-cascade
+            # detections and merge slots whose color palettes collide
+            # within the chi-squared threshold. This catches the case
+            # where two shots of the same character got assigned
+            # different slots because embedding-based clustering had no
+            # signal (lbpcascade doesn't emit embeddings).
+            #
+            # Graceful degradation: when frame_path references are
+            # stale (the dense-detector tempdir has been cleaned up)
+            # cv2.imread returns None and that slot contributes zero
+            # fingerprints. If no slot produces any fingerprints we
+            # log and skip the cluster step entirely.
+            _early_anime_hint_for_reid = locals().get(
+                "_early_anime_hint", False
+            )
+            if (
+                _early_anime_hint_for_reid
+                and face_registry
+                and len(getattr(face_registry, "slots", []) or []) >= 2
+            ):
+                try:
+                    from backend.services.anime_character_clustering import (
+                        USE_ANIME_CHARACTER_CLUSTERING,
+                        extract_color_fingerprint,
+                        cluster_fingerprints,
+                    )
+                except ImportError:
+                    USE_ANIME_CHARACTER_CLUSTERING = False
+
+                if USE_ANIME_CHARACTER_CLUSTERING:
+                    try:
+                        import cv2  # anime clustering needs cv2 anyway
+                        slot_fingerprints: dict = {}
+                        unreadable_frames = 0
+                        _source_frames = dense_face_results or face_results or []
+                        for ff in _source_frames:
+                            frame_path_local = getattr(ff, "frame_path", None)
+                            frame_bgr = (
+                                cv2.imread(frame_path_local)
+                                if frame_path_local else None
+                            )
+                            if frame_bgr is None:
+                                if frame_path_local:
+                                    unreadable_frames += 1
+                                continue
+                            for fi in getattr(ff, "faces", []) or []:
+                                slot_id = int(
+                                    getattr(fi, "identity_id", -1) or -1
+                                )
+                                if slot_id < 0:
+                                    continue
+                                bbox_pct = (
+                                    float(getattr(fi, "x_center", 0.0)),
+                                    float(getattr(fi, "y_center", 0.0)),
+                                    float(getattr(fi, "width", 0.0)),
+                                    float(getattr(fi, "height", 0.0)),
+                                )
+                                fp = extract_color_fingerprint(
+                                    frame_bgr, bbox_pct,
+                                )
+                                slot_fingerprints.setdefault(
+                                    slot_id, [],
+                                ).append(fp)
+
+                        if not slot_fingerprints:
+                            logger.info(
+                                "[%s] Anime character clustering skipped: "
+                                "no readable frames (unreadable=%d). "
+                                "Dense-detector tempdir likely cleaned up; "
+                                "re-ID requires persisted frames (future "
+                                "work).",
+                                job_id, unreadable_frames,
+                            )
+                        elif len(slot_fingerprints) >= 2:
+                            # Average per-slot fingerprints to one centroid.
+                            slot_centroids = {
+                                sid: [
+                                    sum(col) / len(col)
+                                    for col in zip(*fps)
+                                ]
+                                for sid, fps in slot_fingerprints.items()
+                                if fps
+                            }
+                            slot_ids_list = list(slot_centroids.keys())
+                            centroid_list = [
+                                slot_centroids[s] for s in slot_ids_list
+                            ]
+                            cluster = cluster_fingerprints(centroid_list)
+                            cluster_ids = list(cluster.cluster_ids)
+                            # Build remap: slot_id -> canonical slot id
+                            # (the lowest slot in the same cluster).
+                            canonical: dict = {}
+                            for old_id, cid in zip(slot_ids_list, cluster_ids):
+                                same = [
+                                    sid
+                                    for sid, c in zip(
+                                        slot_ids_list, cluster_ids,
+                                    )
+                                    if c == cid
+                                ]
+                                canonical[old_id] = min(same)
+                            merges = [
+                                (o, n) for o, n in canonical.items()
+                                if o != n
+                            ]
+                            if merges:
+                                logger.info(
+                                    "[%s] Anime character clustering "
+                                    "merged %d slot pair(s): %s",
+                                    job_id, len(merges), merges,
+                                )
+                                # Apply remap to every detection's
+                                # identity_id, then rebuild the registry.
+                                for fr_list in (
+                                    face_results, dense_face_results,
+                                ):
+                                    for fr in (fr_list or []):
+                                        for fi in getattr(
+                                            fr, "faces", [],
+                                        ) or []:
+                                            cur = getattr(
+                                                fi, "identity_id", -1,
+                                            )
+                                            if cur in canonical:
+                                                fi.identity_id = (
+                                                    canonical[cur]
+                                                )
+                                if dense_face_results:
+                                    face_registry = (
+                                        build_face_registry_with_embeddings(
+                                            dense_face_results,
+                                            min_appearances=3,
+                                            cosine_threshold=0.25,
+                                        )
+                                    )
+                                elif face_results:
+                                    face_registry = build_face_registry(
+                                        face_results,
+                                    )
+                    except Exception as _cc_err:
+                        logger.warning(
+                            "[%s] Anime character clustering failed "
+                            "(non-fatal): %s",
+                            job_id, _cc_err,
+                        )
 
             if face_registry:
                 for frame in frames:
@@ -2665,6 +2859,18 @@ async def _run_analysis_inner(job_id: str):
                 _classifier_metadata["sports_subtype"] = _sports_subtype
             if _game_type:
                 _classifier_metadata["game_type"] = _game_type
+            # Week 2 Parts D + E: thread object detections + beat grid
+            # into the classifier so the sports / music-video subtype
+            # auto-promotion helpers can see them. Both degrade
+            # gracefully when absent (the helpers return None).
+            _classifier_metadata["frame_objects"] = (
+                _object_detections
+                if "_object_detections" in locals() and _object_detections
+                else None
+            )
+            _classifier_metadata["music_beat_grid"] = (
+                locals().get("_music_beat_grid_for_seg") or None
+            )
             _content_profile = classify_content(
                 shot_cuts=_shot_cuts,
                 face_registry=face_registry,
@@ -2677,6 +2883,124 @@ async def _run_analysis_inner(job_id: str):
             )
         except Exception as e:
             logger.warning("[%s] Content classification failed (non-fatal): %s", job_id, e)
+
+        # ── Anime dense re-run fallback (Week 2 Part A Option 1) ──
+        # If the early anime hint was False (user didn't pick anime,
+        # ANIME_MODE_DETECTED didn't fire during the sparse pass) but
+        # the classifier concluded is_animated=True, the first dense
+        # pass ran live-action-only. Re-run with is_animated=True so
+        # the lbpcascade augmentation gets a shot at the weak frames.
+        # Gated on a low face-per-frame rate (<0.4) so we don't spend
+        # the extra dense minute on clips that already have good
+        # live-action coverage.
+        _anime_profile = (
+            _content_profile
+            and getattr(_content_profile, "is_animated", False)
+        )
+        if (
+            _anime_profile
+            and not _early_anime_hint
+            and dense_face_results
+            and settings.SUBJECT_TRACKING_ENABLED
+        ):
+            try:
+                _faces_per_frame = sum(
+                    1 for fr in dense_face_results if getattr(fr, "faces", None)
+                ) / max(1, len(dense_face_results))
+                if _faces_per_frame < 0.4:
+                    logger.info(
+                        "[%s] Anime re-run fallback: profile.is_animated=True "
+                        "but early hint was False; face coverage %.2f < 0.4. "
+                        "Re-running dense detection with is_animated=True.",
+                        job_id, _faces_per_frame,
+                    )
+                    _dense_rerun_loop = asyncio.get_event_loop()
+                    _video_dur_rr = metadata.get("duration", 0)
+                    _dense_sr_rr = settings.DENSE_FACE_SAMPLE_RATE
+                    _rerun = await _dense_rerun_loop.run_in_executor(
+                        None,
+                        lambda: detect_faces_dense(
+                            video_path,
+                            start=0,
+                            end=_video_dur_rr,
+                            sample_rate=_dense_sr_rr,
+                            min_confidence=0.4,
+                            extract_embeddings=True,
+                            is_animated=True,
+                        ),
+                    )
+                    if _rerun:
+                        dense_face_results = _rerun
+                        logger.info(
+                            "[%s] Anime re-run: replaced dense results "
+                            "(%d frames, %d with faces)",
+                            job_id, len(_rerun),
+                            sum(1 for r in _rerun if r.faces),
+                        )
+            except Exception as _re_err:
+                logger.warning(
+                    "[%s] Anime re-run fallback failed (non-fatal): %s",
+                    job_id, _re_err,
+                )
+
+        # ── Anime shot detector augmentation (Week 2 Part B) ──
+        # When the classifier concluded the clip is animated, run the
+        # histogram / edge-density shot detector and merge its cut
+        # timestamps into scene_cut_timestamps. Anime action scenes
+        # have 6-8-frame shots that PySceneDetect's default luminance-
+        # diff detector misses; the histogram signal catches them.
+        # De-duplicate within ±0.3s so a single cut that both detectors
+        # found doesn't double-count.
+        if (
+            _content_profile
+            and getattr(_content_profile, "is_animated", False)
+        ):
+            try:
+                from backend.services.anime_shot_detector import (
+                    USE_ANIME_SHOT_DETECTOR,
+                    detect_anime_shots,
+                )
+            except ImportError:
+                USE_ANIME_SHOT_DETECTOR = False
+
+            if USE_ANIME_SHOT_DETECTOR:
+                try:
+                    anime_shot_result = detect_anime_shots(
+                        video_path,
+                        video_duration=metadata.get("duration", 0) or None,
+                    )
+                    if (
+                        anime_shot_result.cut_times
+                        and not anime_shot_result.skipped_reason
+                    ):
+                        if scene_cut_timestamps is None:
+                            scene_cut_timestamps = []
+                        existing_cuts = [
+                            float(t) for t in scene_cut_timestamps
+                        ]
+                        added = 0
+                        for t in anime_shot_result.cut_times:
+                            if any(abs(t - e) < 0.30 for e in existing_cuts):
+                                continue
+                            existing_cuts.append(float(t))
+                            added += 1
+                        existing_cuts.sort()
+                        scene_cut_timestamps = existing_cuts
+                        logger.info(
+                            "[%s] Anime shot detector: +%d cuts "
+                            "(total now %d)",
+                            job_id, added, len(scene_cut_timestamps),
+                        )
+                    elif anime_shot_result.skipped_reason:
+                        logger.info(
+                            "[%s] Anime shot detector skipped: %s",
+                            job_id, anime_shot_result.skipped_reason,
+                        )
+                except Exception as e:
+                    logger.warning(
+                        "[%s] Anime shot detector failed (non-fatal): %s",
+                        job_id, e,
+                    )
 
         try:
             from backend.services.persistent_region_detector import detect_persistent_regions

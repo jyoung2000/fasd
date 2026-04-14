@@ -406,6 +406,84 @@ def _plan_layout_impl(
     logger.info("[%s] plan_layout: %d shots detected (threshold=%.0f)",
                 job_id, len(shots), shot_threshold)
 
+    # ── Anime shot detector augmentation (Week 2 Part B) ──
+    # When the ClipContentType resolves to an animation variant, run
+    # the histogram / edge-density detector and splice its cuts into
+    # the live-action Shot list. Each new cut at time t finds the
+    # containing Shot and splits it into two new Shot objects; indices
+    # get renumbered after all splits land.
+    _is_animated_ct = False
+    try:
+        _ct_val = getattr(content_type, "value", content_type)
+        _is_animated_ct = _ct_val in ("animation", "animation_dialogue")
+    except Exception:
+        _is_animated_ct = False
+
+    if _is_animated_ct:
+        try:
+            from backend.services.anime_shot_detector import (
+                USE_ANIME_SHOT_DETECTOR,
+                detect_anime_shots,
+            )
+            from backend.services.shot_detector import Shot as _Shot
+        except ImportError:
+            USE_ANIME_SHOT_DETECTOR = False
+            _Shot = None
+
+        if USE_ANIME_SHOT_DETECTOR and _Shot is not None:
+            try:
+                anime_result = detect_anime_shots(
+                    video_path, video_duration=video_duration,
+                )
+                if (
+                    anime_result.cut_times
+                    and not anime_result.skipped_reason
+                ):
+                    existing_bounds = (
+                        {round(s.start, 2) for s in shots}
+                        | {round(s.end, 2) for s in shots}
+                    )
+                    merged_shots = list(shots)
+                    for t in anime_result.cut_times:
+                        if any(abs(t - b) < 0.30 for b in existing_bounds):
+                            continue
+                        # Find the containing Shot and split.
+                        for idx, sh in enumerate(merged_shots):
+                            if sh.start < t < sh.end:
+                                new_left = _Shot(
+                                    index=sh.index,
+                                    start=sh.start,
+                                    end=float(t),
+                                    detector_confidence="high",
+                                )
+                                new_right = _Shot(
+                                    index=sh.index + 1,
+                                    start=float(t),
+                                    end=sh.end,
+                                    detector_confidence="high",
+                                )
+                                merged_shots[idx:idx + 1] = [
+                                    new_left, new_right,
+                                ]
+                                existing_bounds.add(round(t, 2))
+                                break
+                    # Re-number indices after all splits.
+                    for i, sh in enumerate(merged_shots):
+                        sh.index = i
+                    added = len(merged_shots) - len(shots)
+                    if added:
+                        logger.info(
+                            "[%s] Anime shot detector added %d cuts "
+                            "(now %d shots)",
+                            job_id, added, len(merged_shots),
+                        )
+                    shots = merged_shots
+            except Exception as e:
+                logger.warning(
+                    "[%s] Anime shot detector (AUTOFLIP path) failed: %s",
+                    job_id, e,
+                )
+
     # Extract shot cut timestamps for the AttentionAnchor stream so the
     # boxcar smoother breaks at each cut.
     _shot_cut_times = [float(getattr(s, "start", 0.0)) for s in shots if getattr(s, "start", 0.0) > 0]

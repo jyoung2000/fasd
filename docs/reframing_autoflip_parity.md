@@ -2094,3 +2094,206 @@ semantics should distinguish "all fixtures passed" from "no
 fixtures were measured". Filed as a follow-up; the fix is one-line:
 if every fixture in every combo has ``status="skipped"``, return
 exit code 2 (or a distinct 3 for "couldn't measure").
+
+## Week 2 — anime wiring and subtype auto-promotion
+
+Week 2 is the internal improvement sprint that turns the five
+previously-dormant editorial signals into live runtime behavior:
+the anime face / shot / character-clustering triad (Parts A/B/C),
+sports subtype auto-promotion (Part D), and the music-video
+formation→downbeat snap + subtype auto-promotion pair (Part E).
+
+Every part lands its new behavior behind its existing
+``CLIPAI_*`` flag and adds unit tests that exercise the helper
+logic in isolation. The parity safety gate
+(``validate_v2_phases --quick``) stays at exit 0 on every part's
+checkpoint, and the reframe-lag micro-benchmark still reports
+100% / 0 / -6.
+
+### Part A — `detect_anime_faces` wired into the dense face pipeline
+
+- **Call site:** new ``face_detector._augment_dense_with_anime``
+  helper runs inside ``detect_faces_dense`` when the caller passes
+  ``is_animated=True``. Augments per-frame results: on frames with
+  zero faces or only low-confidence (<0.55) live-action detections,
+  the lbpcascade anime detector runs on that frame and appends its
+  hits as ``FaceInfo`` records with ``is_human=False`` so the
+  human-pose verifier doesn't reject them.
+- **Threading:** ``pipeline.py`` computes an ``_early_anime_hint``
+  right before the dense detection call, sourced from (a) the
+  normalized ``content_type_override`` (``anime`` / ``cartoon``) or
+  (b) ``face_detector.ANIME_MODE_DETECTED`` fired during the sparse
+  pass. If neither fires up-front but ``classify_content``
+  concludes ``is_animated=True`` later, a re-run fallback fires
+  another dense pass with ``is_animated=True`` when the first pass's
+  face-per-frame rate is below 0.4 (gate so we don't spend the extra
+  dense minute on clips that already have good coverage).
+- **Cascade file:** ``backend/models/lbpcascade_animeface.xml``
+  committed to the repo. Public domain per Nagadomi's stated terms.
+  ~250 KB, valid cascade (6693 lines, verified).
+- **Flag flip:** ``CLIPAI_ANIME_FACE_DETECTOR`` default
+  ``"0"`` → ``"1"``.
+- **Tests:** ``backend/tests/test_anime_face_augmentation.py``
+  (7 tests): weak/empty/strong frame handling, flag-off short
+  circuit, threshold edge cases, mismatched ``frame_paths`` safety,
+  empty detection results, per-detection converter exception
+  swallowing, log-line content.
+
+### Part B — `detect_anime_shots` wired into both shot paths
+
+- **Pipeline path:** right after ``classify_content`` in
+  ``pipeline.py``, when ``_content_profile.is_animated=True``, the
+  anime histogram / edge-density detector runs and its cut
+  timestamps merge into ``scene_cut_timestamps`` with a ±0.3s
+  dedup window. De-duplicated + sorted in place.
+- **AUTOFLIP / layout_engine path:** same pattern but operates on
+  ``Shot`` objects — each new anime cut splits its containing
+  ``Shot`` into two new ``Shot`` instances and the entire list is
+  renumbered. Covered by real-dataclass round-trip tests.
+- **Flag flip:** ``CLIPAI_ANIME_SHOT_DETECTOR`` default
+  ``"0"`` → ``"1"``.
+- **Tests:** ``backend/tests/test_anime_shot_integration.py``
+  (13 tests): cut-list merge (add + dedup + sort), Shot-split
+  (single-shot, across-multiple, boundary-exact, out-of-range),
+  real-dataclass round-trip, flag short-circuit.
+
+### Part C — `anime_character_clustering` re-ID pass
+
+- **Call site:** right after ``build_face_registry(_with_embeddings)``
+  in ``pipeline.py``. When the early anime hint fired and the
+  registry has ≥2 slots, the pipeline runs HSV color fingerprinting
+  over the anime-cascade detections, averages per-slot centroids,
+  runs ``cluster_fingerprints`` on the centroids, and collapses any
+  two slots whose fingerprints sit within the chi-squared threshold.
+  The canonical-slot remap collapses to the lowest slot id in each
+  cluster; remapped ``identity_id``s are written back to every
+  ``FaceInfo`` in both ``dense_face_results`` and ``face_results``;
+  the ``face_registry`` is rebuilt from the remapped detections.
+- **Graceful degradation:** when frame files are stale (the dense
+  detector's tempdir has been cleaned up), ``cv2.imread`` returns
+  ``None`` and that frame contributes zero fingerprints. When no
+  slot produces any fingerprints, the pass logs
+  ``"no readable frames"`` and skips without mutating state. This
+  is a known ergonomic wart — Week 3 or beyond will persist dense
+  frames to a longer-lived temp dir so the re-ID can always run.
+- **Flag flip:** ``CLIPAI_ANIME_CHARACTER_CLUSTERING`` default
+  ``"0"`` → ``"1"``.
+- **Tests:** ``backend/tests/test_anime_character_clustering_integration.py``
+  (11 tests): canonical-slot remap (cluster-collapse, singletons,
+  non-contiguous ids), remap application (update + skip-missing +
+  skip-identity), real ``cluster_fingerprints`` contract (merge,
+  empty, all-identical), end-to-end slice through the real module.
+
+### Part D — Sports subtype auto-promotion
+
+- **Helper:** new ``content_classifier._infer_sports_subtype_from_objects``
+  pure function. Accepts either the flat ``ObjectDetection`` list
+  the pipeline actually emits OR a per-frame ``.objects`` shape for
+  future-proofing. Groups the flat list by rounded timestamp
+  internally. Fires promotion only when the winning ratio clears
+  its threshold AND beats the other class's ratio (strict ``>``).
+- **Pipeline plumbing:** ``_classifier_metadata["frame_objects"]``
+  is threaded into ``classify_content``. The promotion block runs
+  right after voting settles, before the cinematic-dialogue branch.
+  User-override branches at the top of ``classify_content`` still
+  short-circuit so a dropdown pick always wins.
+- **Thresholds:** basketball ``ball_ratio ≥ 0.15``, racing
+  ``vehicle_ratio ≥ 0.10`` + per-vehicle frame-area gate ≥5%.
+  Tuned so a half-court basketball clip promotes and a generic
+  street-running clip with incidental cars does not.
+- **Tests:** ``backend/tests/test_sports_subtype_autopromotion.py``
+  (13 tests): basketball/racing threshold crossings, mixed
+  ball+car (higher ratio wins), tiny-car area-gate, non-sports
+  short-circuit, user-override preservation, per-frame-vs-flat
+  shape handling.
+
+### Part E — Music video formation → downbeat snap + subtype auto-promotion
+
+Two independent changes in this part:
+
+**E1. Stage 11 Pass C — formation → downbeat snap.**
+For any segment whose last probeable frame (``seg.end - 0.15``) is
+a formation shot (3+ faces, ≥55% width span), the segment end
+shifts forward to the next downbeat (up to 1.5s out) so the cut
+lands ON the beat. Only applies when the downbeat falls strictly
+inside the next segment AND extending wouldn't shrink that segment
+below 0.30s. Logged via the existing Stage 11 log line as
+``formation=N``.
+
+**E2. Subtype auto-promotion.**
+``content_classifier._infer_music_subtype_from_formation_and_beat``
+counts formation-frame density across ``dense_faces`` and compares
+against the ``BeatGrid.effective_confidence()`` property (new —
+zero-gates empty grids even when the stored confidence is high).
+Fires when ``formation_ratio ≥ 0.08`` AND ``beat_conf ≥ 0.6``.
+
+**Supporting changes.**
+- ``BeatGrid`` gets a new ``confidence: float = 0.0`` field and an
+  ``effective_confidence()`` method. ``detect_beats`` (librosa-
+  backed) sets ``confidence=0.9``; the synthetic constructor leaves
+  it at 0.0 so fixtures don't accidentally trigger promotion.
+- ``_classifier_metadata["music_beat_grid"]`` threaded into
+  ``classify_content`` so the promotion helper can read it.
+
+**Tests:**
+- ``backend/tests/test_music_formation_downbeat_snap.py`` (9 tests):
+  formation-at-boundary snap, no-snap when downbeat too far,
+  non-formation short-circuit, next-segment-shrink rejection,
+  downbeat-outside-next rejection, multi-formation chain, last-
+  segment protection, probe-window offset accuracy.
+- ``backend/tests/test_music_subtype_autopromotion.py`` (10 tests):
+  promotion thresholds (both floors), low-formation/low-conf
+  rejection, missing/empty beat grid, empty dense-faces, user-
+  override preservation, non-music short-circuit, real ``BeatGrid``
+  confidence contract.
+
+### Week 2 validation state
+
+- **76 new tests across 6 new test files, 100% passing.**
+- ``validate_v2_phases --quick`` exit 0 at every part checkpoint
+  (Parts A, B, C, D, E separately + final combined run).
+- ``measure_reframe_lag``: 100% recall, 0 overlaps, -6 frame
+  anticipation (unchanged from Week 1).
+- ``test_flag_defaults_stable.py`` grew three new rows: the anime
+  face / shot / character-clustering flags. All 11 flag defaults
+  green.
+- ``test_dormant_flags_labeled.py`` — ``DORMANT_MODULES`` dict is
+  now empty; every anime module has a call site. The guard is
+  kept in place as a landing spot for future dormant modules.
+
+### Week 2 fixture artifacts
+
+- ``/tmp/week2_partA.json`` / ``.md`` — post-Part-A quick gate
+- ``/tmp/week2_partB.json`` / ``.md`` — post-Part-B quick gate
+- ``/tmp/week2_partC.json`` / ``.md`` — post-Part-C quick gate
+- ``/tmp/week2_partD.json`` / ``.md`` — post-Part-D quick gate
+- ``/tmp/week2_final.json`` / ``.md`` — final combined gate
+- ``/tmp/week2_lag.log`` — final reframe-lag bench
+
+### Known Week-2 caveats
+
+1. **Anime character clustering needs persisted frames.** The re-ID
+   pass currently relies on ``cv2.imread`` over ``FrameFaces.frame_path``
+   entries that become stale once ``detect_faces_dense`` exits its
+   ``TemporaryDirectory``. In production the re-ID typically logs
+   ``"no readable frames"`` and short-circuits. A future change
+   should move dense frames to a per-job persisted directory so
+   the re-ID pass can actually run on every anime clip.
+
+2. **Part-E subtype promotion needs beat-grid hoist.** The
+   ``music_beat_grid`` that feeds the subtype-promotion gate is
+   computed inside the reframe segmenter today, *after*
+   ``classify_content`` has already run. In the current code path
+   the gate will see ``music_beat_grid=None`` and the promotion
+   won't fire. A follow-up (Week 3) hoists beat grid computation
+   to right after audio extraction so both the classifier and the
+   segmenter see the same grid.
+
+3. **Anime module synchronization with ``is_animated`` detection.**
+   Parts A/B/C all gate on ``_early_anime_hint`` or
+   ``_content_profile.is_animated``. When the sparse-face pass's
+   ``ANIME_MODE_DETECTED`` flag fires late, Part A's re-run fallback
+   catches up but Parts B + C still require a second pipeline pass
+   to benefit. In practice this is rare (the user dropdown picks
+   anime up-front most of the time), but worth noting for the
+   Week 3 real-content benchmark.

@@ -82,10 +82,26 @@ class BeatGrid:
     downbeat_times: list[float] = field(default_factory=list)
     meter: int = 4
     source: str = "synthetic"
+    # Confidence proxy in [0, 1]. librosa-backed grids default to 0.9
+    # (librosa's beat tracker is reliable on music with a stable
+    # tempo); synthetic / fixture grids default to 0.0 so the Week 2
+    # music-video subtype auto-promotion doesn't fire on stub data.
+    # An empty grid always reads as 0.0 regardless of the stored field.
+    confidence: float = 0.0
 
     @property
     def has_data(self) -> bool:
         return bool(self.downbeat_times)
+
+    def effective_confidence(self) -> float:
+        """Return ``confidence`` when the grid has downbeats, else 0.0.
+
+        Cheap guard so the subtype-promotion gate never trusts a
+        BeatGrid that lost its downbeats downstream.
+        """
+        if not self.downbeat_times:
+            return 0.0
+        return float(self.confidence)
 
 
 # ─────────────── Builders ────────────────────────────────────────
@@ -188,6 +204,10 @@ def detect_beats(
         downbeat_times=[round(t, 6) for t in downbeat_times],
         meter=int(meter),
         source="librosa",
+        # librosa.beat.beat_track is reliable on music with a stable
+        # tempo. 0.9 is below the "music_video → performance"
+        # promotion gate (0.6) by a comfortable margin.
+        confidence=0.9,
     )
 
 

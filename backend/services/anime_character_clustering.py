@@ -63,7 +63,7 @@ logger = logging.getLogger(__name__)
 # ──────────────────── Feature flag ────────────────────
 
 USE_ANIME_CHARACTER_CLUSTERING = os.environ.get(
-    "CLIPAI_ANIME_CHARACTER_CLUSTERING", "0",
+    "CLIPAI_ANIME_CHARACTER_CLUSTERING", "1",
 ).lower() in ("1", "true", "yes", "on")
 
 

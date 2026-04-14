@@ -807,6 +807,94 @@ def detect_faces_batch(
     return final_results
 
 
+def _augment_dense_with_anime(
+    results: list,
+    frame_paths: list,
+    *,
+    strong_conf_threshold: float = 0.55,
+    job_log_prefix: str = "",
+) -> tuple[int, int]:
+    """Augment ``results`` with anime-cascade detections on weak frames.
+
+    Week 2 Part A. Runs ``detect_anime_faces`` on every result whose
+    ``faces`` list is empty or whose strongest face is below
+    ``strong_conf_threshold``. Detections are converted to ``FaceInfo``
+    via ``anime_face_detector.to_face_info`` (which sets
+    ``is_human=False`` so the human-pose verifier skips them) and
+    appended to the frame's ``faces`` list — they never replace
+    live-action detections that were already confident.
+
+    The helper is module-level so tests can exercise it without
+    standing up the whole ``detect_faces_dense`` pipeline.
+
+    Args:
+        results: Mutable list of ``FrameFaces`` from one of the
+            ``_detect_with_*`` functions (same order as ``frame_paths``).
+        frame_paths: Parallel list of ``(timestamp, path)`` tuples.
+            The paths must still point to extant frame files — call
+            this while the enclosing ``TemporaryDirectory`` is alive.
+        strong_conf_threshold: Live-action confidence floor above
+            which a frame is considered "already confident" and is
+            skipped. Default 0.55 matches the YuNet / FaceMesh
+            production threshold.
+        job_log_prefix: Optional "[job_id] " string for log lines.
+
+    Returns:
+        ``(augmented_frames, augmented_faces)`` counts. Both zero when
+        the feature flag is OFF, the detector module can't be imported,
+        or no frames needed augmentation.
+    """
+    try:
+        from backend.services.anime_face_detector import (
+            USE_ANIME_FACE_DETECTOR,
+            detect_anime_faces,
+            to_face_info,
+        )
+    except ImportError:
+        return (0, 0)
+
+    if not USE_ANIME_FACE_DETECTOR:
+        return (0, 0)
+
+    augmented_frames = 0
+    augmented_faces = 0
+
+    for i, fr in enumerate(results):
+        # Skip frames where live-action already found a confident face.
+        strong_faces = [
+            f for f in fr.faces
+            if getattr(f, "confidence", 0.0) >= strong_conf_threshold
+        ]
+        if strong_faces:
+            continue
+
+        if i >= len(frame_paths):
+            continue
+        _ts, fp = frame_paths[i]
+        anime_result = detect_anime_faces(fp, timestamp=_ts)
+        if not anime_result.has_faces:
+            continue
+
+        # Append anime detections — do NOT replace the live-action list.
+        # If YuNet picked up a faint face AND the anime cascade picked
+        # up a different one, the face_registry identity-clustering step
+        # resolves overlaps downstream.
+        for det in anime_result.detections:
+            try:
+                fr.faces.append(to_face_info(det))
+            except Exception:
+                continue
+        augmented_frames += 1
+        augmented_faces += len(anime_result.detections)
+
+    if augmented_frames:
+        logger.info(
+            "%s[DenseFaces] Anime augmentation: +%d faces across %d frames",
+            job_log_prefix, augmented_faces, augmented_frames,
+        )
+    return (augmented_frames, augmented_faces)
+
+
 def detect_faces_dense(
     video_path: str,
     start: float,
@@ -815,6 +903,7 @@ def detect_faces_dense(
     min_confidence: float = 0.5,
     extract_embeddings: bool = True,
     progress_callback=None,
+    is_animated: bool = False,
 ) -> list:
     """Dense face detection for a clip's time range.
 
@@ -950,6 +1039,16 @@ def detect_faces_dense(
                                 best_yf = yf
                         if best_yf and best_dist < 10:
                             mf.identity_embedding = best_yf.identity_embedding
+
+        # ── Anime face augmentation ──
+        # When the caller signaled animated content, run the lbpcascade
+        # anime detector on frames where live-action detection found
+        # zero faces or only low-confidence (<0.55) detections. Anime
+        # cascade results are marked is_human=False so the human-pose
+        # verifier skips them. Runs inside the TemporaryDirectory scope
+        # so the per-frame paths in frame_paths are still valid.
+        if is_animated:
+            _augment_dense_with_anime(results, frame_paths)
 
         if progress_callback:
             progress_callback("complete", len(results), len(frame_paths))
