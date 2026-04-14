@@ -33,6 +33,7 @@ metric for every fixture without crashing on missing data.
 
 from __future__ import annotations
 
+from statistics import median as _median
 from typing import Iterable, Optional
 
 
@@ -363,6 +364,86 @@ def face_centroid_in_thirds_rate(
         if abs(y - target_thirds) <= tolerance
     )
     return in_thirds / len(face_y_in_crop_normalized)
+
+
+# ── Metric 9: cut-to-hold ratio (Week 3) ────────────────────────────
+
+def cut_to_hold_ratio(events: list[dict]) -> dict:
+    """Distribution of per-segment hold durations.
+
+    Week 3 real-content bench metric. Human professional editors hold
+    shots a median of ~3-8 seconds on dialogue / panel / narrative
+    content; closer to 1.5-3 seconds on fast music / action. AutoFlip
+    tends to hold shorter than humans across all content types because
+    its optimization is local (scene-cropping calculator operates per
+    shot without an editorial prior). The ClipAI editorial prior is
+    designed to pull hold distributions toward the human median; this
+    metric is what proves it on real content.
+
+    Input shape is the AutoFlip-compatible event list:
+
+        [
+            {"t": float, "scene_change": bool, ...},
+            ...
+        ]
+
+    Events with ``scene_change == True`` mark the start of a new
+    segment. Hold duration for segment ``i`` is
+    ``next_segment_start - this_segment_start``, with the final
+    segment ending at the last event's ``t``. If no event has
+    ``scene_change == True`` the entire clip is treated as one
+    segment (hold = last - first).
+
+    Returns a dict with:
+
+        n_segments:            int
+        median_hold_sec:       float  (0.0 on empty)
+        p25, p75, p95:         float  (quantile holds)
+        segments_under_1s_rate: float — red flag if high on dialogue
+        segments_over_8s_rate:  float — red flag on music / action
+
+    An empty event list returns ``{"n_segments": 0}``.
+    """
+    if not events:
+        return {"n_segments": 0}
+
+    # Segment start times: every event flagged as a scene change.
+    segment_starts = [
+        float(e["t"]) for e in events if e.get("scene_change")
+    ]
+    # If no scene-change flag fired, treat the whole clip as one segment.
+    if not segment_starts:
+        segment_starts = [float(events[0]["t"])]
+
+    last_t = float(events[-1]["t"])
+    segment_ends = segment_starts[1:] + [last_t]
+    holds = [
+        e - s for s, e in zip(segment_starts, segment_ends) if e > s
+    ]
+    if not holds:
+        return {"n_segments": 0}
+
+    holds_sorted = sorted(holds)
+    n = len(holds_sorted)
+
+    def _pct(p: float) -> float:
+        """Nearest-rank quantile; n*p clamped to last index."""
+        idx = min(n - 1, max(0, int(n * p)))
+        return holds_sorted[idx]
+
+    return {
+        "n_segments": n,
+        "median_hold_sec": round(_median(holds_sorted), 3),
+        "p25": round(_pct(0.25), 3),
+        "p75": round(_pct(0.75), 3),
+        "p95": round(_pct(0.95), 3),
+        "segments_under_1s_rate": round(
+            sum(1 for h in holds_sorted if h < 1.0) / n, 3,
+        ),
+        "segments_over_8s_rate": round(
+            sum(1 for h in holds_sorted if h > 8.0) / n, 3,
+        ),
+    }
 
 
 # ── Aggregator: score a fixture ────────────────────────────────────

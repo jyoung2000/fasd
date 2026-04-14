@@ -2297,3 +2297,94 @@ Fires when ``formation_ratio ≥ 0.08`` AND ``beat_conf ≥ 0.6``.
    to benefit. In practice this is rare (the user dropdown picks
    anime up-front most of the time), but worth noting for the
    Week 3 real-content benchmark.
+
+## Week 3 — Real-content comparison harness (infrastructure)
+
+Week 3 is a measurement-and-calibration week. It lands the harness
+and scoring pieces that will drive Week 4+ decisions on real video;
+it does not change any solver behavior or flag defaults. The synthetic
+fixtures are unaffected — ``validate_v2_phases --quick`` exit-0 before
+and after Week 3.
+
+### What landed
+
+- ``backend/services/autoflip_parity_metrics.py::cut_to_hold_ratio``
+  — new 9th metric. Takes an AutoFlip-shape event list and returns
+  per-segment hold statistics (median, quartiles, under-1s rate,
+  over-8s rate). Pure Python, 8 unit tests.
+- ``backend/scripts/export_autoflip_compatible.py`` — translator
+  that takes a ClipAI ``RenderPlan.to_dict()`` dump OR a list of
+  ``ReframeSegment`` dicts and emits an AutoFlip-shape per-frame
+  JSON timeline. Lets the comparison harness score both tools in
+  the same coordinate system. 17 unit tests including ffprobe
+  monkeypatch.
+- ``backend/scripts/compare_autoflip_vs_clipai.py`` — the harness
+  itself. Reads the real-content manifest, loads cached AutoFlip
+  JSONs, runs (a stubbed) ClipAI pipeline, scores both with the
+  metric library + the new ``cut_to_hold_ratio``, and emits a
+  per-content-type markdown rollup with target-zone verdicts
+  (PASS / MARGINAL / MISS / UNKNOWN). 16 unit tests pin the
+  scoring + verdict layers.
+- ``reference/autoflip/Dockerfile`` + ``run_one.sh`` +
+  ``REFERENCE_OUTPUTS.md`` — reference MediaPipe AutoFlip runner.
+  Builds from source against ``v0.10.9`` + Bazel 6.1.1. Used for
+  one-time cache generation; the harness reads the cached JSONs
+  offline forever after.
+- ``tests/real_content/manifest.json`` + ``fetch.sh`` — 12-clip
+  real-content set spanning the four target verticals (panels,
+  anime, sports, music). Clips themselves are ``.gitignore``'d;
+  the manifest pins sha256 hashes once the fetcher has run.
+- ``docs/week3_real_content_results.md`` — placeholder that
+  becomes the live markdown rollup when the harness runs.
+- ``docs/week3_gap_analysis.md`` — Week-4-planning template.
+
+### What did NOT land
+
+- **No real-content rollup.** The session sandbox has no clips
+  (manifest ``source_url`` fields are empty) and no AutoFlip
+  cache (Docker build is intractable in the sandbox — see
+  ``reference/autoflip/REFERENCE_OUTPUTS.md``). The harness works
+  end-to-end against these gaps: every AutoFlip row is marked
+  SKIPPED, every ClipAI row is a placeholder single-segment stub.
+  That's enough to prove the rendering + verdict layers fire but
+  not enough to drive any real Week-4 decision.
+- **No ``MIN_HOLD_SECONDS`` tuning (Part E).** The Week 3 prompt's
+  Part E tunes per-content-type hold floors ONLY when the harness
+  shows a systematic skew on real content. With the stub ClipAI
+  path producing single-segment timelines, any skew signal is
+  meaningless. **Zero changes to ``content_type_config.py`` landed
+  in this week.**
+- **No flag default flips.**
+- **No new pipeline-layer behavior.** Same behavior before and
+  after Week 3; only measurement scaffolding.
+
+### Week 3 blockers to clear before Week 4 can start
+
+1. **Populate the real clip cache.** Fill in ``source_url`` fields
+   in ``tests/real_content/manifest.json``, run ``fetch.sh``, paste
+   back the ``new sha256`` lines the fetcher emits on stderr.
+2. **Generate the AutoFlip reference cache.** Build
+   ``reference/autoflip/Dockerfile`` on a machine that can finish
+   the Bazel build (cloud VM, homelab box), run each clip through
+   it once, commit the resulting JSONs at
+   ``tests/autoflip_reference_outputs/``. One-time cost.
+3. **Wire ``run_clipai_on_clip`` to the real inline segmenter.**
+   The stub in ``compare_autoflip_vs_clipai.py`` has a clearly
+   marked seam (``run_clipai_on_clip``). The real implementation
+   cribs from ``measure_autoflip_parity.py``'s inline segmenter
+   path and runs over a real extraction cache keyed on clip sha256.
+   Biggest remaining work item from Week 3.
+
+Once (1) + (2) + (3) are done, running the harness produces a real
+``docs/week3_real_content_results.md``, populating
+``docs/week3_gap_analysis.md``'s ``<fill in>`` placeholders becomes
+a straightforward triage, and Week 4 opens as a targeted-fix
+session on the top three gaps.
+
+### Tests shipped in Week 3
+
+- ``backend/tests/test_cut_to_hold_ratio.py`` — 8 tests
+- ``backend/tests/test_export_autoflip_compatible.py`` — 17 tests
+- ``backend/tests/test_compare_autoflip_vs_clipai.py`` — 16 tests
+
+All 41 green. ``validate_v2_phases --quick`` exit 0.
