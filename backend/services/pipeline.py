@@ -2796,6 +2796,50 @@ async def _run_analysis_inner(job_id: str):
         except Exception as e:
             logger.warning("[%s] Lip-only speaker fallback failed (non-fatal): %s", job_id, e)
 
+    # ── Gap 5a: Diarization fusion (second independent vote) ──
+    # Run a speaker-side audio diarization pass (pyannote → MFCC →
+    # off) and fuse the resulting speaker clusters with the lip-
+    # motion timeline produced above. The two signals are
+    # independent — lip-motion sees faces, diarization sees
+    # waveforms — so agreement is strong evidence and disagreement
+    # reliably flags crosstalk frames. The fusion is strictly
+    # additive: empty diarization or a single-cluster result leaves
+    # ``active_speaker_events`` bit-identical to the pre-fusion
+    # timeline. Phase B threads the cluster→slot mapping down to
+    # the reframe segmenter via ``_diar_segments`` / ``_fusion``
+    # locals that are read at the existing ``build_reframe_segments``
+    # call below.
+    _diar_segments: list = []
+    _fusion = None
+    try:
+        from backend.services.speaker_diarization import (
+            USE_DIARIZATION, diarize_audio, fuse_lip_and_diarization,
+        )
+        _num_slots = len(face_registry.slots) if face_registry else 0
+        if USE_DIARIZATION and _num_slots >= 2 and audio_path and active_speaker_events:
+            _diar_start = _time.time()
+            _diar_segments = diarize_audio(audio_path, num_speakers=_num_slots)
+            if _diar_segments:
+                _fusion = fuse_lip_and_diarization(
+                    active_speaker_events, _diar_segments,
+                )
+                active_speaker_events = _fusion.events
+                logger.info(
+                    "[%s] Diarization fusion: agree=%d disagree=%d "
+                    "override=%d (%.1fs)",
+                    job_id, _fusion.agree_count, _fusion.disagree_count,
+                    _fusion.override_count, _time.time() - _diar_start,
+                )
+            else:
+                logger.info(
+                    "[%s] Diarization produced no segments; "
+                    "lip-only path retained", job_id,
+                )
+    except Exception as _diar_exc:
+        logger.warning(
+            "[%s] Diarization fusion skipped: %s", job_id, _diar_exc,
+        )
+
     # ── Speaker → Face Slot Mapping (BEFORE per-second synthesis) ──
     # Map Whisper speaker labels to face registry slots using audio diarization.
     # This must run before synthesis so transcript-driven tracking can be used.
