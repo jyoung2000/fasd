@@ -11,7 +11,12 @@ from backend.config import settings
 from backend.models import (
     FrameData, SceneDescription, TranscriptSegment, VideoSummary, ClipCandidate, ClipSEO,
 )
-from backend.services.providers.base import AIProvider, ChunkedClipDetectionMixin, ProviderError, extract_json, extract_partial_clips, extract_description_fallback, normalize_seo_data, build_fallback_summary, has_real_summary_content, build_summary_from_transcript
+from backend.services.providers.base import (
+    AIProvider, ChunkedClipDetectionMixin, ProviderError, extract_json,
+    extract_partial_clips, extract_description_fallback, normalize_seo_data,
+    build_fallback_summary, has_real_summary_content, build_summary_from_transcript,
+    CLIP_JSON_SCHEMA_FOUR_AXIS, parse_clip_dict,
+)
 from backend.services.prompts import DEFAULT_FRAME_ANALYSIS_PROMPT, DEFAULT_VIRAL_CLIP_PROMPT, DEFAULT_SEO_PROMPT, DEFAULT_SUMMARY_PROMPT
 from backend.services.transcript_utils import analyze_transcript_energy, correlate_scenes_with_transcript, derive_content_guidance
 from backend.services.hot_zone_scorer import format_hot_zones_for_prompt
@@ -2174,11 +2179,7 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
             f"You MUST return exactly {num_clips} viral clip candidates, ranked by viral potential from highest to lowest. "
             f"Do NOT return fewer than {num_clips} clips — find {num_clips} distinct moments even if some score lower. "
             f"Each clip must be between {dur_min} and {dur_max} seconds long.\n\n"
-            'Return JSON: {"clips": [{"id": 1, "title": "SEO social media title (no speaker names, describe the TOPIC not the speakers)", "start_time": 0.0, '
-            '"end_time": 60.0, "duration": 60.0, "viral_score": 50, '
-            '"viral_score_reasoning": "...", "clip_type": "highlight", '
-            '"platform": "both", "suggested_caption": "...", '
-            '"hook_text": "...", "why_this_works": "..."}]}\n\n'
+            "Return JSON: " + CLIP_JSON_SCHEMA_FOUR_AXIS + "\n\n"
             "TITLE RULES (critical):\n"
             "- Title must be an SEO-optimized social media title about the SUBJECT/TOPIC of the clip\n"
             "- NEVER mention speaker names, 'Speaker 1', 'Speaker 2', or any speaker references\n"
@@ -2217,33 +2218,21 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                 data = extract_json(raw)
                 clips = []
                 for c in data.get("clips", []):
-                    st = float(c.get("start_time", 0))
-                    et = float(c.get("end_time", 0))
-                    # Fix inverted timestamps (LLM sometimes swaps start/end)
-                    if et < st:
-                        logger.warning("Clip '%s': inverted timestamps %.1f→%.1f, swapping", c.get("title", "?"), st, et)
-                        st, et = et, st
-                    if et <= st:
-                        dur_hint = float(c.get("duration", 0))
-                        if dur_hint > 0:
-                            et = st + dur_hint
-                    duration = et - st
-                    if duration < 15 or duration > 600:
-                        continue
-                    clips.append(ClipCandidate(
-                        id=c.get("id", len(clips) + 1),
-                        title=c.get("title", "Untitled"),
-                        start_time=st,
-                        end_time=et,
-                        duration=round(duration, 1),
-                        viral_score=max(1, min(100, int(float(c.get("viral_score", 50))))),
-                        viral_score_reasoning=str(c.get("viral_score_reasoning", "")),
-                        clip_type=str(c.get("clip_type", "highlight")),
-                        platform=str(c.get("platform", "both")),
-                        suggested_caption=str(c.get("suggested_caption", "")),
-                        hook_text=str(c.get("hook_text", "")),
-                        why_this_works=str(c.get("why_this_works", "")),
-                    ))
+                    # Fix inverted timestamps before parse (LLM sometimes swaps)
+                    try:
+                        st = float(c.get("start_time", 0))
+                        et = float(c.get("end_time", 0))
+                        if et < st:
+                            logger.warning(
+                                "Clip '%s': inverted timestamps %.1f→%.1f, swapping",
+                                c.get("title", "?"), st, et,
+                            )
+                            c["start_time"], c["end_time"] = et, st
+                    except (TypeError, ValueError):
+                        pass
+                    parsed, _ = parse_clip_dict(c, fallback_id=len(clips) + 1)
+                    if parsed is not None:
+                        clips.append(parsed)
                 if clips:
                     logger.info("Ollama parsed %d valid clips on attempt %d", len(clips), attempt + 1)
                     return clips
@@ -2258,29 +2247,16 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
                             st = float(c.get("start_time", 0))
                             et = float(c.get("end_time", 0))
                             if et < st:
-                                logger.warning("Salvage clip '%s': inverted %.1f→%.1f, swapping", c.get("title", "?"), st, et)
-                                st, et = et, st
-                            if et <= st:
-                                dur_hint = float(c.get("duration", 0))
-                                if dur_hint > 0:
-                                    et = st + dur_hint
-                            duration = et - st
-                            if 15 <= duration <= 600:
-                                salvaged.append(ClipCandidate(
-                                    id=c.get("id", len(salvaged) + 1),
-                                    title=c.get("title", "Untitled"),
-                                    start_time=st, end_time=et,
-                                    duration=round(duration, 1),
-                                    viral_score=max(1, min(100, int(float(c.get("viral_score", 50))))),
-                                    viral_score_reasoning=str(c.get("viral_score_reasoning", "")),
-                                    clip_type=str(c.get("clip_type", "highlight")),
-                                    platform=str(c.get("platform", "both")),
-                                    suggested_caption=str(c.get("suggested_caption", "")),
-                                    hook_text=str(c.get("hook_text", "")),
-                                    why_this_works=str(c.get("why_this_works", "")),
-                                ))
-                        except (KeyError, ValueError):
-                            continue
+                                logger.warning(
+                                    "Salvage clip '%s': inverted %.1f→%.1f, swapping",
+                                    c.get("title", "?"), st, et,
+                                )
+                                c["start_time"], c["end_time"] = et, st
+                        except (TypeError, ValueError):
+                            pass
+                        parsed, _ = parse_clip_dict(c, fallback_id=len(salvaged) + 1)
+                        if parsed is not None:
+                            salvaged.append(parsed)
                     if salvaged:
                         logger.warning(
                             "Attempt %d: Salvaged %d clips from partial JSON response",

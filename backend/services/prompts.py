@@ -62,11 +62,47 @@ DEFAULT_SUBJECT_TRACKING_PROMPT = (
     "Keep values in the 10-90 range to prevent the subject being cut off at frame edges."
 )
 
-DEFAULT_VIRAL_CLIP_PROMPT = (
-    "You are an expert social media video strategist who identifies the most "
-    "viral-worthy, attention-grabbing moments in long-form content. Your job is "
-    "to find segments that will perform best on TikTok, YouTube Shorts, and "
-    "Instagram Reels.\n\n"
+# ── 4-axis scoring rubric (Phase 1 of OpusClip parity gap) ───────────
+# Every genre prompt below shares this base. The LLM must return the
+# four axes (hook / flow / value / trend) per clip; the composite
+# ``viral_score`` is computed in Python from those axes (see
+# clip_scoring.py).
+FOUR_AXIS_RUBRIC = (
+    "SCORING — return four independent axis scores (0-100) per clip:\n\n"
+    "1. hook_score (0-100): Does the FIRST 3 SECONDS pull a scrolling viewer in?\n"
+    "   90+ — bold question, jaw-dropping claim, visual spectacle, or a clean\n"
+    "         emotional spike (laughter, shouting, gasp) lands inside the first 3s.\n"
+    "   60-80 — clear topic introduction with a confident opener and no dead air.\n"
+    "   30-50 — generic exposition, mid-thought entry, or weak energy at t=0.\n"
+    "   0-25 — dead air, mid-sentence start, filler word opener (\"um\", \"so\", \"and\"),\n"
+    "         or context-dependent pronoun opener (\"that was\", \"it's\").\n\n"
+    "2. flow_score (0-100): Does the clip stay on ONE topic, ONE scene, ONE exchange,\n"
+    "   with a setup → payoff arc?\n"
+    "   90+ — single coherent moment with a clear beginning / middle / end.\n"
+    "   60-80 — mostly cohesive; one or two minor digressions but the through-line is clear.\n"
+    "   30-50 — drifts between sub-topics or cuts across scenes.\n"
+    "   0-25 — incoherent: stitches unrelated moments or ends mid-thought.\n\n"
+    "3. value_score (0-100): Does the clip RESOLVE — answer a question, reveal\n"
+    "   something, land a punchline, or deliver an emotional payoff?\n"
+    "   90+ — explicit payoff: punchline, shocking reveal, hot take, satisfying answer.\n"
+    "   60-80 — solid takeaway viewer would remember.\n"
+    "   ~50 — interesting but unresolved: the clip is engaging but doesn't actually\n"
+    "         arrive anywhere.\n"
+    "   0-30 — no payoff, filler dialogue, no quotable moment.\n\n"
+    "4. trend_score (0-100): How closely does the topic/vibe match current short-form\n"
+    "   patterns for the detected genre and platform?\n"
+    "   - If a TREND CONTEXT block is provided below, use it. Phrases that overlap\n"
+    "     a listed trending topic should score 70+, phrases adjacent to one 50-65,\n"
+    "     and unrelated content 30-45.\n"
+    "   - When NO trend context is provided, default to 50 (neutral). Do NOT guess.\n\n"
+    "Each axis ALSO needs a ONE-SENTENCE reason field explaining the score:\n"
+    "  hook_reason, flow_reason, value_reason, trend_reason.\n"
+    "Be concrete and specific. Bad: \"good hook\". Good: \"opens with the question\n"
+    "'why does nobody talk about this' — strong scroll-stopper\".\n"
+)
+
+
+_VIRAL_BASE_INSTRUCTIONS = (
     "DETECTION METHODOLOGY (follow this two-phase process):\n\n"
     "PHASE 1 — SCAN: Read through the transcript and scene descriptions chronologically. "
     "Identify ALL potential clip-worthy moments. Look for:\n"
@@ -75,20 +111,9 @@ DEFAULT_VIRAL_CLIP_PROMPT = (
     " - Moments where strong dialogue COINCIDES with strong visuals\n"
     " - Natural story arcs: setup → tension → payoff within a contained segment\n"
     " - Speaker changes that mark the start or end of a distinct exchange\n\n"
-    "PHASE 2 — EVALUATE each candidate moment:\n"
-    " - Hook Test: Would the first 3 seconds make someone stop scrolling?\n"
-    " - Standalone Test: Does this clip make sense WITHOUT the rest of the video?\n"
-    " - Completion Test: Does the clip have a beginning, middle, and end?\n"
-    " - Coherence Test: Does the clip stay in ONE scene, ONE topic, ONE exchange?\n"
-    " - Share Test: Would someone send this to a friend or repost it?\n\n"
-    "WHAT MAKES A VIRAL CLIP:\n"
-    "- Strong hook in the first 3 seconds (question, bold claim, visual spectacle)\n"
-    "- Emotional peaks: laughter, shock, awe, heartfelt moments\n"
-    "- Visual spectacle: stunning visuals, cool effects, dramatic reveals\n"
-    "- Quotable/shareable statements or hot takes\n"
-    "- Complete micro-stories with setup + payoff\n"
-    "- Reaction-worthy moments that make viewers comment or share\n"
-    "- When a visual peak (★ scene) coincides with strong transcript content, score that clip higher\n\n"
+    "PHASE 2 — SCORE each candidate against the 4-axis rubric below. Do NOT\n"
+    "blend the axes into a single number — return them separately and we will\n"
+    "compose the final score in code.\n\n"
     "SCENE & SUBJECT COHERENCE (CRITICAL):\n"
     "- The main subject MUST stay in focus throughout the entire clip\n"
     "- NEVER cut across unrelated scenes or topics — the clip must feel like ONE moment\n"
@@ -106,8 +131,193 @@ DEFAULT_VIRAL_CLIP_PROMPT = (
     "BOUNDARY RULES:\n"
     "- Start at natural speech boundaries — beginning of a sentence, after a pause, at a speaker change\n"
     "- End at natural conclusions — punchlines, resolved thoughts, scene transitions\n"
-    "- Must work standalone without context from the full video"
+    "- Must work standalone without context from the full video\n"
 )
+
+
+def _build_viral_prompt(role_line: str, genre_block: str = "") -> str:
+    """Compose a genre prompt from the shared base + a per-genre block."""
+    parts = [role_line.rstrip(), "", _VIRAL_BASE_INSTRUCTIONS, FOUR_AXIS_RUBRIC]
+    if genre_block:
+        parts.append(genre_block.rstrip())
+    return "\n".join(parts)
+
+
+# Generic / fallback prompt — same role line as the legacy default.
+_GENERIC_ROLE = (
+    "You are an expert social media video strategist who identifies the most "
+    "viral-worthy, attention-grabbing moments in long-form content. Your job is "
+    "to find segments that will perform best on TikTok, YouTube Shorts, and "
+    "Instagram Reels."
+)
+
+DEFAULT_VIRAL_CLIP_PROMPT = _build_viral_prompt(_GENERIC_ROLE)
+
+
+# ── Genre-specific prompt variants (Phase 2) ────────────────────────
+# Each variant adds a genre block that re-tunes what a 90+ score on
+# each axis looks like for that content type and lists genre-specific
+# examples. The shared 4-axis rubric still applies — the genre block
+# just refines it.
+
+VIRAL_PROMPT_TALKING_HEAD = _build_viral_prompt(
+    "You are a podcast / interview / vlog clip editor finding the moments most "
+    "likely to be reposted as standalone shorts. Focus on quotable hot takes, "
+    "clean exchanges, and reaction-worthy answers. Visual spectacle is rare in "
+    "this genre — judge clips on what is SAID, not what is shown.",
+    genre_block=(
+        "GENRE TUNING — TALKING HEAD / PODCAST / INTERVIEW / VLOG:\n"
+        "- A 90+ HOOK is a question the audience wants answered or a confident\n"
+        "  declarative claim. Mid-question entries are penalised hard.\n"
+        "- A 90+ FLOW stays inside a single exchange between speakers — never\n"
+        "  glue together two questions that cover different topics.\n"
+        "- A 90+ VALUE is a quotable line: \"Most people get this wrong because\n"
+        "  ___\", a confessional reveal, or a punchline that lands.\n"
+        "- Prefer 30-60s clips that capture one full Q→A or one self-contained\n"
+        "  monologue beat. Do not pad to fill duration.\n"
+    ),
+)
+
+VIRAL_PROMPT_GAMEPLAY = _build_viral_prompt(
+    "You are a gameplay highlight editor finding clutch plays, kill streaks, "
+    "skill moments, funny deaths, and reaction-worthy commentary. Most viewers "
+    "are scrolling — the first second of action decides whether they stop.",
+    genre_block=(
+        "GENRE TUNING — GAMEPLAY (FPS / MOBA / TPS / RACING):\n"
+        "- A 90+ HOOK opens on a moment of high stakes or a kinetic action beat:\n"
+        "  the start of a teamfight, a clutch round, an enemy contact, or a\n"
+        "  funny fail moment. Static menu / loadout screens are dead air — score 0-25.\n"
+        "- A 90+ FLOW is a single play that resolves in a clear win or loss.\n"
+        "  Avoid stitching plays from different rounds together.\n"
+        "- A 90+ VALUE has a clear payoff: the kill, the clutch, the joke. The\n"
+        "  commentary reaction (\"NO WAY\", \"OH MY GOD\") is a reliable payoff signal.\n"
+        "- De-emphasise long stretches of dialogue between fights — those are\n"
+        "  filler in this genre.\n"
+        "- Prefer 15-45s clips. Anything longer than 60s loses scrollers.\n"
+    ),
+)
+
+VIRAL_PROMPT_SPORTS = _build_viral_prompt(
+    "You are a sports highlight editor finding scoring plays, close calls, "
+    "crowd reactions, and dramatic moments. Score boundaries by play "
+    "completion, not sentence boundaries — the cheering after the play is part "
+    "of the clip.",
+    genre_block=(
+        "GENRE TUNING — SPORTS:\n"
+        "- A 90+ HOOK opens a few seconds before the decisive moment so viewers\n"
+        "  feel the build-up. Cold opens on a celebration are weaker (40-60).\n"
+        "- A 90+ FLOW is one continuous play from setup to result, ending after\n"
+        "  the crowd reaction. Cutting before the cheer kills the payoff.\n"
+        "- A 90+ VALUE is the play itself + the reaction (crowd, commentary,\n"
+        "  player). A scoring play with no reaction shot is ~70.\n"
+        "- Boundary rule: snap to play start / whistle, not to mid-sentence\n"
+        "  commentary. The commentator can still be mid-word at the start.\n"
+        "- Prefer 15-40s clips.\n"
+    ),
+)
+
+VIRAL_PROMPT_MUSIC_VIDEO = _build_viral_prompt(
+    "You are a music video editor finding beat drops, chorus moments, and "
+    "iconic visual motifs. The audio waveform is the primary signal — find the "
+    "moments where the music peaks and the visuals support it.",
+    genre_block=(
+        "GENRE TUNING — MUSIC VIDEO:\n"
+        "- A 90+ HOOK is a beat drop, vocal entry, or a striking visual motif\n"
+        "  in the first 1-2 seconds. Long instrumental intros without a payoff\n"
+        "  are weaker (30-50).\n"
+        "- A 90+ FLOW is bar-aligned: starts on a downbeat, ends on a phrase\n"
+        "  resolution. Do NOT cut mid-bar.\n"
+        "- A 90+ VALUE is the chorus or the most memorable visual sequence —\n"
+        "  the part viewers would loop or duet with.\n"
+        "- Boundary rule: snap to beat boundaries. Even a 0.3s offset feels wrong.\n"
+        "- Trend axis matters more than usual here — match against what is\n"
+        "  currently going viral on TikTok sound.\n"
+        "- Prefer 15-30s clips.\n"
+    ),
+)
+
+VIRAL_PROMPT_ANIMATION = _build_viral_prompt(
+    "You are an animation / anime clip editor finding reaction shots, "
+    "punchline frames, action peaks, and emotional beats. Cuts must respect "
+    "shot boundaries — never combine two scenes that show different characters "
+    "in different settings.",
+    genre_block=(
+        "GENRE TUNING — ANIMATION / ANIME / CARTOON:\n"
+        "- A 90+ HOOK is a striking pose, a sudden expression, or a sharp\n"
+        "  motion beat in the first second. Static establishing shots are weak\n"
+        "  (30-45).\n"
+        "- A 90+ FLOW is one scene with one character set. Hard cut to a new\n"
+        "  scene = drop flow to 30 or below.\n"
+        "- A 90+ VALUE is a punchline frame, a reveal expression, an action peak,\n"
+        "  or an emotional climax. Talking heads with no expression change ~50.\n"
+        "- Character consistency is mandatory: do not glue together two scenes\n"
+        "  with different protagonists.\n"
+        "- Prefer 15-40s clips.\n"
+    ),
+)
+
+VIRAL_PROMPT_NARRATIVE = _build_viral_prompt(
+    "You are a narrative film / TV clip editor finding cinematic dialogue, "
+    "reveal moments, and emotional beats. Respect shot boundaries hard — a "
+    "clip must live inside a single scene.",
+    genre_block=(
+        "GENRE TUNING — NARRATIVE / CINEMATIC DIALOGUE:\n"
+        "- A 90+ HOOK opens on a clean line delivery or a striking visual.\n"
+        "  Mid-line entries lose 25 points.\n"
+        "- A 90+ FLOW lives entirely inside one scene with one set of\n"
+        "  characters. Scene cuts inside the clip = drop flow hard.\n"
+        "- A 90+ VALUE is a reveal, a confession, a punchline, or a line that\n"
+        "  hits hard out of context.\n"
+        "- Boundary rule: snap to shot transitions, not to mid-line audio.\n"
+        "- Prefer 20-50s clips so the beat has room to breathe.\n"
+    ),
+)
+
+VIRAL_PROMPT_GENERIC = DEFAULT_VIRAL_CLIP_PROMPT
+
+
+def get_genre_prompt(content_type) -> str:
+    """Return the right viral-clip prompt variant for a content type.
+
+    Accepts a ``ClipContentType`` enum value (or anything with a
+    ``.value`` attribute / a string). Always returns a non-empty
+    string — falls back to ``DEFAULT_VIRAL_CLIP_PROMPT`` for unknown
+    types so the caller never has to null-check.
+    """
+    # Defer the import so this module stays cheap to import. The
+    # content_classifier module is several hundred lines of heuristics
+    # we do not need just to look up an enum.
+    try:
+        from backend.services.content_classifier import ClipContentType
+    except Exception:
+        return DEFAULT_VIRAL_CLIP_PROMPT
+
+    if content_type is None:
+        return DEFAULT_VIRAL_CLIP_PROMPT
+
+    if hasattr(content_type, "value"):
+        key = content_type.value
+    else:
+        key = str(content_type)
+
+    mapping = {
+        ClipContentType.TALKING_HEAD.value: VIRAL_PROMPT_TALKING_HEAD,
+        ClipContentType.MULTI_SPEAKER_PANEL.value: VIRAL_PROMPT_TALKING_HEAD,
+        ClipContentType.GAMEPLAY.value: VIRAL_PROMPT_GAMEPLAY,
+        ClipContentType.GAMEPLAY_MOBA.value: VIRAL_PROMPT_GAMEPLAY,
+        ClipContentType.GAMEPLAY_TPS.value: VIRAL_PROMPT_GAMEPLAY,
+        ClipContentType.GAMEPLAY_RACING.value: VIRAL_PROMPT_GAMEPLAY,
+        ClipContentType.STREAM.value: VIRAL_PROMPT_GAMEPLAY,
+        ClipContentType.SPORTS.value: VIRAL_PROMPT_SPORTS,
+        ClipContentType.SPORTS_BASKETBALL.value: VIRAL_PROMPT_SPORTS,
+        ClipContentType.SPORTS_RACING.value: VIRAL_PROMPT_SPORTS,
+        ClipContentType.MUSIC_VIDEO.value: VIRAL_PROMPT_MUSIC_VIDEO,
+        ClipContentType.ANIMATION.value: VIRAL_PROMPT_ANIMATION,
+        ClipContentType.ANIMATION_DIALOGUE.value: VIRAL_PROMPT_ANIMATION,
+        ClipContentType.CINEMATIC_DIALOGUE.value: VIRAL_PROMPT_NARRATIVE,
+        ClipContentType.GENERIC.value: VIRAL_PROMPT_GENERIC,
+    }
+    return mapping.get(key, VIRAL_PROMPT_GENERIC)
 
 
 DEFAULT_SUMMARY_PROMPT = (

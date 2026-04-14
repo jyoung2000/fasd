@@ -4263,10 +4263,24 @@ async def _run_analysis_inner(job_id: str):
             logger.warning("[%s] Filler detection failed (non-fatal): %s", job_id, e)
 
     # Hot zone pre-scoring (instant, no AI calls)
+    # Phase 3 — pass the trend matcher in if the flag is on. The matcher
+    # is built lazily so the import / lexicon read only fires when the
+    # operator opts in.
+    _hot_zone_trend_matcher = None
+    try:
+        from backend.services.trend_matcher import (
+            build_default_trend_matcher, trend_matcher_enabled,
+        )
+        if trend_matcher_enabled():
+            _hot_zone_trend_matcher = build_default_trend_matcher()
+    except Exception as _tm_err:
+        logger.warning("[%s] Trend matcher (hot zones) init failed: %s", job_id, _tm_err)
+
     from backend.services.hot_zone_scorer import score_hot_zones, format_hot_zones_for_prompt
     hot_zones = score_hot_zones(
         transcript, scenes, audio_moments, metadata["duration"],
         filler_events=filler_events,
+        trend_matcher=_hot_zone_trend_matcher,
     )
     hot_zone_text = format_hot_zones_for_prompt(hot_zones, top_n=tier.hot_zone_top_n)
     logger.info(
@@ -4352,6 +4366,89 @@ async def _run_analysis_inner(job_id: str):
         # Reset again before clip detection — summary generation may have
         # had transient failures that shouldn't block clip detection.
         orchestrator.reset_circuit_breaker()
+
+        # ── Phase 2 (OpusClip parity gap): job-level content type ──
+        # The per-clip content type is computed later (line ~3944) for
+        # camera-solver routing. For genre-aware clip DETECTION we need
+        # one job-level type ahead of time. Derive it from the global
+        # content profile we built right after dense face detection.
+        _job_content_type = None
+        try:
+            from backend.services.content_classifier import (
+                classify_clip as _classify_clip_for_detection, ClipContentType,
+            )
+            if _content_profile is not None:
+                _job_content_type = _classify_clip_for_detection(
+                    content_profile=_content_profile,
+                    persistent_regions=None,
+                    frame_faces=None,
+                    shot_count=len(scene_cut_timestamps) if scene_cut_timestamps else 0,
+                    duration=metadata.get("duration", 0),
+                )
+                logger.info(
+                    "[%s] Clip detection content_type=%s (from profile=%s)",
+                    job_id,
+                    _job_content_type.value if _job_content_type else "none",
+                    getattr(_content_profile, "content_type", "unknown"),
+                )
+            else:
+                _job_content_type = ClipContentType.GENERIC
+                logger.info("[%s] No content profile — using GENERIC for clip detection", job_id)
+        except Exception as _ct_err:
+            logger.warning("[%s] Failed to compute job content_type (non-fatal): %s", job_id, _ct_err)
+            _job_content_type = None
+
+        # ── Phase 3 — Trend matcher (off by default, opt-in via flag) ──
+        _trend_context_text: str | None = None
+        _trend_matcher = None
+        try:
+            from backend.services.trend_matcher import (
+                build_default_trend_matcher, format_trend_context,
+                trend_matcher_enabled,
+            )
+            if trend_matcher_enabled():
+                _trend_matcher = build_default_trend_matcher(
+                    emphasis_keywords=None,  # filled in after detect_emphasis_words below
+                )
+                _trend_context_text = format_trend_context(
+                    _trend_matcher, transcript,
+                    content_type=_job_content_type,
+                )
+                if _trend_context_text:
+                    logger.info(
+                        "[%s] Trend context built: %d chars", job_id, len(_trend_context_text),
+                    )
+        except Exception as _trend_err:
+            logger.warning("[%s] Trend matcher init failed (non-fatal): %s", job_id, _trend_err)
+
+        # ── Phase 5 — Sentiment timeline from audio_moments ──
+        _sentiment_timeline_text: str | None = None
+        try:
+            from backend.services.audio_analyzer import format_sentiment_timeline
+            _sentiment_timeline_text = format_sentiment_timeline(audio_moments)
+        except Exception:
+            _sentiment_timeline_text = None
+
+        # ── Phase 6 — Chapter segmentation (opt-in via flag) ──
+        _chapters = None
+        try:
+            from backend.services.chapter_segmenter import (
+                segment_chapters, chapter_segmentation_enabled,
+            )
+            if (
+                chapter_segmentation_enabled()
+                and metadata.get("duration", 0) >= 180  # short videos: skip
+            ):
+                _chapters = segment_chapters(
+                    transcript, scenes, audio_moments,
+                )
+                logger.info(
+                    "[%s] Chapter segmentation produced %d chapters",
+                    job_id, len(_chapters),
+                )
+        except Exception as _ch_err:
+            logger.warning("[%s] Chapter segmentation failed (non-fatal): %s", job_id, _ch_err)
+            _chapters = None
 
         _clips_start = _time.monotonic()
         _clips_phase_start[0] = _clips_start  # For phase-aware ETA
@@ -4458,6 +4555,10 @@ async def _run_analysis_inner(job_id: str):
                         progress_callback=_clip_progress,
                         clip_count=dynamic_clip_count,
                         tier=tier,
+                        content_type=_job_content_type,
+                        chapters=_chapters,
+                        trend_context=_trend_context_text,
+                        sentiment_timeline=_sentiment_timeline_text,
                     )
                 )
                 clips, clips_provider = await asyncio.wait_for(
@@ -4479,6 +4580,10 @@ async def _run_analysis_inner(job_id: str):
                             progress_callback=_clip_progress,
                             clip_count=dynamic_clip_count,
                             tier=tier,
+                            content_type=_job_content_type,
+                            chapters=_chapters,
+                            trend_context=_trend_context_text,
+                            sentiment_timeline=_sentiment_timeline_text,
                         ),
                         timeout=_SUMMARY_CLIP_TIMEOUT,
                     )

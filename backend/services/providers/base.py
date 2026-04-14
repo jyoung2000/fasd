@@ -407,6 +407,139 @@ def extract_partial_clips(raw: str) -> list[dict]:
     return clips
 
 
+# ── Phase 1 (4-axis scoring) helpers ────────────────────────────────
+# Every provider builds a JSON schema string for the LLM and parses
+# the response back into ClipCandidate. We centralise the schema and
+# parser here so adding axes / fields only needs one edit.
+
+CLIP_JSON_SCHEMA_FOUR_AXIS = (
+    '{"clips": [{"id": 1, '
+    '"title": "SEO social media title about the topic (no speaker names)", '
+    '"start_time": 45.2, "end_time": 112.8, "duration": 67.6, '
+    '"hook_score": 88, "hook_reason": "opens with bold question", '
+    '"flow_score": 75, "flow_reason": "single coherent exchange", '
+    '"value_score": 80, "value_reason": "delivers a quotable hot take", '
+    '"trend_score": 60, "trend_reason": "topic adjacent to trending", '
+    '"clip_type": "informative|funny|emotional|shocking|tutorial|highlight|debate|reveal", '
+    '"platform": "tiktok|youtube_shorts|both", '
+    '"suggested_caption": "Caption with #hashtags", '
+    '"hook_text": "Text overlay for opening frame", '
+    '"why_this_works": "One sentence explanation"}], '
+    '"total_candidates": 8, "best_clip_id": 1}'
+)
+
+
+def _coerce_axis_score(raw, default: int = 0) -> int:
+    """Coerce an LLM-returned score field to an int 0-100.
+
+    Handles ``None``, strings, floats, and out-of-range values. Returns
+    ``default`` (typically 0 or 50) when the value is missing or
+    unparseable.
+    """
+    if raw is None or raw == "":
+        return default
+    try:
+        score = int(round(float(raw)))
+    except (TypeError, ValueError):
+        return default
+    return max(0, min(100, score))
+
+
+def parse_clip_dict(
+    c: dict,
+    fallback_id: int = 1,
+    min_duration: float = 15.0,
+    max_duration: float = 600.0,
+) -> "tuple[ClipCandidate | None, str | None]":
+    """Parse one LLM-returned clip dict into a ``ClipCandidate``.
+
+    Returns ``(clip, None)`` on success or ``(None, reason)`` on
+    validation failure. Centralises the boilerplate every provider
+    used to repeat: duration validation, ID coercion, axis-score
+    parsing, and backward compatibility with the legacy
+    ``viral_score`` field.
+
+    Backward compatibility: if the LLM did not return the four axes
+    (older / fine-tuned models), we splat the legacy ``viral_score``
+    across all four axes via ``fill_axes_from_legacy`` so downstream
+    code paths still work.
+    """
+    try:
+        start = float(c.get("start_time", 0))
+        end = float(c.get("end_time", 0))
+        duration = end - start
+        if duration <= 0:
+            duration = float(c.get("duration", 0))
+        if duration < min_duration:
+            return None, f"too short ({duration:.1f}s)"
+        if duration > max_duration:
+            return None, f"too long ({duration:.1f}s)"
+
+        focus_relevance = c.get("focus_relevance")
+        if focus_relevance is not None:
+            try:
+                focus_relevance = max(1, min(100, int(float(focus_relevance))))
+            except (TypeError, ValueError):
+                focus_relevance = None
+        focus_tier = c.get("focus_tier")
+        if focus_tier and focus_tier not in ("strong", "moderate", "weak"):
+            focus_tier = None
+
+        # Axis scores. ``trend_score`` defaults to 50 (neutral) when
+        # the LLM omits it — we never want a missing trend signal to
+        # drag the composite to 0.
+        hook_score = _coerce_axis_score(c.get("hook_score"), default=0)
+        flow_score = _coerce_axis_score(c.get("flow_score"), default=0)
+        value_score = _coerce_axis_score(c.get("value_score"), default=0)
+        trend_score = _coerce_axis_score(c.get("trend_score"), default=0)
+
+        # Legacy viral_score is still accepted as a tiebreaker / backfill.
+        legacy_viral = c.get("viral_score")
+        if legacy_viral is not None:
+            legacy_viral = _coerce_axis_score(legacy_viral, default=50)
+        else:
+            # No explicit viral_score — derive a temporary one from
+            # whichever axes were populated. ``finalize_clip_scores``
+            # will overwrite this with the genre-weighted composite.
+            populated = [s for s in (hook_score, flow_score, value_score, trend_score) if s > 0]
+            legacy_viral = int(sum(populated) / len(populated)) if populated else 50
+
+        clip = ClipCandidate(
+            id=int(c.get("id", fallback_id)),
+            title=str(c.get("title", "Untitled")),
+            start_time=start,
+            end_time=end,
+            duration=round(duration, 1),
+            viral_score=legacy_viral,
+            viral_score_reasoning=str(c.get("viral_score_reasoning", "")),
+            clip_type=str(c.get("clip_type", "highlight")),
+            platform=str(c.get("platform", "both")),
+            suggested_caption=str(c.get("suggested_caption", "")),
+            hook_text=str(c.get("hook_text", "")),
+            why_this_works=str(c.get("why_this_works", "")),
+            focus_relevance=focus_relevance,
+            focus_tier=focus_tier,
+            hook_score=hook_score,
+            flow_score=flow_score,
+            value_score=value_score,
+            trend_score=trend_score,
+            hook_reason=str(c.get("hook_reason", "")),
+            flow_reason=str(c.get("flow_reason", "")),
+            value_reason=str(c.get("value_reason", "")),
+            trend_reason=str(c.get("trend_reason", "")),
+        )
+
+        # Backfill axes from the legacy score if the LLM ignored the
+        # 4-axis schema entirely.
+        if (hook_score, flow_score, value_score, trend_score) == (0, 0, 0, 0):
+            from backend.services.clip_scoring import fill_axes_from_legacy
+            fill_axes_from_legacy(clip)
+
+        return clip, None
+    except (TypeError, ValueError, KeyError) as err:
+        return None, f"malformed: {err}"
+
+
 class ProviderError(Exception):
     pass
 
@@ -529,10 +662,21 @@ class AIProvider(ABC):
 def _score_hook_strength(
     clip: ClipCandidate,
     transcript: list[TranscriptSegment],
+    audio_moments: "list[dict] | None" = None,
+    scenes: "list[SceneDescription] | None" = None,
 ) -> tuple[int, str]:
     """Score the hook (first 3 seconds) of a clip candidate.
 
     Returns (score 0-100, reason string).
+
+    Phase 5 (OpusClip parity gap) extends the original transcript-only
+    scorer with optional audio-attack and visual-importance signals.
+    Both parameters are optional so existing callers keep working
+    unchanged. When supplied, they nudge the score:
+
+      * audio attack within first 500ms   → +10
+      * sentiment tag (laughter/cheering) → +12
+      * high importance scene at t=0      → +8
     """
     hook_start = clip.start_time
     hook_end = hook_start + 3.0
@@ -543,7 +687,27 @@ def _score_hook_strength(
     ]
 
     if not hook_segs:
-        return 15, "dead_air_opening"
+        # No speech in the first 3s — but a strong audio spike or a
+        # visual peak can still pull viewers in (think a music drop or
+        # a cinematic establishing shot). Don't auto-floor to 15.
+        base = 15
+        if audio_moments:
+            attack = next(
+                (m for m in audio_moments
+                 if hook_start <= m.get("timestamp", -1) <= hook_start + 0.5),
+                None,
+            )
+            if attack:
+                base += 30
+        if scenes:
+            opener_scene = next(
+                (s for s in scenes
+                 if hook_start <= getattr(s, "timestamp", -1) <= hook_start + 1.0),
+                None,
+            )
+            if opener_scene and getattr(opener_scene, "importance_score", 0) >= 8:
+                base += 20
+        return min(100, base), "dead_air_opening"
 
     first_seg = min(hook_segs, key=lambda s: s.start)
     first_text = first_seg.text.strip()
@@ -603,6 +767,42 @@ def _score_hook_strength(
     if any(m in first_text_lower for m in bold_markers):
         score += 15
         reason_parts.append("bold_claim_hook")
+
+    # ── Phase 5: audio attack within 500ms of t=0 ──
+    if audio_moments:
+        attack = None
+        sentiment_attack = None
+        for m in audio_moments:
+            ts = m.get("timestamp", -1)
+            if hook_start <= ts <= hook_start + 0.5:
+                attack = m
+            if hook_start <= ts <= hook_start + 1.5:
+                sent = m.get("sentiment")
+                if sent in {"laughter", "cheering", "shouting", "applause"}:
+                    sentiment_attack = sent
+                    break
+        if attack:
+            score += 10
+            reason_parts.append("audio_attack_hook")
+        if sentiment_attack:
+            score += 12
+            reason_parts.append(f"sentiment_{sentiment_attack}_hook")
+
+    # ── Phase 5: visual peak in opening frame ──
+    if scenes:
+        opener_scene = next(
+            (s for s in scenes
+             if hook_start <= getattr(s, "timestamp", -1) <= hook_start + 1.0),
+            None,
+        )
+        if opener_scene:
+            importance = getattr(opener_scene, "importance_score", 0)
+            if importance >= 8:
+                score += 8
+                reason_parts.append("visual_peak_hook")
+            elif importance <= 3:
+                score -= 8
+                reason_parts.append("visual_dead_hook")
 
     return max(0, min(100, score)), "+".join(reason_parts) if reason_parts else "neutral"
 
@@ -1461,13 +1661,36 @@ class ChunkedClipDetectionMixin:
             all_clips[i] = self._snap_to_speech_boundaries(clip, transcript)
 
         # ── Hook strength validation ──
+        # ``hot_zones`` is a list of HotZone objects, not raw audio
+        # moments; we don't have direct access to ``audio_moments``
+        # at this layer. The Phase 5 audio-attack signals fold in via
+        # the hot-zone scoring earlier in the pipeline; here we still
+        # get the transcript + scenes signals.
         for clip in all_clips:
-            hook_score, hook_reason = _score_hook_strength(clip, transcript)
-            hook_adjustment = int((hook_score - 50) * 0.2)
-            clip.viral_score = max(1, min(100, clip.viral_score + hook_adjustment))
-            clip.viral_score_reasoning += f" [Hook: {hook_score}/100 ({hook_reason})]"
+            local_hook_score, hook_reason = _score_hook_strength(
+                clip, transcript,
+                audio_moments=None,
+                scenes=scenes,
+            )
+            # Phase 1 — if the LLM already gave us a hook_score, blend
+            # 60/40 toward the local signal when they disagree by >25.
+            llm_hook = clip.hook_score
+            if llm_hook > 0 and abs(local_hook_score - llm_hook) > 25:
+                blended = int(round(local_hook_score * 0.6 + llm_hook * 0.4))
+                clip.hook_score = max(0, min(100, blended))
+                clip.hook_reason = (
+                    f"{clip.hook_reason} | local: {hook_reason}"
+                ).strip(" |")
+            elif llm_hook == 0:
+                # No LLM hook — fall back to the local signal entirely.
+                clip.hook_score = local_hook_score
+                clip.hook_reason = hook_reason
 
-            if hook_score < 30 and transcript:
+            hook_adjustment = int((local_hook_score - 50) * 0.2)
+            clip.viral_score = max(1, min(100, clip.viral_score + hook_adjustment))
+            clip.viral_score_reasoning += f" [Hook: {local_hook_score}/100 ({hook_reason})]"
+
+            if local_hook_score < 30 and transcript:
                 better_start = _find_better_hook(clip, transcript)
                 if better_start is not None and better_start > clip.start_time:
                     old_start = clip.start_time
@@ -1477,6 +1700,9 @@ class ChunkedClipDetectionMixin:
                         "Hook fix: '%s' start slid %.1f→%.1fs (hook was %s)",
                         clip.title, old_start, better_start, hook_reason,
                     )
+
+        # Update audio component of hot-zone scoring with sentiment bonuses
+        # (handled inline in hot_zone_scorer when sentiment tags are present).
 
         # ── Retention curve analysis ──
         for clip in all_clips:

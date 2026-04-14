@@ -12,7 +12,13 @@ from backend.config import settings
 from backend.models import (
     FrameData, SceneDescription, TranscriptSegment, VideoSummary, ClipCandidate, ClipSEO,
 )
-from backend.services.providers.base import AIProvider, ChunkedClipDetectionMixin, ProviderError, ProviderRateLimitError, extract_json, extract_partial_clips, extract_description_fallback, normalize_seo_data, build_fallback_summary, has_real_summary_content, build_summary_from_transcript
+from backend.services.providers.base import (
+    AIProvider, ChunkedClipDetectionMixin, ProviderError, ProviderRateLimitError,
+    extract_json, extract_partial_clips, extract_description_fallback,
+    normalize_seo_data, build_fallback_summary, has_real_summary_content,
+    build_summary_from_transcript,
+    CLIP_JSON_SCHEMA_FOUR_AXIS, parse_clip_dict,
+)
 from backend.services.prompts import DEFAULT_FRAME_ANALYSIS_PROMPT, DEFAULT_VIRAL_CLIP_PROMPT, DEFAULT_SEO_PROMPT, DEFAULT_SUMMARY_PROMPT
 from backend.services.transcript_utils import analyze_transcript_energy, correlate_scenes_with_transcript, derive_content_guidance
 
@@ -1522,15 +1528,7 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
             "high-scoring zones (score >50). These zones have verified audio energy spikes, "
             "rapid dialogue, visual peaks, or speaker dynamics that indicate viral moments.\n\n"
             "Return ONLY valid JSON, no other text:\n"
-            '{"clips": [{"id": 1, "title": "SEO social media title about the topic (no speaker names)", '
-            '"start_time": 45.2, "end_time": 112.8, "duration": 67.6, '
-            '"viral_score": 87, "viral_score_reasoning": "Strong hook...", '
-            '"clip_type": "informative|funny|emotional|shocking|tutorial|highlight|debate|reveal", '
-            '"platform": "tiktok|youtube_shorts|both", '
-            '"suggested_caption": "Caption with #hashtags", '
-            '"hook_text": "Text overlay for opening frame", '
-            '"why_this_works": "One sentence explanation"}], '
-            '"total_candidates": 8, "best_clip_id": 1}'
+            + CLIP_JSON_SCHEMA_FOUR_AXIS
         )
         summary_section = ""
         if video_summary:
@@ -1596,50 +1594,16 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                 clips = []
                 filtered_reasons = []
                 for c in clips_data:
-                    try:
-                        start = float(c.get("start_time", 0))
-                        end = float(c.get("end_time", 0))
-                        # Always compute from timestamps — model's duration field is unreliable
-                        duration = end - start
-                        if duration <= 0:
-                            # Fallback to model's duration field
-                            duration = float(c.get("duration", 0))
-                        clip_title = c.get("title", "Untitled")
-                        if duration < 15:
+                    parsed, err = parse_clip_dict(c, fallback_id=len(clips) + 1)
+                    if parsed is None:
+                        if err and ("too short" in err or "too long" in err):
                             filtered_reasons.append(
-                                f"  #{c.get('id', '?')} '{clip_title}': too short ({duration:.1f}s)")
-                            continue
-                        if duration > 600:
-                            filtered_reasons.append(
-                                f"  #{c.get('id', '?')} '{clip_title}': too long ({duration:.1f}s)")
-                            continue
-                        # Parse optional focus relevance fields
-                        focus_relevance = c.get("focus_relevance")
-                        if focus_relevance is not None:
-                            focus_relevance = max(1, min(100, int(float(focus_relevance))))
-                        focus_tier = c.get("focus_tier")
-                        if focus_tier and focus_tier not in ("strong", "moderate", "weak"):
-                            focus_tier = None
-
-                        clips.append(ClipCandidate(
-                            id=int(c.get("id", len(clips) + 1)),
-                            title=clip_title,
-                            start_time=start,
-                            end_time=end,
-                            duration=round(duration, 1),
-                            viral_score=max(1, min(100, int(float(c.get("viral_score", 50))))),
-                            viral_score_reasoning=str(c.get("viral_score_reasoning", "")),
-                            clip_type=str(c.get("clip_type", "highlight")),
-                            platform=str(c.get("platform", "both")),
-                            suggested_caption=str(c.get("suggested_caption", "")),
-                            hook_text=str(c.get("hook_text", "")),
-                            why_this_works=str(c.get("why_this_works", "")),
-                            focus_relevance=focus_relevance,
-                            focus_tier=focus_tier,
-                        ))
-                    except (TypeError, ValueError, KeyError) as clip_err:
-                        logger.warning(f"Skipping malformed clip: {clip_err} — data: {c}")
+                                f"  #{c.get('id', '?')} '{c.get('title', '?')}': {err}"
+                            )
+                        else:
+                            logger.warning(f"Skipping malformed clip: {err} — data: {c}")
                         continue
+                    clips.append(parsed)
 
                 if filtered_reasons:
                     logger.info(
@@ -1669,26 +1633,9 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
                 if partial_clips_data:
                     salvaged = []
                     for c in partial_clips_data:
-                        try:
-                            st = float(c.get("start_time", 0))
-                            et = float(c.get("end_time", 0))
-                            duration = et - st if et > st else float(c.get("duration", 0))
-                            if 15 <= duration <= 600:
-                                salvaged.append(ClipCandidate(
-                                    id=c.get("id", len(salvaged) + 1),
-                                    title=c.get("title", "Untitled"),
-                                    start_time=st, end_time=et,
-                                    duration=round(duration, 1),
-                                    viral_score=max(1, min(100, int(float(c.get("viral_score", 50))))),
-                                    viral_score_reasoning=str(c.get("viral_score_reasoning", "")),
-                                    clip_type=str(c.get("clip_type", "highlight")),
-                                    platform=str(c.get("platform", "both")),
-                                    suggested_caption=str(c.get("suggested_caption", "")),
-                                    hook_text=str(c.get("hook_text", "")),
-                                    why_this_works=str(c.get("why_this_works", "")),
-                                ))
-                        except (KeyError, ValueError):
-                            continue
+                        parsed, _ = parse_clip_dict(c, fallback_id=len(salvaged) + 1)
+                        if parsed is not None:
+                            salvaged.append(parsed)
                     if salvaged:
                         logger.warning(
                             "Attempt %d: Salvaged %d clips from partial JSON response",

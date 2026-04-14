@@ -561,9 +561,39 @@ class AIOrchestrator:
         hot_zones=None,
         progress_callback=None,
         tier=None,
+        content_type=None,
+        chapters=None,
+        trend_context: Optional[str] = None,
+        sentiment_timeline: Optional[str] = None,
     ) -> tuple[list[ClipCandidate], str]:
-        """Returns (clips, provider_name_used)."""
-        clip_prompt = self._custom_prompts.viral_clip_detection if self._custom_prompts else None
+        """Returns (clips, provider_name_used).
+
+        ``content_type`` (Phase 2) is a ``ClipContentType`` enum value
+        used to pick the genre-specific viral-clip prompt. ``chapters``
+        (Phase 6), ``trend_context`` (Phase 3), and ``sentiment_timeline``
+        (Phase 5) are optional context blocks injected into the prompt
+        — providers that don't know what to do with them ignore them.
+        """
+        # Phase 2 — pick the genre-specific prompt unless the user has
+        # an explicit override in custom_prompts. The user's custom
+        # prompt always wins so they can fine-tune per deployment.
+        custom_user_prompt = self._custom_prompts.viral_clip_detection if self._custom_prompts else None
+        # ``PromptSet`` defaults to ``DEFAULT_VIRAL_CLIP_PROMPT``, so a
+        # vanilla custom_prompts object would shadow the genre routing.
+        # Detect the default-equals case and fall through to genre.
+        from backend.services.prompts import (
+            DEFAULT_VIRAL_CLIP_PROMPT, get_genre_prompt,
+        )
+        from backend.services.clip_scoring import (
+            finalize_clip_scores, four_axis_scoring_enabled,
+        )
+        if custom_user_prompt and custom_user_prompt != DEFAULT_VIRAL_CLIP_PROMPT:
+            clip_prompt = custom_user_prompt
+            logger.info("Clip detection: using user custom prompt")
+        else:
+            clip_prompt = get_genre_prompt(content_type)
+            ct_label = content_type.value if hasattr(content_type, "value") else (content_type or "generic")
+            logger.info("Using genre prompt: %s", ct_label)
         # If clip_focus is provided, build an augmented focus prompt that
         # BUILDS ON the viral detection infrastructure rather than replacing it
         if clip_focus and clip_focus.strip():
@@ -608,6 +638,43 @@ class AIOrchestrator:
                 f"- Prefer clips where the focus topic is introduced within the first 5 seconds"
             )
             logger.info("Clip focus mode active for job %s: '%s'", job_id, focus_text)
+
+        # Phase 3 / 5 / 6 — append optional context blocks the LLM should
+        # use for the four-axis scoring. Each block is fenced so the LLM
+        # can clearly tell where the rubric ends and the data begins.
+        appended_blocks: list[str] = []
+        if trend_context:
+            appended_blocks.append(
+                "TREND CONTEXT (use this to populate trend_score):\n"
+                + trend_context.strip()
+            )
+        if sentiment_timeline:
+            appended_blocks.append(
+                "SENTIMENT TIMELINE (audio sentiment moments — use for hook_score "
+                "and value_score):\n" + sentiment_timeline.strip()
+            )
+        if chapters:
+            try:
+                chapter_lines = []
+                for ch in chapters:
+                    title = getattr(ch, "title", "") or ""
+                    start = float(getattr(ch, "start", 0))
+                    end = float(getattr(ch, "end", 0))
+                    chapter_lines.append(
+                        f"  [{start:.0f}-{end:.0f}s] {title}"
+                    )
+                if chapter_lines:
+                    appended_blocks.append(
+                        "CHAPTERS (the video has been pre-segmented into topic "
+                        "chapters — try to find at least one strong clip per "
+                        "chapter, do not cluster all clips in the first chapter):\n"
+                        + "\n".join(chapter_lines)
+                    )
+            except Exception:
+                pass
+        if appended_blocks:
+            clip_prompt = clip_prompt + "\n\n" + "\n\n".join(appended_blocks)
+
         # Per-provider timeout prevents any single provider from blocking the
         # fallback chain. Scale timeout based on video duration and provider type.
         vid_minutes = video_duration / 60 if video_duration else 0
@@ -653,6 +720,11 @@ class AIOrchestrator:
                 elapsed = time.monotonic() - t0
                 logger.info("Clip detection via %s completed in %.1fs (%d clips)", pname, elapsed, len(result))
                 self._circuit_breaker.record_success(pname)
+                # Phase 4 — recompose viral_score from the four axes
+                # using the genre-aware weights. No-op when the four
+                # axes are all zero (legacy clip path).
+                if four_axis_scoring_enabled():
+                    finalize_clip_scores(result, content_type)
                 return result, self._get_task_model(provider, "clips")
             except asyncio.TimeoutError:
                 elapsed = time.monotonic() - t0
@@ -666,6 +738,8 @@ class AIOrchestrator:
                         "Clip detection via %s timed out after %ds but recovered %d partial clips",
                         pname, timeout, len(deduped),
                     )
+                    if four_axis_scoring_enabled():
+                        finalize_clip_scores(deduped, content_type)
                     return deduped, f"{self._get_task_model(provider, 'clips')} (partial)"
                 logger.warning("Clip detection via %s timed out after %ds", pname, timeout)
                 self._circuit_breaker.record_failure(pname)
@@ -681,6 +755,8 @@ class AIOrchestrator:
             logger.warning(
                 "All providers failed but recovered %d partial clips", len(_partial_clips),
             )
+            if four_axis_scoring_enabled():
+                finalize_clip_scores(_partial_clips, content_type)
             return _partial_clips, "partial"
         raise AllProvidersFailedError("All providers failed for viral clip detection")
 

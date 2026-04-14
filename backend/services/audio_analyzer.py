@@ -84,6 +84,7 @@ async def analyze_audio_energy(
                 "loudness_db": round(rms_db, 1),
                 "delta_db": round(rms_db - baseline, 1),
                 "type": spike_type,
+                "sentiment": classify_audio_sentiment(rms_db, rms_db - baseline, spike_type),
             })
 
     # Also detect sudden silence-to-loud transitions (reveals, drops)
@@ -96,6 +97,7 @@ async def analyze_audio_energy(
                 "loudness_db": round(curr_rms, 1),
                 "delta_db": round(curr_rms - prev_rms, 1),
                 "type": "silence_to_loud",
+                "sentiment": "applause",
             })
 
     # Sort by delta_db (most dramatic first) and cap
@@ -106,6 +108,61 @@ async def analyze_audio_energy(
 
     logger.info("Audio energy analysis: %d spikes detected (baseline=%.1f dB)", len(capped), baseline)
     return capped
+
+
+def classify_audio_sentiment(loudness_db: float, delta_db: float, spike_type: str) -> str:
+    """Classify an audio moment into a coarse sentiment tag.
+
+    Phase 5 of the OpusClip parity gap. We deliberately avoid a new
+    ML model — these tags come from rule-based thresholds on the
+    existing FFmpeg loudness signal. They feed the LLM via the
+    SENTIMENT TIMELINE block and the hot-zone scorer's audio
+    component.
+
+    Tags returned:
+      - laughter: brief sustained burst above baseline
+      - cheering: high-energy spike with strong delta
+      - shouting: extreme spike, very loud
+      - applause: silence → loud transition
+      - silence: handled by the gap detector (not from this function)
+      - neutral: anything we can't confidently classify
+    """
+    if spike_type == "silence_to_loud":
+        return "applause"
+    if spike_type == "extreme_spike":
+        if loudness_db > -8:
+            return "shouting"
+        return "cheering"
+    if spike_type == "volume_spike":
+        if delta_db > 12:
+            return "cheering"
+        if delta_db > 8:
+            return "laughter"
+    return "neutral"
+
+
+def format_sentiment_timeline(moments: list[dict], top_n: int = 20) -> str:
+    """Format an audio sentiment timeline for injection into the clip prompt.
+
+    Returns an empty string when no moments carry sentiment tags so
+    the orchestrator can skip the SENTIMENT TIMELINE block entirely
+    and the LLM never sees an empty header.
+    """
+    if not moments:
+        return ""
+    tagged = [m for m in moments if m.get("sentiment") and m.get("sentiment") != "neutral"]
+    if not tagged:
+        return ""
+    tagged.sort(key=lambda m: m.get("delta_db", 0), reverse=True)
+    top = tagged[:top_n]
+    top.sort(key=lambda m: m.get("timestamp", 0))
+    lines = []
+    for m in top:
+        ts = float(m.get("timestamp", 0))
+        sentiment = m.get("sentiment", "neutral")
+        delta = m.get("delta_db", 0)
+        lines.append(f"  [{ts:.1f}s] {sentiment} (+{delta:.0f}dB)")
+    return "\n".join(lines)
 
 
 def format_audio_energy_map(moments: list[dict]) -> str:

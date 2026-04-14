@@ -37,10 +37,17 @@ def score_hot_zones(
     window_size: float = WINDOW_SIZE,
     overlap: float = WINDOW_OVERLAP,
     filler_events: list[dict] | None = None,
+    trend_matcher=None,
 ) -> list[HotZone]:
     """Score every time window in the video for viral potential.
 
     Returns zones sorted by composite_score descending.
+
+    If ``trend_matcher`` (a ``TrendMatcher`` instance from
+    ``backend.services.trend_matcher``) is supplied, an additional
+    trend axis with weight 0.15 is folded into the composite. When
+    omitted, the legacy 4-signal weights are preserved bit-for-bit so
+    the no-flag default has no behavior change.
     """
     if video_duration <= 0:
         return []
@@ -67,15 +74,35 @@ def score_hot_zones(
             elif density > 3:
                 filler_penalty = 8
 
-        # Weighted composite (transcript and audio are strongest signals)
-        composite = (
-            audio_score * 0.25 +
-            transcript_score * 0.35 +
-            scene_score * 0.25 +
-            speaker_score * 0.15
-        ) - filler_penalty
+        trend_signals: list[str] = []
+        if trend_matcher is not None:
+            window_text = " ".join(
+                s.text for s in transcript
+                if s.start >= window_start and s.end <= window_end
+            )
+            try:
+                trend_score_val, trend_reason = trend_matcher.score_clip(window_text)
+            except Exception:
+                trend_score_val, trend_reason = 50, ""
+            if trend_reason and trend_score_val >= 60:
+                trend_signals.append(f"trend match: {trend_reason}")
+            composite = (
+                audio_score * 0.20
+                + transcript_score * 0.30
+                + scene_score * 0.20
+                + speaker_score * 0.15
+                + trend_score_val * 0.15
+            ) - filler_penalty
+        else:
+            # Legacy 4-signal weights — unchanged.
+            composite = (
+                audio_score * 0.25 +
+                transcript_score * 0.35 +
+                scene_score * 0.25 +
+                speaker_score * 0.15
+            ) - filler_penalty
 
-        signals = audio_signals + transcript_signals + scene_signals + speaker_signals
+        signals = audio_signals + transcript_signals + scene_signals + speaker_signals + trend_signals
 
         zones.append(HotZone(
             start=window_start,
@@ -95,7 +122,12 @@ def score_hot_zones(
 
 
 def _score_audio(moments: list[dict], start: float, end: float) -> tuple[float, list[str]]:
-    """Score audio energy in a time window."""
+    """Score audio energy in a time window.
+
+    Phase 5 (OpusClip parity gap) — when audio moments carry a
+    ``sentiment`` tag (laughter / cheering / shouting / applause)
+    those are treated as first-class signals on top of raw loudness.
+    """
     window_moments = [m for m in moments if start <= m.get("timestamp", 0) <= end]
     if not window_moments:
         return 0.0, []
@@ -106,6 +138,7 @@ def _score_audio(moments: list[dict], start: float, end: float) -> tuple[float, 
     for m in window_moments:
         mtype = m.get("type", "")
         ts = m.get("timestamp", 0)
+        sentiment = m.get("sentiment", "")
         if mtype == "extreme_spike":
             score += 30
             signals.append(f"extreme audio spike at {ts:.0f}s")
@@ -114,6 +147,15 @@ def _score_audio(moments: list[dict], start: float, end: float) -> tuple[float, 
             signals.append(f"silence->loud at {ts:.0f}s")
         elif mtype == "volume_spike":
             score += 15
+
+        # Sentiment-tag bonus / penalty — Phase 5
+        if sentiment in ("laughter", "cheering"):
+            score += 15
+            signals.append(f"{sentiment} at {ts:.0f}s")
+        elif sentiment == "applause":
+            score += 10
+        elif sentiment == "shouting":
+            score += 8
 
     return min(100, score), signals[:3]
 

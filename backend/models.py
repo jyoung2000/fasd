@@ -99,7 +99,7 @@ class ClipCandidate(BaseModel):
     start_time: float
     end_time: float
     duration: float
-    viral_score: int  # 1-100
+    viral_score: int  # 1-100 — composite computed from the four axes below
     viral_score_reasoning: str
     clip_type: str
     platform: str  # tiktok | youtube_shorts | both
@@ -109,6 +109,25 @@ class ClipCandidate(BaseModel):
     clip_focus: Optional[str] = None  # The focus topic used to generate this clip, if any
     focus_relevance: Optional[int] = None  # 1-100, how relevant to the focus query
     focus_tier: Optional[str] = None  # "strong", "moderate", "weak"
+    # ── Phase 1 (OpusClip parity gap) — 4-axis decomposed scoring ──
+    # Each axis is 0-100. The legacy ``viral_score`` is recomputed as a
+    # genre-weighted composite of these four axes (see clip_scoring.py).
+    # All four default to 0 so backward-compat code paths that only set
+    # viral_score continue to round-trip; the composite helper detects
+    # the all-zero case and falls back to the LLM's raw viral_score.
+    hook_score: int = 0
+    flow_score: int = 0
+    value_score: int = 0
+    trend_score: int = 0
+    hook_reason: str = ""
+    flow_reason: str = ""
+    value_reason: str = ""
+    trend_reason: str = ""
+    # Diagnostics — populated by composite_score() so the job report can
+    # show which weights produced the final viral_score and which trend
+    # lexicon entries / sentiment tags fired. Free-form dict so we can
+    # evolve the schema without migrations.
+    score_diagnostics: Optional[dict] = None
     # Persisted SEO data (populated by generation endpoints)
     seo_title: Optional[str] = None
     seo_description: Optional[str] = None
