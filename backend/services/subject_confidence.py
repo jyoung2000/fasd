@@ -163,6 +163,9 @@ class SubjectConfidenceEstimator:
         source_height: int,
         frame_saliency: Optional[list] = None,
         persistent_regions=None,
+        diarization_segments: Optional[list] = None,
+        cluster_to_slot: Optional[dict] = None,
+        content_type: str = "unknown",
     ):
         self.face_registry = face_registry
         self.dense_faces = dense_faces or []
@@ -182,6 +185,30 @@ class SubjectConfidenceEstimator:
         if face_registry and getattr(face_registry, "slots", None):
             for s in face_registry.slots:
                 self._tracked_slot_ids.add(int(s.slot_id))
+
+        # ── Gap 5b: diarization as a second vote ──
+        # When a diarization pass ran in the pipeline AND at least one
+        # cluster mapped to a known face slot, the estimator treats the
+        # audio-side vote as an independent Check 2b alongside the lip-
+        # motion vote. The weight split is 0.15 lip + 0.10 diar (the
+        # 0.20 legacy lip slice, split); Phase C swaps this for a
+        # per-content-type table lookup.
+        self.diarization_segments = diarization_segments or []
+        self.cluster_to_slot = cluster_to_slot or {}
+        self._has_diarization = bool(
+            self.diarization_segments
+            and self.cluster_to_slot
+            and any(v >= 0 for v in self.cluster_to_slot.values())
+        )
+        self.content_type = content_type or "unknown"
+        # Phase B: hard-coded split. Phase C replaces this block with
+        # a ``get_vote_weights(content_type, has_diarization)`` call.
+        if self._has_diarization:
+            self._lip_weight = 0.15
+            self._diar_weight = 0.10
+        else:
+            self._lip_weight = 0.20
+            self._diar_weight = 0.0
 
     def evaluate(
         self,
@@ -224,15 +251,29 @@ class SubjectConfidenceEstimator:
             reasons.append(f"no_face_in_crop_window ({face_check_detail})")
             return min(0.30, confidence), "; ".join(reasons) if reasons else "no_face_in_crop"
 
-        # ── Check 2: Speaker agreement ──
+        # ── Check 2: Speaker agreement (lip-motion vote) ──
         # Does the active-speaker slot match the candidate slot?
         speaker_agrees = self._check_speaker_agreement(
             seg_start, seg_end, candidate_slot,
         )
         if speaker_agrees:
-            confidence += 0.20
+            confidence += self._lip_weight
         else:
             reasons.append("speaker_disagrees")
+
+        # ── Check 2b: Diarization agreement (second independent vote) ──
+        # Gap 5b: when diarization produced cluster→slot mappings,
+        # treat the audio-side vote as an independent signal. Lip
+        # + diar each carry half of the 0.25 "speaker agree" budget
+        # (tunable per-content-type in Phase C).
+        if self._has_diarization:
+            diar_agrees = self._check_diarization_agreement(
+                seg_start, seg_end, candidate_slot,
+            )
+            if diar_agrees:
+                confidence += self._diar_weight
+            else:
+                reasons.append("diarization_disagrees")
 
         # ── Check 3: Dense-face stability ──
         # How stable is the face position across the segment?
@@ -271,6 +312,7 @@ class SubjectConfidenceEstimator:
         breakdown = {
             "face_in_crop": 0.0,
             "speaker_agree": 0.0,
+            "diarization_agree": 0.0,
             "stability": 0.0,
             "transcript": 0.0,
         }
@@ -292,15 +334,26 @@ class SubjectConfidenceEstimator:
             reason = "; ".join(reasons) if reasons else "no_face_in_crop"
             return confidence, reason, breakdown
 
-        # Check 2: Speaker agreement
+        # Check 2: Speaker agreement (lip-motion vote)
         speaker_agrees = self._check_speaker_agreement(
             seg_start, seg_end, candidate_slot,
         )
         if speaker_agrees:
-            confidence += 0.20
-            breakdown["speaker_agree"] = 0.20
+            confidence += self._lip_weight
+            breakdown["speaker_agree"] = self._lip_weight
         else:
             reasons.append("speaker_disagrees")
+
+        # Check 2b: Diarization agreement (Gap 5b second vote)
+        if self._has_diarization:
+            diar_agrees = self._check_diarization_agreement(
+                seg_start, seg_end, candidate_slot,
+            )
+            if diar_agrees:
+                confidence += self._diar_weight
+                breakdown["diarization_agree"] = self._diar_weight
+            else:
+                reasons.append("diarization_disagrees")
 
         # Check 3: Dense-face stability
         stability = self._check_face_stability(seg_start, seg_end, candidate_slot)
@@ -537,6 +590,45 @@ class SubjectConfidenceEstimator:
             dur = overlap_end - overlap_start
             total_time += dur
             if ev.slot_id == candidate_slot:
+                agree_time += dur
+
+        if total_time <= 0:
+            return False
+        return (agree_time / total_time) >= 0.5
+
+    def _check_diarization_agreement(
+        self,
+        seg_start: float,
+        seg_end: float,
+        candidate_slot: Optional[int],
+    ) -> bool:
+        """Gap 5b — Check 2b: does the diarization audio-side vote
+        agree with the candidate slot over the majority of the
+        segment window?
+
+        Returns True when ≥ 50% of the diarization time inside
+        ``[seg_start, seg_end)`` resolves (via ``cluster_to_slot``)
+        to ``candidate_slot``. Returns False when diarization is
+        absent, the candidate slot is unknown, no diarization
+        clusters overlap the segment, or the majority is a
+        different slot.
+        """
+        if candidate_slot is None:
+            return False
+        if not self.diarization_segments or not self.cluster_to_slot:
+            return False
+
+        total_time = 0.0
+        agree_time = 0.0
+        for diar in self.diarization_segments:
+            lo = max(seg_start, diar.start)
+            hi = min(seg_end, diar.end)
+            if lo >= hi:
+                continue
+            dur = hi - lo
+            total_time += dur
+            resolved = self.cluster_to_slot.get(diar.cluster_id, -1)
+            if resolved == candidate_slot:
                 agree_time += dur
 
         if total_time <= 0:

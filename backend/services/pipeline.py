@@ -3442,6 +3442,20 @@ async def _run_analysis_inner(job_id: str):
                     # Phase 5 + Phase 6 follow-up wiring
                     music_beat_grid=_music_beat_grid_for_seg,
                     anime_anchors=_anime_anchors_for_seg,
+                    # Gap 5b: fusion result propagation. When the
+                    # upstream diarization block ran (≥ 2 slots, flag
+                    # on, audio available), ``_diar_segments`` and
+                    # ``_fusion`` are populated; otherwise they fall
+                    # back to empty/None so the estimator defaults to
+                    # the legacy 0.20 lip slice.
+                    diarization_segments=(
+                        _diar_segments if '_diar_segments' in dir() else None
+                    ),
+                    cluster_to_slot=(
+                        _fusion.cluster_to_slot
+                        if '_fusion' in dir() and _fusion is not None
+                        else None
+                    ),
                     debug_out=_reframe_debug_out,
                 )
                 if reframe_segments:

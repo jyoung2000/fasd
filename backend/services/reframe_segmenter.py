@@ -123,6 +123,8 @@ def build_reframe_segments(
     anime_anchors: list = None,
     gameplay_motion_centroids: list = None,
     audio_events: list = None,
+    diarization_segments: list = None,
+    cluster_to_slot: dict = None,
     debug_out: Optional[dict] = None,
 ) -> list[ReframeSegment]:
     """Build a segment-based reframe timeline.
@@ -244,6 +246,12 @@ def build_reframe_segments(
             # of hardcoded_center.
             frame_saliency=frame_saliency,
             persistent_regions=persistent_regions,
+            # Gap 5b: diarization as a second independent vote. Phase C
+            # adds ``content_type=ct`` here for the per-type weight
+            # table lookup.
+            diarization_segments=diarization_segments,
+            cluster_to_slot=cluster_to_slot,
+            content_type=ct,
         )
     except Exception as e:
         logger.warning("[%s] SubjectConfidenceEstimator init failed: %s", job_id, e)
