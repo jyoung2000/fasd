@@ -33,6 +33,7 @@ from backend.app.cloud.service import (
     call_with_refresh,
     import_cloud_file,
 )
+from backend.config import settings
 from backend.services.ingest import IngestMetadata
 from backend.services.pipeline import broadcast_ws
 
@@ -385,3 +386,284 @@ async def import_file(
         status="downloading_from_cloud",
         filename=meta.name,
     )
+
+
+# ── Credentials management ────────────────────────────────────────────────
+#
+# The Unraid / env-var pathway still works: if the operator sets
+# ``GOOGLE_DRIVE_CLIENT_ID`` etc. via the container template, nothing here
+# changes. But the out-of-the-box experience for users who just pulled
+# the image and want to click "Connect" is broken when env vars aren't
+# set, so this endpoint pair lets the user paste their OAuth client
+# credentials directly in the ClipAI Settings page. Saved credentials
+# are persisted to ``user_settings.json`` on the data volume, so they
+# survive container restarts without touching the ``.env`` file.
+
+
+class CloudProviderCredentials(BaseModel):
+    client_id: str = ""
+    client_secret: str = ""
+    redirect_uri: str = ""
+
+
+class CloudCredentialsResponse(BaseModel):
+    """One row per provider. Secret values are masked on read — the
+    frontend never sees the raw client secret after it's persisted.
+    """
+    enabled: bool
+    providers: dict[str, dict]
+
+
+class SaveCredentialsRequest(BaseModel):
+    provider: str
+    client_id: str = ""
+    client_secret: str = ""
+    redirect_uri: str = ""
+
+
+_CRED_FIELDS: dict[str, dict[str, str]] = {
+    "google_drive": {
+        "client_id": "GOOGLE_DRIVE_CLIENT_ID",
+        "client_secret": "GOOGLE_DRIVE_CLIENT_SECRET",
+        "redirect_uri": "GOOGLE_DRIVE_REDIRECT_URI",
+    },
+    "box": {
+        "client_id": "BOX_CLIENT_ID",
+        "client_secret": "BOX_CLIENT_SECRET",
+        "redirect_uri": "BOX_REDIRECT_URI",
+    },
+}
+
+
+def _mask_secret(value: str) -> str:
+    """Return a masked version of ``value`` safe for the frontend.
+
+    Preserves the last 4 characters so the user can recognise which key
+    they pasted, but never sends the full secret back.
+    """
+    if not value:
+        return ""
+    if len(value) <= 4:
+        return "••••"
+    return "••••" + value[-4:]
+
+
+@router.get("/config", response_model=CloudCredentialsResponse)
+async def get_cloud_config() -> CloudCredentialsResponse:
+    """Return the current cloud OAuth client credentials (secrets masked).
+
+    The frontend uses this to pre-fill the credentials form so a user
+    who has already entered their Google Drive client id can see it
+    without being forced to re-paste it.
+    """
+    out: dict[str, dict] = {}
+    for provider, mapping in _CRED_FIELDS.items():
+        out[provider] = {
+            "client_id": str(getattr(settings, mapping["client_id"], "") or ""),
+            # Never ship the raw secret back — mask it.
+            "client_secret_masked": _mask_secret(
+                str(getattr(settings, mapping["client_secret"], "") or "")
+            ),
+            "client_secret_set": bool(
+                str(getattr(settings, mapping["client_secret"], "") or "").strip()
+            ),
+            "redirect_uri": str(getattr(settings, mapping["redirect_uri"], "") or ""),
+        }
+    return CloudCredentialsResponse(
+        enabled=cloud_storage_enabled(),
+        providers=out,
+    )
+
+
+@router.post("/config")
+async def save_cloud_config(req: SaveCredentialsRequest) -> dict:
+    """Persist OAuth client credentials for one provider.
+
+    Blank secret fields are treated as "leave the existing secret
+    alone" — that way a user can update just the redirect URI without
+    being forced to re-paste the client secret (which the frontend
+    only ever saw as masked).
+    """
+    mapping = _CRED_FIELDS.get(req.provider)
+    if not mapping:
+        raise HTTPException(
+            status_code=404, detail=f"Unknown cloud provider: {req.provider}"
+        )
+
+    # Apply the fields to the in-memory settings object. Everything here
+    # is optional so we can partial-update.
+    if req.client_id.strip():
+        setattr(settings, mapping["client_id"], req.client_id.strip())
+    if req.client_secret.strip():
+        setattr(settings, mapping["client_secret"], req.client_secret.strip())
+    if req.redirect_uri.strip():
+        setattr(settings, mapping["redirect_uri"], req.redirect_uri.strip())
+
+    # Also mirror into the .env file (best effort) and persist to the
+    # Docker volume JSON for restart survival. We deliberately import
+    # inside the function so the cloud router has no import-time
+    # dependency on the settings router.
+    try:
+        from backend.routers.settings import (
+            _find_env_file, _upsert_env_var, _persist_user_settings,
+        )
+        env_path = _find_env_file()
+        if env_path:
+            for field_key, env_key in mapping.items():
+                value = getattr(settings, env_key, "")
+                if value:
+                    _upsert_env_var(env_path, env_key, str(value))
+        _persist_user_settings()
+    except Exception as exc:
+        logger.warning("Cloud credential persistence failed (non-fatal): %s", exc)
+
+    # Re-check configured state so the response tells the frontend whether
+    # it should flip the card to "Connect" mode.
+    provider = get_provider(req.provider)
+    configured = bool(provider and provider.is_configured())
+    return {
+        "status": "saved",
+        "provider": req.provider,
+        "configured": configured,
+    }
+
+
+@router.post("/config/test/{provider}")
+async def test_cloud_config(provider: str) -> dict:
+    """Sanity-check the saved credentials for one provider.
+
+    This deliberately does **not** try to run a full OAuth flow — that
+    requires a browser redirect and a user consent. Instead it checks:
+
+    1. The provider is recognised.
+    2. Client id / secret / redirect URI are all present on the server.
+    3. The redirect URI parses as a valid http(s) URL.
+    4. The provider-specific authorize URL builds without raising.
+    5. (Google Drive only) the token endpoint responds to a cheap
+       probe request — a real client id must be known to Google.
+
+    Returns ``{status: "ok" | "error", checks: [...]}`` so the UI can
+    show which step passed and which failed.
+    """
+    prov = _provider_or_404(provider)
+    mapping = _CRED_FIELDS[provider]
+    checks: list[dict] = []
+
+    client_id = str(getattr(settings, mapping["client_id"], "") or "").strip()
+    client_secret = str(getattr(settings, mapping["client_secret"], "") or "").strip()
+    redirect_uri = str(getattr(settings, mapping["redirect_uri"], "") or "").strip()
+
+    def _add(label: str, ok: bool, detail: str = "") -> None:
+        checks.append({"label": label, "ok": ok, "detail": detail})
+
+    _add("client_id set", bool(client_id), "" if client_id else "Field is empty")
+    _add("client_secret set", bool(client_secret), "" if client_secret else "Field is empty")
+    _add("redirect_uri set", bool(redirect_uri), "" if redirect_uri else "Field is empty")
+
+    if redirect_uri:
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(redirect_uri)
+            valid_scheme = parsed.scheme in ("http", "https")
+            valid_host = bool(parsed.netloc)
+            valid_path = parsed.path.endswith(f"/api/cloud/{provider}/callback")
+            _add(
+                "redirect_uri scheme",
+                valid_scheme,
+                "" if valid_scheme else f"Expected http/https, got {parsed.scheme!r}",
+            )
+            _add(
+                "redirect_uri host",
+                valid_host,
+                "" if valid_host else "Host/port is empty",
+            )
+            _add(
+                "redirect_uri path",
+                valid_path,
+                (
+                    ""
+                    if valid_path
+                    else f"Must end with /api/cloud/{provider}/callback"
+                ),
+            )
+        except Exception as exc:
+            _add("redirect_uri parseable", False, str(exc))
+
+    # Provider-specific spot checks
+    if provider == "google_drive":
+        if client_id and not client_id.endswith(".apps.googleusercontent.com"):
+            _add(
+                "client_id format",
+                False,
+                "Google client IDs typically end with .apps.googleusercontent.com",
+            )
+        else:
+            _add("client_id format", True, "")
+    elif provider == "box":
+        _add("client_id format", True, "")
+
+    # Build the authorize URL as a smoke test.
+    configured_now = prov.is_configured()
+    if configured_now:
+        try:
+            url = prov.build_authorize_url("test-state-token")
+            _add(
+                "authorize URL builds",
+                bool(url and url.startswith(("http://", "https://"))),
+                "" if url else "Provider returned empty URL",
+            )
+        except Exception as exc:
+            _add("authorize URL builds", False, f"{type(exc).__name__}: {exc}")
+    else:
+        _add(
+            "authorize URL builds",
+            False,
+            "Provider reports is_configured()==False; set all three fields first.",
+        )
+
+    # Cheap live probe for Google Drive: hit the token endpoint with an
+    # obviously invalid grant and confirm Google answers with a proper
+    # JSON error (which means the client_id is recognised).
+    if provider == "google_drive" and configured_now:
+        import httpx
+        try:
+            async with httpx.AsyncClient(timeout=8.0) as client:
+                resp = await client.post(
+                    "https://oauth2.googleapis.com/token",
+                    data={
+                        "client_id": client_id,
+                        "client_secret": client_secret,
+                        "grant_type": "refresh_token",
+                        "refresh_token": "clipai-credential-probe-invalid",
+                    },
+                )
+            # Google answers 400 + json for bogus grants when the
+            # client is recognised; 401 when it isn't.
+            if resp.status_code == 400:
+                _add("google token endpoint reachable", True, "")
+            elif resp.status_code == 401:
+                body = resp.json() if resp.content else {}
+                _add(
+                    "google token endpoint reachable",
+                    False,
+                    f"Google rejected the client: {body.get('error', 'unauthorized')}",
+                )
+            else:
+                _add(
+                    "google token endpoint reachable",
+                    True,
+                    f"HTTP {resp.status_code} (accepted as live)",
+                )
+        except Exception as exc:
+            _add(
+                "google token endpoint reachable",
+                False,
+                f"Network error: {exc}",
+            )
+
+    overall_ok = all(c["ok"] for c in checks)
+    return {
+        "status": "ok" if overall_ok else "error",
+        "configured": configured_now,
+        "checks": checks,
+    }

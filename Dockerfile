@@ -130,6 +130,12 @@ ${LD_LIBRARY_PATH}
 # Copy backend source
 COPY backend/ ./backend/
 
+# Copy the markdown docs so the cloud storage setup guide (and friends)
+# can be rendered at /docs/cloud-storage/SETUP.md by backend/main.py.
+# This is a few KB of markdown; excluding it makes the Settings page's
+# "Setup guide →" link land on a blank page.
+COPY docs/ ./docs/
+
 # Copy built frontend from stage 1
 COPY --from=frontend-build /app/frontend/dist ./static
 

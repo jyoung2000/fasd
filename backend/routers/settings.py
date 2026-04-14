@@ -57,10 +57,21 @@ _PERSISTABLE_KEYS = [
     "GPU_ACCELERATION_ENABLED", "GPU_VENDOR_OVERRIDE",
     "GPU_HWDECODE_ENABLED", "GPU_HEVC_FOR_4K", "GPU_DEVICE_INDEX",
     "AI_FALLBACK_CHAIN",
+    # Cloud storage OAuth credentials — entered via the Settings > Cloud
+    # Storage UI and persisted so containers without env vars can still
+    # connect to Google Drive / Box after the user pastes their credentials.
+    "CLIPAI_CLOUD_STORAGE_ENABLED",
+    "GOOGLE_DRIVE_CLIENT_ID", "GOOGLE_DRIVE_CLIENT_SECRET", "GOOGLE_DRIVE_REDIRECT_URI",
+    "BOX_CLIENT_ID", "BOX_CLIENT_SECRET", "BOX_REDIRECT_URI",
 ]
 
 # API key fields specifically (used to filter out placeholder values)
-_API_KEY_FIELDS = {"OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "GROQ_API_KEY", "HF_AUTH_TOKEN"}
+_API_KEY_FIELDS = {
+    "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "GROQ_API_KEY",
+    "HF_AUTH_TOKEN",
+    # Cloud client secrets — same "never overwrite with blank" rule.
+    "GOOGLE_DRIVE_CLIENT_SECRET", "BOX_CLIENT_SECRET",
+}
 
 
 def _is_real_value(key: str, val: str) -> bool:

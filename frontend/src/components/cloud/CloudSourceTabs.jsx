@@ -119,6 +119,15 @@ export default function CloudSourceTabs({ uploadMetadata, onJobStart }) {
     return null;
   }
 
+  // Also hide the tab strip entirely when zero cloud providers have
+  // been configured. Showing a lone "Local file" tab with nothing
+  // next to it is awkward, and the local drop zone below us is
+  // already the default experience for users who don't want cloud.
+  const anyCloudConfigured = (providers || []).some((p) => p?.configured);
+  if (!anyCloudConfigured) {
+    return null;
+  }
+
   const notConnectedProvider = (() => {
     if (active === 'local') return null;
     const provider = providerByName[active];

@@ -631,6 +631,257 @@ async def serve_file(job_id: str, path: str, request: Request):
     return FileResponse(file_path, media_type=content_type)
 
 
+# ── Cloud storage setup docs ─────────────────────────────────────────
+# The CloudStorageSection in Settings links to
+# /docs/cloud-storage/SETUP.md (and friends). The SPA has no route for
+# that path, so without this endpoint the user lands on a blank React
+# page. We render the repo's markdown files into a minimal HTML
+# wrapper so the docs actually load. Served BEFORE the SPA catch-all
+# so the specific path wins over the generic fallback.
+_DOCS_ROOT = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)),
+    "docs",
+    "cloud-storage",
+)
+_ALLOWED_CLOUD_DOCS = {"SETUP.md", "RECON.md", "UNRAID.md"}
+
+
+def _render_markdown_to_html(md_text: str, title: str) -> str:
+    """Tiny pure-Python markdown → HTML renderer.
+
+    Handles the subset of features used by the cloud-storage docs:
+    fenced code blocks, headings, bold, inline code, links, horizontal
+    rules, unordered + ordered lists, paragraphs.
+
+    We roll our own so we don't add a new runtime dependency just for
+    three static docs. It is NOT a general-purpose markdown parser —
+    don't use it for user-supplied input.
+    """
+    import html as _html
+    import re
+
+    def _escape(s: str) -> str:
+        return _html.escape(s, quote=False)
+
+    def _inline(s: str) -> str:
+        s = _escape(s)
+        # Inline code first (so ** inside code isn't re-parsed)
+        s = re.sub(r"`([^`]+)`", r"<code>\1</code>", s)
+        # Bold
+        s = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", s)
+        # Links [text](url)
+        s = re.sub(
+            r"\[([^\]]+)\]\(([^)]+)\)",
+            lambda m: f'<a href="{m.group(2)}" target="_blank" rel="noopener noreferrer">{m.group(1)}</a>',
+            s,
+        )
+        return s
+
+    lines = md_text.splitlines()
+    out: list[str] = []
+    i = 0
+    in_code = False
+    code_lines: list[str] = []
+    list_stack: list[str] = []  # 'ul' or 'ol'
+
+    def _close_lists():
+        while list_stack:
+            out.append(f"</{list_stack.pop()}>")
+
+    while i < len(lines):
+        line = lines[i]
+        # Fenced code block
+        if line.lstrip().startswith("```"):
+            if in_code:
+                out.append(
+                    "<pre><code>"
+                    + _escape("\n".join(code_lines))
+                    + "</code></pre>"
+                )
+                code_lines = []
+                in_code = False
+            else:
+                _close_lists()
+                in_code = True
+            i += 1
+            continue
+        if in_code:
+            code_lines.append(line)
+            i += 1
+            continue
+
+        stripped = line.strip()
+        if not stripped:
+            _close_lists()
+            i += 1
+            continue
+
+        # Horizontal rule
+        if stripped == "---":
+            _close_lists()
+            out.append("<hr />")
+            i += 1
+            continue
+
+        # Headings
+        heading = re.match(r"^(#{1,6})\s+(.*)$", stripped)
+        if heading:
+            _close_lists()
+            level = len(heading.group(1))
+            out.append(f"<h{level}>{_inline(heading.group(2))}</h{level}>")
+            i += 1
+            continue
+
+        # Unordered list
+        ul = re.match(r"^[-*]\s+(.*)$", stripped)
+        if ul:
+            if not list_stack or list_stack[-1] != "ul":
+                _close_lists()
+                out.append("<ul>")
+                list_stack.append("ul")
+            out.append(f"<li>{_inline(ul.group(1))}</li>")
+            i += 1
+            continue
+
+        # Ordered list
+        ol = re.match(r"^\d+\.\s+(.*)$", stripped)
+        if ol:
+            if not list_stack or list_stack[-1] != "ol":
+                _close_lists()
+                out.append("<ol>")
+                list_stack.append("ol")
+            out.append(f"<li>{_inline(ol.group(1))}</li>")
+            i += 1
+            continue
+
+        # Paragraph — coalesce consecutive non-empty, non-special lines
+        _close_lists()
+        para_lines = [line]
+        j = i + 1
+        while j < len(lines):
+            nxt = lines[j]
+            if not nxt.strip():
+                break
+            if nxt.lstrip().startswith(("#", "```", "- ", "* ")):
+                break
+            if re.match(r"^\d+\.\s", nxt.lstrip()):
+                break
+            para_lines.append(nxt)
+            j += 1
+        para_html = " ".join(_inline(pl.strip()) for pl in para_lines)
+        out.append(f"<p>{para_html}</p>")
+        i = j
+
+    _close_lists()
+    if in_code and code_lines:
+        out.append("<pre><code>" + _escape("\n".join(code_lines)) + "</code></pre>")
+
+    body = "\n".join(out)
+    # Minimal dark-theme CSS so the doc matches the rest of ClipAI.
+    css = """
+    body {
+        margin: 0;
+        background: #0b0d10;
+        color: #e8ecf0;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        line-height: 1.55;
+    }
+    .wrap {
+        max-width: 760px;
+        margin: 0 auto;
+        padding: 32px 24px 80px;
+    }
+    h1, h2, h3 { color: #fff; margin-top: 1.8em; }
+    h1 { font-size: 28px; border-bottom: 1px solid #222; padding-bottom: 10px; }
+    h2 { font-size: 22px; border-bottom: 1px solid #1a1a1a; padding-bottom: 6px; }
+    h3 { font-size: 17px; }
+    p, li { color: #d0d6dc; }
+    a { color: #4ec8f4; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    code {
+        background: #1a1e24;
+        border: 1px solid #2a2f36;
+        color: #f6d68d;
+        padding: 1px 6px;
+        border-radius: 4px;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 13px;
+    }
+    pre {
+        background: #0e1116;
+        border: 1px solid #1e232a;
+        border-radius: 6px;
+        padding: 12px 14px;
+        overflow-x: auto;
+    }
+    pre code {
+        background: transparent;
+        border: none;
+        padding: 0;
+        color: #cfd6dd;
+    }
+    hr { border: none; border-top: 1px solid #1e232a; margin: 28px 0; }
+    ul, ol { padding-left: 22px; }
+    .backlink {
+        display: inline-block;
+        margin-bottom: 18px;
+        font-size: 13px;
+        color: #8892a0;
+    }
+    """
+    safe_title = _html.escape(title, quote=True)
+    return (
+        "<!doctype html><html><head>"
+        '<meta charset="utf-8" />'
+        '<meta name="viewport" content="width=device-width, initial-scale=1" />'
+        f"<title>{safe_title} — ClipAI</title>"
+        f"<style>{css}</style>"
+        "</head><body><div class=\"wrap\">"
+        '<a class="backlink" href="/settings">&larr; Back to Settings</a>'
+        f"{body}"
+        "</div></body></html>"
+    )
+
+
+@app.get("/docs/cloud-storage/{doc_name}")
+async def serve_cloud_storage_doc(doc_name: str):
+    """Render one of the cloud-storage setup docs as HTML.
+
+    Only a hard-coded allowlist of .md filenames is accepted so this
+    endpoint can never be abused to read arbitrary files from the
+    container.
+    """
+    if doc_name not in _ALLOWED_CLOUD_DOCS:
+        return Response(
+            content=f"Unknown cloud storage doc: {doc_name}",
+            status_code=404,
+            media_type="text/plain",
+        )
+    doc_path = os.path.join(_DOCS_ROOT, doc_name)
+    if not os.path.isfile(doc_path):
+        return Response(
+            content=(
+                f"Doc missing: {doc_name}. This usually means the "
+                "docs/ directory was not included in the Docker image. "
+                "Rebuild with: docker compose build --no-cache clipai-app"
+            ),
+            status_code=404,
+            media_type="text/plain",
+        )
+    try:
+        with open(doc_path, "r", encoding="utf-8") as f:
+            md_text = f.read()
+    except OSError as exc:
+        return Response(
+            content=f"Failed to read {doc_name}: {exc}",
+            status_code=500,
+            media_type="text/plain",
+        )
+    title = doc_name.replace(".md", "").replace("-", " ").title()
+    html = _render_markdown_to_html(md_text, title)
+    return Response(content=html, media_type="text/html")
+
+
 # Serve frontend static files
 static_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "static")
 _assets_dir = os.path.join(static_dir, "assets")
