@@ -343,6 +343,44 @@ export function snapToClusters(keyframes, clusters) {
 }
 
 /**
+ * Compute AutoFlip-style bbox-aware subject_x for close-up shots.
+ * When a face bbox is wider than the crop window, slot-average X is unreliable.
+ * Instead, use the per-frame face center from face_positions data.
+ *
+ * @param {Object} scene - Scene with face_positions
+ * @param {number} fallbackX - Slot-based subject_x to fall back to
+ * @param {number|null} srcRatio - Source aspect ratio (e.g. 16/9)
+ * @param {number|null} targetRatio - Target aspect ratio (e.g. 9/16)
+ * @returns {number} Best crop center X (0-100)
+ */
+function bboxAwareSubjectX(scene, fallbackX, srcRatio, targetRatio) {
+  if (!scene.face_positions?.length || !srcRatio || !targetRatio) return fallbackX;
+
+  // Crop window width as % of source width
+  const R = srcRatio / targetRatio;
+  const cropWidthPct = R <= 1 ? 100 : (100 / R);
+
+  // Find the speaking (or largest) face
+  const speaking = scene.face_positions.find(f => f.is_speaking);
+  const face = speaking || scene.face_positions.reduce((best, f) =>
+    (f.w ?? 0) > (best.w ?? 0) ? f : best
+  , scene.face_positions[0]);
+
+  if (!face || typeof face.x !== 'number') return fallbackX;
+
+  const faceCenterX = face.x; // already 0-100
+  const faceWidthPct = face.w ?? 0; // 0-100
+
+  // Only override when this is a close-up (face > 25% of source width)
+  // — panel shots where face is ~8% wide should keep slot-snapped X.
+  if (faceWidthPct < 25) return fallbackX;
+
+  // Center the crop on the face, clamped so crop stays in frame
+  const halfCrop = cropWidthPct / 2;
+  return Math.max(halfCrop, Math.min(100 - halfCrop, faceCenterX));
+}
+
+/**
  * Build sorted keyframes from scenes for a clip range.
  *
  * Uses scenes both within and outside the clip range.  Scenes outside the
@@ -370,11 +408,15 @@ export function buildSubjectKeyframes(scenes, clipStart, clipEnd, srcRatio = nul
   // precise_x: actual face nose_x from detection, not slot-snapped
   const _px = (s) => s.precise_x ?? _sx(s);
 
-  const raw = within.map((s) => ({
-    t: s.timestamp - clipStart,
-    x: safeSubjectX(_sx(s), srcRatio, targetRatio),
-    px: safeSubjectX(_px(s), srcRatio, targetRatio),
-  }));
+  const raw = within.map((s) => {
+    const slotX = safeSubjectX(_sx(s), srcRatio, targetRatio);
+    const closeupX = bboxAwareSubjectX(s, slotX, srcRatio, targetRatio);
+    return {
+      t: s.timestamp - clipStart,
+      x: safeSubjectX(closeupX, srcRatio, targetRatio),
+      px: safeSubjectX(_px(s), srcRatio, targetRatio),
+    };
+  });
 
   const interp = (tAbs, s1, s2) => {
     const dt = s2.timestamp - s1.timestamp;

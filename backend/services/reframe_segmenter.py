@@ -520,6 +520,48 @@ def build_reframe_segments(
                     candidate_y=50,
                 )
 
+                # Zero-face guard: if the proposed crop has essentially no
+                # faces in it AND confidence is already low, the fallback
+                # cascade returned a stale slot position (empty seat / couch
+                # scene). Forcing wide_master is always better than a crop of
+                # set dressing. Only applies below CONFIDENCE_MEDIUM — medium+
+                # confidence means the estimator itself saw a face.
+                from backend.services.subject_confidence import (
+                    CONFIDENCE_MEDIUM as _CONF_MED,
+                )
+                _zero_face_override = False
+                if conf < _CONF_MED and _confidence_estimator is not None:
+                    try:
+                        _zero_face_pass_rate = (
+                            _confidence_estimator.per_frame_in_crop_pass_rate(
+                                seg.start, seg.end, fb_x_pct,
+                            )
+                        )
+                        if _zero_face_pass_rate < 0.10:
+                            seg.strategy = "wide_master"
+                            seg.layout = "wide_master"
+                            seg.active_slot = None
+                            seg.subject_x = source_width / 2.0
+                            seg.reason = "zero_face_in_crop_guard"
+                            seg.subject_source = "zero_face_guard"
+                            seg.fallback_reason = conf_reason
+                            fallback_count += 1
+                            _log(
+                                "segment %.1f-%.1fs: zero-face guard fired "
+                                "(pass_rate=%.0f%% < 10%%, conf=%.2f) → WIDE_MASTER",
+                                seg.start, seg.end,
+                                _zero_face_pass_rate * 100, conf,
+                            )
+                            _zero_face_override = True
+                    except Exception as _zfg_e:
+                        logger.debug(
+                            "[%s] zero-face guard check failed %.1f-%.1f: %s",
+                            job_id, seg.start, seg.end, _zfg_e,
+                        )
+
+                if _zero_face_override:
+                    continue  # skip get_fallback_strategy for this segment
+
                 fallback = get_fallback_strategy(
                     conf, ct,
                     last_confident_x=_last_x_pct,
