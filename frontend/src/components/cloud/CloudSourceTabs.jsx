@@ -51,12 +51,13 @@ export default function CloudSourceTabs({ uploadMetadata, onJobStart }) {
     (providers || []).map((p) => [p.name, p])
   );
 
-  // If cloud storage is disabled on the server, render nothing — the
-  // existing drop zone is still fully functional on its own.
-  if (!enabled) {
-    return null;
-  }
-
+  // NOTE: every hook below must be declared unconditionally so React's
+  // hook ordering stays stable across renders. The original version
+  // early-returned on ``!enabled`` BEFORE these useCallbacks ran —
+  // that flipped the hook count between the initial (loading) render
+  // and the post-fetch render, triggering React error #310 ("rendered
+  // more hooks than during the previous render") on any deployment
+  // that doesn't have cloud storage configured.
   const handleTabClick = useCallback(
     (tab) => {
       setError(null);
@@ -110,6 +111,13 @@ export default function CloudSourceTabs({ uploadMetadata, onJobStart }) {
     },
     [pickerFor, uploadMetadata, onJobStart]
   );
+
+  // If cloud storage is disabled on the server, render nothing — the
+  // existing drop zone is still fully functional on its own. This
+  // return MUST live after every hook above.
+  if (!enabled) {
+    return null;
+  }
 
   const notConnectedProvider = (() => {
     if (active === 'local') return null;
