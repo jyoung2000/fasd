@@ -235,3 +235,105 @@ def test_main_dry_run_produces_populated_outputs(tmp_path):
         assert r["clipai"] is not None
         assert r["autoflip"] is None  # no cache in tmp
         assert "clipai pipeline invocation not wired" in r["notes"] or True
+
+
+def test_main_filter_slugs_narrows_to_exact_list(tmp_path):
+    """``--filter-slugs`` takes a comma-separated list of exact slugs
+    and narrows the manifest iteration to only those clips. Unset (or
+    empty) leaves the full default behavior intact.
+    """
+    import json as _json
+
+    manifest = {
+        "clips": [
+            {
+                "slug": "joebudden_4way_couch",
+                "content_type": "podcast", "subtype": None,
+                "target_clipcontenttype": "multi_speaker_panel",
+                "duration_sec": 40,
+            },
+            {
+                "slug": "fatesn_fight_action",
+                "content_type": "anime", "subtype": "action",
+                "target_clipcontenttype": "animation",
+                "duration_sec": 40,
+            },
+            {
+                "slug": "music_mj_thriller_formation_15s",
+                "content_type": "music_video", "subtype": "performance",
+                "target_clipcontenttype": "music_video",
+                "duration_sec": 15,
+            },
+        ]
+    }
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(_json.dumps(manifest))
+
+    md_path = tmp_path / "results.md"
+    json_path = tmp_path / "results.json"
+
+    from backend.scripts.compare_autoflip_vs_clipai import main
+
+    rc = main([
+        "--manifest", str(manifest_path),
+        "--autoflip-outputs", str(tmp_path / "_missing"),
+        "--ground-truth-dir", str(tmp_path / "_missing_gt"),
+        "--output", str(md_path),
+        "--json-out", str(json_path),
+        "--filter-slugs", "joebudden_4way_couch,fatesn_fight_action",
+        "--dry-run",
+        "--quiet",
+    ])
+    assert rc == 0
+
+    payload = _json.loads(json_path.read_text())
+    slugs = {r["slug"] for r in payload["results"]}
+    assert slugs == {"joebudden_4way_couch", "fatesn_fight_action"}, slugs
+    # The music slug must be excluded — it's not in the whitelist.
+    assert "music_mj_thriller_formation_15s" not in slugs
+    # Filter is traced in the JSON payload for later rollup inspection.
+    assert payload["filter_slugs"] == [
+        "fatesn_fight_action", "joebudden_4way_couch",
+    ]
+
+
+def test_main_filter_slugs_absent_keeps_all_clips(tmp_path):
+    """When ``--filter-slugs`` is absent the default behavior is
+    unchanged: every clip that matches ``--filter`` is scored."""
+    import json as _json
+
+    manifest = {
+        "clips": [
+            {
+                "slug": "clip_a", "content_type": "debate", "subtype": None,
+                "target_clipcontenttype": "multi_speaker_panel",
+                "duration_sec": 10,
+            },
+            {
+                "slug": "clip_b", "content_type": "debate", "subtype": None,
+                "target_clipcontenttype": "multi_speaker_panel",
+                "duration_sec": 10,
+            },
+        ]
+    }
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(_json.dumps(manifest))
+
+    md_path = tmp_path / "results.md"
+    json_path = tmp_path / "results.json"
+
+    from backend.scripts.compare_autoflip_vs_clipai import main
+
+    rc = main([
+        "--manifest", str(manifest_path),
+        "--autoflip-outputs", str(tmp_path / "_missing"),
+        "--ground-truth-dir", str(tmp_path / "_missing_gt"),
+        "--output", str(md_path),
+        "--json-out", str(json_path),
+        "--dry-run", "--quiet",
+    ])
+    assert rc == 0
+    payload = _json.loads(json_path.read_text())
+    slugs = {r["slug"] for r in payload["results"]}
+    assert slugs == {"clip_a", "clip_b"}
+    assert payload["filter_slugs"] is None

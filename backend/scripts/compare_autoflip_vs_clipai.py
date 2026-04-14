@@ -1176,6 +1176,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         help="Only score clips whose slug matches the glob",
     )
     parser.add_argument(
+        "--filter-slugs", default=None,
+        help=(
+            "Comma-separated list of exact slugs to score. Applied "
+            "after --filter. When unset (default) every clip that "
+            "matches --filter runs."
+        ),
+    )
+    parser.add_argument(
         "--clipai-only", action="store_true",
         help="Skip AutoFlip load (mark every clip's autoflip as SKIPPED)",
     )
@@ -1239,10 +1247,17 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     results: list[ClipResult] = []
     filter_glob = args.filter
+    slug_whitelist: Optional[set[str]] = None
+    if args.filter_slugs:
+        slug_whitelist = {
+            s.strip() for s in args.filter_slugs.split(",") if s.strip()
+        }
 
     for clip in manifest.get("clips", []):
         slug = clip.get("slug") or ""
         if not fnmatch.fnmatch(slug, filter_glob):
+            continue
+        if slug_whitelist is not None and slug not in slug_whitelist:
             continue
 
         result = ClipResult(
@@ -1328,6 +1343,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         "manifest_path": str(manifest_path),
         "autoflip_outputs_dir": str(autoflip_dir),
         "filter": args.filter,
+        "filter_slugs": (
+            sorted(slug_whitelist) if slug_whitelist is not None else None
+        ),
         "results": [
             {
                 "slug": r.slug,
