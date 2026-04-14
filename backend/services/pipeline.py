@@ -2855,6 +2855,15 @@ async def _run_analysis_inner(job_id: str):
                 try:
                     from backend.services.local_pacing import LocalPacingEstimator, compute_motion_from_dense_faces
                     _ct_str = getattr(_content_profile, 'content_type', 'unknown') if _content_profile else 'unknown'
+                    # Promote animated content to "animation_dialogue" pacing
+                    # weights — mirrors the segmenter's Fix A routing so
+                    # pacing is consistent across stages.
+                    if (
+                        _ct_str in ("narrative", "unknown", "")
+                        and _content_profile
+                        and getattr(_content_profile, 'is_animated', False)
+                    ):
+                        _ct_str = "animation_dialogue"
                     _pacing_estimator = LocalPacingEstimator(_video_dur, content_type=_ct_str or 'unknown')
                     _pacing_estimator.add_shot_cuts(_shot_cuts)
                     _pacing_estimator.add_speaker_turns(active_speaker_events)

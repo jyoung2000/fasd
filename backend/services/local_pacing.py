@@ -46,6 +46,10 @@ PACING_WEIGHTS = {
     "sports":       {"cuts": 0.20, "speakers": 0.05, "motion": 0.55, "audio": 0.20},
     "music_video":  {"cuts": 0.40, "speakers": 0.00, "motion": 0.45, "audio": 0.15},
     "anime":        {"cuts": 0.35, "speakers": 0.15, "motion": 0.30, "audio": 0.20},
+    # animation_dialogue = anime dialogue scenes: cut-driven pacing with
+    # meaningful speaker turns. Higher speaker weight than pure anime
+    # because BSD-style content has clear per-character speech runs.
+    "animation_dialogue": {"cuts": 0.30, "speakers": 0.30, "motion": 0.20, "audio": 0.20},
     "unknown":      {"cuts": 0.25, "speakers": 0.25, "motion": 0.25, "audio": 0.25},
 }
 

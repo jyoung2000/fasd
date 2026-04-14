@@ -21,6 +21,7 @@ class ContentType(str, Enum):
     SPORTS = "sports"
     MUSIC_VIDEO = "music_video"
     ANIME = "anime"
+    ANIMATION_DIALOGUE = "animation_dialogue"
     # v2 Phase 11: distinct preset for seated 2-5 person panels (Verzuz,
     # debate show, interview show). Panels need tighter holds and snap-
     # on-speaker-turn pacing — not the vlog/podcast tracking presets.
@@ -180,6 +181,35 @@ CONTENT_TYPE_CONFIG = {
         # Intent tracking — snappiest, fast cuts demand fast response
         "intent_ema_alpha": 0.55,
         "intent_switch_margin": 0.10,
+    },
+    ContentType.ANIMATION_DIALOGUE: {
+        # Anime dialogue: character-driven scenes with 1-2 speakers,
+        # clear gaze direction, and slow-to-medium cut rates. Human
+        # editors hold tight on the speaking character, apply lead room
+        # in the speaking direction, and use blur_fill when composition
+        # would otherwise go wide.
+        "apply_lead_room": True,
+        "wide_master_on_multi_face": False,   # NEVER go wide on anime dialogue —
+                                               # always track the active speaker
+        "allow_tracking": True,
+        "allow_motion_tracking": True,
+        "use_split_screen_on_overlap": False,
+        "fallback_preference": "blur_fill",
+        # Ease: snap on shot cuts (anime editors cut on beats), short
+        # ease on speaker turn (200ms = one-frame anticipation at 24fps)
+        "ease_speaker_turn_ms": 200,
+        "ease_shot_cut_ms": 0,
+        "ease_subject_walk_ms": 400,
+        # Detection thresholds: slightly looser than anime because
+        # character designs are consistent (lower false-positive rate)
+        "speaker_confidence_threshold": 0.55,
+        "speaker_coverage_threshold": 0.55,
+        "dense_dominance_threshold": 0.65,
+        "multi_speaker_threshold": 0.20,
+        # Intent tracking: fast alpha for quick speaker-switch response,
+        # tight margin for decisive snaps with no hover
+        "intent_ema_alpha": 0.60,
+        "intent_switch_margin": 0.08,
     },
     # v2 Phase 11 — multi-speaker panel (Verzuz, debate show, interview panel).
     # Mirrors PODCAST but with tighter per-speaker holds and no in-shot

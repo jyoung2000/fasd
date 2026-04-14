@@ -138,6 +138,16 @@ def build_reframe_segments(
         # returns the panel preset.
         if getattr(content_profile, 'is_multi_speaker_panel', False):
             ct = "multi_speaker_panel"
+        elif (
+            getattr(content_profile, 'is_animated', False)
+            and base_ct in ("narrative", "unknown", "")
+        ):
+            # Animated content that the video-level classifier promoted
+            # to "narrative" for routing purposes should use the anime
+            # preset — not the live-action narrative preset. Anime has
+            # fast intent tracking, blur_fill fallback, and no
+            # wide_master_on_multi_face (speaker should stay tracked).
+            ct = "anime"
         else:
             ct = base_ct
         try:
@@ -934,12 +944,22 @@ def build_reframe_segments(
     # ``thirds_bias.THIRDS_BIAS_CONTENT_TYPES``. The thirds offset
     # is composed with whatever lead-room offset already fired, so
     # both flags can be ON simultaneously.
+    # Auto-enable lead room and thirds bias for animated content regardless
+    # of env var. Anime/animation_dialogue almost always has clear gaze
+    # direction (characters face the person they're talking to). Lead room
+    # converts "face centered in crop" to "face on the looking side" — the
+    # primary difference between ClipAI and a human editor on this content
+    # type. Thirds bias adds the natural off-center placement editors use.
+    _is_animated_content = (
+        content_profile is not None
+        and getattr(content_profile, 'is_animated', False)
+    )
     lead_room_count = 0
     thirds_count = 0
     if _apply_lead_room and dense_faces:
         try:
             from backend.services.gaze_estimator import (
-                USE_GAZE_LEAD_ROOM_V2,
+                USE_GAZE_LEAD_ROOM_V2 as _USE_LEAD_RAW,
                 apply_lead_room as _apply_lr,
                 estimate_gaze_from_dense,
                 estimate_yaw_from_dense,
@@ -951,6 +971,7 @@ def build_reframe_segments(
                 applies_to_profile as _thirds_applies_profile,
                 thirds_x_offset_px,
             )
+            USE_GAZE_LEAD_ROOM_V2 = _USE_LEAD_RAW or _is_animated_content
 
             # Crop width in source pixels (16:9 → 9:16). Match the
             # value used by l1_camera_path / multi_region_layout so
@@ -963,7 +984,8 @@ def build_reframe_segments(
             # is_multi_speaker_panel exclusion so debate / panel
             # shots don't get a thirds offset even though their
             # parent ContentType is "podcast".
-            _thirds_on = USE_THIRDS_BIAS and _thirds_applies_profile(content_profile)
+            _thirds_auto = _is_animated_content and _thirds_applies_profile(content_profile)
+            _thirds_on = (USE_THIRDS_BIAS or _thirds_auto) and _thirds_applies_profile(content_profile)
             # Phase 6: anime-action multiplier on the lead-room
             # offset. Applied to BOTH Stage 8 (stationary) and
             # Stage 10c (tracking / panning). Other anime sub-types
@@ -1349,6 +1371,13 @@ def build_reframe_segments(
             )
 
             try:
+                # Anime/animation_dialogue dialogue content: use higher
+                # TV lambda for longer, stickier holds that match human
+                # editorial pacing. 0.03 × 1920 = 57.6 vs default 38.4.
+                # Action content handled by pacing estimator reducing min_hold.
+                _shot_lam_frac = (
+                    0.03 if _is_animated_content else 0.02
+                )
                 results = solve_camera_path_for_shot(
                     shot_start=shot_start,
                     shot_end=shot_end,
@@ -1356,6 +1385,7 @@ def build_reframe_segments(
                     propagated_path=source,
                     source_width=source_width,
                     source_height=source_height,
+                    lam=_shot_lam_frac * source_width,
                     job_id=job_id,
                 )
             except Exception as shot_exc:
