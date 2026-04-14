@@ -51,7 +51,7 @@ logger = logging.getLogger(__name__)
 # ─────────────── Feature flag ────────────────────────────────────
 
 USE_MUSIC_BEAT_SNAP = os.environ.get(
-    "CLIPAI_MUSIC_BEAT_SNAP", "0",
+    "CLIPAI_MUSIC_BEAT_SNAP", "1",
 ).lower() in ("1", "true", "yes", "on")
 
 

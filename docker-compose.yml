@@ -20,6 +20,13 @@ services:
       # Tell PyTorch to release memory back to OS aggressively.
       # Without this, torch caches 1.6GB+ VRAM after Whisper, starving Ollama.
       - PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128,garbage_collection_threshold:0.6
+      # ClipAI v4 universal reframing: enable all editorial signals by default.
+      - CLIPAI_ANIME_ANCHOR=1
+      - CLIPAI_MUSIC_BEAT_SNAP=1
+      - CLIPAI_GAMEPLAY_TRACKER=1
+      - CLIPAI_EDITORIAL_PRIOR=1
+      - CLIPAI_THIRDS_BIAS=1
+      - CLIPAI_GAZE_LEAD_ROOM_V2=1
     # Enable GPU passthrough when NVIDIA Container Toolkit is installed.
     # If no GPU is available, the container still starts normally on CPU.
     deploy:

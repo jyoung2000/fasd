@@ -1243,6 +1243,7 @@ async def _run_analysis_inner(job_id: str):
     # downstream tuning can read them off the profile.
     _anime_subtype = getattr(_job_data, "anime_subtype", "") if _job_data else ""
     _music_subtype = getattr(_job_data, "music_subtype", "") if _job_data else ""
+    _sports_subtype = getattr(_job_data, "sports_subtype", "") if _job_data else ""
     _normalized_override = normalize_ui_content_type(_content_override)
 
     if is_gameplay_override(_content_override):
@@ -2355,18 +2356,22 @@ async def _run_analysis_inner(job_id: str):
         except Exception as e:
             logger.warning("[%s] Object tracking failed (non-fatal): %s", job_id, e)
 
-    # ── Saliency + Object Detection for AutoFlip path ──
+    # ── Saliency + Object Detection (universal) ──
+    # Run saliency for all content types (not just AutoFlip path). This is the
+    # AutoFlip-equivalent foundation: the single signal that matters most when
+    # no face is present. Content-type weighting in required_regions controls
+    # how much influence it has on the solver.
     _saliency_regions = []
     _object_detections = []
     OBJECT_DETECTION_ENABLED = os.environ.get("OBJECT_DETECTION_ENABLED", "true").lower() in ("true", "1", "yes")
     USE_AUTOFLIP_REFRAME = os.environ.get("USE_AUTOFLIP_REFRAME", "false").lower() in ("true", "1", "yes")
-    if USE_AUTOFLIP_REFRAME and OBJECT_DETECTION_ENABLED and not _is_gameplay:
+    if OBJECT_DETECTION_ENABLED:
         try:
             from backend.services.saliency_tracker import track_saliency_in_frames
             frame_list_sal = [(f.timestamp, f.path) for f in frames]
             _saliency_regions = track_saliency_in_frames(frame_list_sal, face_results,
                                                              persistent_regions=_persistent_regions)
-            logger.info("[%s] SaliencyTracker: %d regions", job_id, len(_saliency_regions))
+            logger.info("[%s] SaliencyTracker: %d regions (universal)", job_id, len(_saliency_regions))
         except Exception as e:
             logger.warning("[%s] Saliency tracker failed (non-fatal): %s", job_id, e)
 
@@ -2656,6 +2661,8 @@ async def _run_analysis_inner(job_id: str):
                 _classifier_metadata["anime_subtype"] = _anime_subtype
             if _music_subtype:
                 _classifier_metadata["music_subtype"] = _music_subtype
+            if _sports_subtype:
+                _classifier_metadata["sports_subtype"] = _sports_subtype
             if _game_type:
                 _classifier_metadata["game_type"] = _game_type
             _content_profile = classify_content(
@@ -2713,10 +2720,33 @@ async def _run_analysis_inner(job_id: str):
                 _video_dur = metadata.get("duration", 0)
                 _shot_cuts = scene_cut_timestamps if scene_cut_timestamps else []
 
-                # ── Subject Fusion (optional, behind feature flag) ──
-                USE_SUBJECT_FUSION = os.environ.get("USE_SUBJECT_FUSION", "false").lower() in ("true", "1", "yes")
+                # ── Subject Fusion (feature-flagged or auto for action types) ──
+                # v4: auto-enable subject fusion for content types where
+                # non-face subjects persist across cuts (anime, sports,
+                # music video, vlog). These are the cases where the
+                # face_registry alone can't carry identity through the
+                # long stretches without a clean face bbox.
+                _ct_str_fusion = (
+                    getattr(_content_profile, "content_type", "")
+                    if _content_profile else ""
+                )
+                _fusion_auto = _ct_str_fusion in (
+                    "anime",
+                    "animation_dialogue",
+                    "sports",
+                    "sports_basketball",
+                    "sports_racing",
+                    "music_video",
+                    "vlog",
+                )
+                USE_SUBJECT_FUSION = (
+                    os.environ.get("USE_SUBJECT_FUSION", "false").lower() in ("true", "1", "yes")
+                    or _fusion_auto
+                )
                 _subject_tracks = None
-                if USE_SUBJECT_FUSION:
+                if USE_SUBJECT_FUSION and face_registry and getattr(
+                    face_registry, "slots", None,
+                ):
                     try:
                         from backend.services.subject_fusion import build_subject_tracks
                         _subject_tracks = build_subject_tracks(
@@ -2729,8 +2759,12 @@ async def _run_analysis_inner(job_id: str):
                             shot_cuts=_shot_cuts,
                             job_id=job_id,
                         )
-                        logger.info("[%s] SubjectFusion: %d unified tracks", job_id,
-                                    len(_subject_tracks) if _subject_tracks else 0)
+                        logger.info(
+                            "[%s] SubjectFusion: %d unified tracks (auto=%s, ct=%s)",
+                            job_id,
+                            len(_subject_tracks) if _subject_tracks else 0,
+                            _fusion_auto, _ct_str_fusion,
+                        )
                     except Exception as e:
                         logger.warning("[%s] Subject fusion failed (non-fatal): %s", job_id, e)
 
@@ -2915,10 +2949,12 @@ async def _run_analysis_inner(job_id: str):
                         _features_seq: list = []
                         # Build per-frame features from dense_face_results.
                         # The face signal comes from the highest-conf
-                        # face on each frame; motion / contrast /
-                        # saturation default to 0 (OpenCV-backed
-                        # extraction is wired separately when the
-                        # cascade XML lands — Phase 6 follow-up).
+                        # face on each frame; motion_energy is derived
+                        # from the face-position delta frame-to-frame so
+                        # impact-frame detection has real signal even
+                        # without the OpenCV cascade. Contrast and
+                        # saturation remain 0 until the Phase 6 cascade
+                        # lands.
                         for df in dense_face_results:
                             best_face = None
                             best_score = -1.0
@@ -2933,11 +2969,23 @@ async def _run_analysis_inner(job_id: str):
                                 max(0.0, min(1.0, best_score))
                                 if best_face is not None else 0.0
                             )
+                            # v4: compute motion_energy from face delta
+                            # frame-to-frame. 20% movement = max energy.
+                            _prev_face_x = (
+                                _features_seq[-1].face_x_pct if _features_seq else face_x
+                            )
+                            _prev_face_y = (
+                                _features_seq[-1].face_y_pct if _features_seq else face_y
+                            )
+                            _dx = abs(face_x - _prev_face_x)
+                            _dy = abs(face_y - _prev_face_y)
+                            _motion = min(1.0, (_dx + _dy) / 20.0)
                             _features_seq.append(AnimeFrameFeatures(
                                 timestamp=float(df.timestamp),
                                 face_x_pct=face_x,
                                 face_y_pct=face_y,
                                 face_score=face_score,
+                                motion_energy=_motion,
                             ))
                         _anime_subtype_pipe = getattr(
                             _content_profile, "anime_subtype", None,

@@ -58,6 +58,29 @@ EASE_SPEAKER_TURN_MS = 200
 EASE_SUBJECT_WALK_MS = 250
 
 
+def _is_formation_frame(
+    frame_faces,
+    min_faces: int = 3,
+    min_span_pct: float = 55.0,
+) -> bool:
+    """True when ``min_faces`` or more faces span ``>= min_span_pct`` of
+    frame width.
+
+    Signals group choreography (dance formation, ensemble cast) where a
+    tight single-face crop loses the composition entirely. Human editors
+    hold wide or pan slowly across the formation in these frames. Used
+    by the music-video segment branch to force ``wide_master`` on
+    formation-dominant windows.
+    """
+    faces = getattr(frame_faces, "faces", []) or []
+    if len(faces) < min_faces:
+        return False
+    xs = [float(getattr(f, "nose_x", 50)) for f in faces]
+    if not xs:
+        return False
+    return (max(xs) - min(xs)) >= min_span_pct
+
+
 @dataclass
 class ReframeSegment:
     start: float              # seconds
@@ -179,6 +202,30 @@ def build_reframe_segments(
     _apply_lead_room = cfg.get("apply_lead_room", False) if cfg else False
     _allow_motion_tracking = cfg.get("allow_motion_tracking", False) if cfg else False
 
+    # ── Music video sub-type behavior branches ──
+    # The music_video parent type routes all performance content by
+    # default. Sub-types refine the editorial behavior:
+    #   narrative: cinematic-dialogue feel (lead room + wide on multi)
+    #   lyric:     minimal motion, long holds (override pacing floor)
+    #   performance: snappy, wide on formation (formation detector does
+    #                the wide work; keep lead room off)
+    _music_subtype = (
+        getattr(content_profile, "music_subtype", None)
+        if content_profile else None
+    )
+    if ct == "music_video" and _music_subtype:
+        if _music_subtype == "narrative":
+            _apply_lead_room = True
+            _wide_on_multi = True
+        elif _music_subtype == "lyric":
+            _apply_lead_room = False
+            _wide_on_multi = False
+            # Hold floor ≥ 2.5s: lyric videos should almost never cut
+            _min_hold = max(_min_hold, 2.5)
+        elif _music_subtype == "performance":
+            _apply_lead_room = False
+            _wide_on_multi = True
+
     # ── Initialize subject confidence estimator ──
     _confidence_estimator = None
     try:
@@ -277,20 +324,54 @@ def build_reframe_segments(
 
         subject_x = _slot_to_x(active_slot, face_registry, source_width)
 
-        raw_segments.append(ReframeSegment(
-            start=seg_start,
-            end=seg_end,
-            subject_x=subject_x,
-            subject_y=SUBJECT_Y_DEFAULT / 100.0 * source_height,
-            layout=layout,
-            active_slot=active_slot,
-            confidence=confidence,
-            reason=reason,
-            ease_in_ms=0,
-            strategy="stationary",
-            content_type=ct,
-            subject_source=subject_source,
-        ))
+        # ── Music video: formation detection ──
+        # For music videos with group choreography (3+ faces spanning
+        # >55% of the frame), force a wide master crop instead of a
+        # tight single-face follow. Human editors hold wide or pan
+        # slowly across formation shots.
+        _formation_override = False
+        if ct == "music_video" and dense_faces:
+            _window_frames = [
+                df for df in dense_faces
+                if seg_start <= df.timestamp < seg_end
+            ]
+            if _window_frames:
+                _formation_count = sum(
+                    1 for df in _window_frames if _is_formation_frame(df)
+                )
+                if _formation_count / len(_window_frames) >= 0.5:
+                    _formation_override = True
+
+        if _formation_override:
+            raw_segments.append(ReframeSegment(
+                start=seg_start,
+                end=seg_end,
+                subject_x=source_width * 0.5,
+                subject_y=SUBJECT_Y_DEFAULT / 100.0 * source_height,
+                layout="wide_master",
+                active_slot=None,
+                confidence=0.85,
+                reason="formation_shot",
+                ease_in_ms=0,
+                strategy="wide_master",
+                content_type=ct,
+                subject_source="formation",
+            ))
+        else:
+            raw_segments.append(ReframeSegment(
+                start=seg_start,
+                end=seg_end,
+                subject_x=subject_x,
+                subject_y=SUBJECT_Y_DEFAULT / 100.0 * source_height,
+                layout=layout,
+                active_slot=active_slot,
+                confidence=confidence,
+                reason=reason,
+                ease_in_ms=0,
+                strategy="stationary",
+                content_type=ct,
+                subject_source=subject_source,
+            ))
 
     # ── Confidence-gated merge of short segments ──
     # A short segment is merged ONLY if:

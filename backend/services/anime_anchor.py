@@ -59,7 +59,7 @@ logger = logging.getLogger(__name__)
 # ──────────────────── Feature flag ────────────────────
 
 USE_ANIME_ANCHOR = os.environ.get(
-    "CLIPAI_ANIME_ANCHOR", "0",
+    "CLIPAI_ANIME_ANCHOR", "1",
 ).lower() in ("1", "true", "yes", "on")
 
 
@@ -141,6 +141,10 @@ class AnimeAnchor:
         source: Dominant signal name — one of ``"face"`` /
             ``"motion"`` / ``"contrast"`` / ``"saturation"`` /
             ``"fallback"``. Useful for telemetry and debug logs.
+        is_impact_peak: True when this anchor is the wind-up frame
+            immediately before a motion-energy peak (action subtype
+            only). The reframe segmenter treats these as hard hold
+            points so the camera lands on the wind-up, not the blur.
     """
 
     timestamp: float
@@ -148,6 +152,7 @@ class AnimeAnchor:
     y_pct: float
     score: float
     source: str = "fallback"
+    is_impact_peak: bool = False
 
 
 # ──────────────────── Per-frame scorer ────────────────────
@@ -221,16 +226,59 @@ def score_anime_frame(
     )
 
 
+def snap_to_impact_frames(
+    anchors: list[AnimeAnchor],
+    features_seq: list[AnimeFrameFeatures],
+) -> list[AnimeAnchor]:
+    """Mark anchors whose frame is the wind-up before a motion peak.
+
+    Anime editors hold on the wind-up frame (2-3 frames before impact),
+    not on the peak blur frame. This flags the anchor immediately
+    upstream of each local motion-energy peak so the reframe segmenter
+    can snap segment starts to match.
+
+    Only applies when ``len(anchors) == len(features_seq)`` — otherwise
+    the index alignment is unreliable and we return anchors unchanged.
+    """
+    if len(anchors) < 5 or len(anchors) != len(features_seq):
+        return anchors
+    energies = [
+        float(getattr(f, "motion_energy", 0.0) or 0.0)
+        for f in features_seq
+    ]
+    # Walk the interior: require monotone rise over 2 frames and a
+    # drop on the frame after — that's a clean local peak above the
+    # 0.35 noise floor.
+    for i in range(2, len(anchors) - 2):
+        if (
+            energies[i] > 0.35
+            and energies[i] > energies[i - 1] > energies[i - 2]
+            and energies[i] > energies[i + 1]
+        ):
+            lead = max(0, i - 1)
+            anchors[lead].is_impact_peak = True
+    return anchors
+
+
 def score_anime_sequence(
     features_seq: Iterable[AnimeFrameFeatures],
     *,
     anime_subtype: Optional[str] = None,
 ) -> list[AnimeAnchor]:
-    """Score every frame in a sequence and return per-frame anchors."""
-    return [
+    """Score every frame in a sequence and return per-frame anchors.
+
+    When ``anime_subtype == "action"`` the result is additionally run
+    through :func:`snap_to_impact_frames` so wind-up frames (2 frames
+    before each motion peak) are flagged ``is_impact_peak=True``.
+    """
+    feats = list(features_seq)
+    result = [
         score_anime_frame(f, anime_subtype=anime_subtype)
-        for f in features_seq
+        for f in feats
     ]
+    if anime_subtype == "action":
+        result = snap_to_impact_frames(result, feats)
+    return result
 
 
 # ──────────────────── Per-segment aggregator ────────────────────

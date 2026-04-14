@@ -83,6 +83,7 @@ class NormalizedContentType:
     anime_subtype: Optional[str] = None
     music_subtype: Optional[str] = None
     gameplay_subtype: Optional[str] = None
+    sports_subtype: Optional[str] = None
     is_gameplay_fastpath: bool = False
     raw: str = ""
 
@@ -156,6 +157,22 @@ _UI_TO_ENUM: dict[str, dict] = {
         "gameplay_subtype": "stream",
     },
     "sports": {"content_type": ContentType.SPORTS},
+    "sports_basketball": {
+        "content_type": ContentType.SPORTS,
+        "sports_subtype": "basketball",
+    },
+    "sports_racing": {
+        "content_type": ContentType.SPORTS,
+        "sports_subtype": "racing",
+    },
+    "basketball": {
+        "content_type": ContentType.SPORTS,
+        "sports_subtype": "basketball",
+    },
+    "racing": {
+        "content_type": ContentType.SPORTS,
+        "sports_subtype": "racing",
+    },
 
     # ── Special no-op tokens ──
     "": None,
@@ -247,6 +264,7 @@ def normalize_ui_content_type(token: Optional[str]) -> Optional[NormalizedConten
         anime_subtype=spec.get("anime_subtype"),
         music_subtype=spec.get("music_subtype"),
         gameplay_subtype=spec.get("gameplay_subtype"),
+        sports_subtype=spec.get("sports_subtype"),
         is_gameplay_fastpath=bool(spec.get("gameplay_fastpath", False)),
         raw=key,
     )

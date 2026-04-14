@@ -120,8 +120,18 @@ ROUTING_MATRIX = [
      ClipContentType.STREAM),
 
     # ── Sports ──
+    # v4: SPORTS parent now maps to ClipContentType.SPORTS, and the
+    # sub-types route to SPORTS_BASKETBALL / SPORTS_RACING.
     ("sports", None, None, ContentType.SPORTS, None, False, False, False,
-     ClipContentType.GENERIC),
+     ClipContentType.SPORTS),
+    ("sports_basketball", None, None, ContentType.SPORTS, None, False, False, False,
+     ClipContentType.SPORTS_BASKETBALL),
+    ("sports_racing", None, None, ContentType.SPORTS, None, False, False, False,
+     ClipContentType.SPORTS_RACING),
+    ("basketball", None, None, ContentType.SPORTS, None, False, False, False,
+     ClipContentType.SPORTS_BASKETBALL),
+    ("racing", None, None, ContentType.SPORTS, None, False, False, False,
+     ClipContentType.SPORTS_RACING),
 ]
 
 
@@ -294,8 +304,8 @@ class TestEndToEndCoverage:
         "music_video",
         # Gaming
         "gameplay_moba", "gameplay_tps", "gameplay_racing", "stream",
-        # Sports
-        "sports",
+        # Sports (v4)
+        "sports", "sports_basketball", "sports_racing",
     }
 
     def test_matrix_covers_every_upload_jsx_token(self):
@@ -366,6 +376,28 @@ class TestPipelineSubtypeInjection:
                         found = True
                         break
         assert found, "pipeline.py must inject music_subtype"
+
+    def test_pipeline_injects_sports_subtype(self):
+        import ast
+        from pathlib import Path
+        src = (
+            Path(__file__).resolve().parents[1] / "services" / "pipeline.py"
+        ).read_text()
+        tree = ast.parse(src)
+        found = False
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                for tgt in node.targets:
+                    if (
+                        isinstance(tgt, ast.Subscript)
+                        and isinstance(tgt.value, ast.Name)
+                        and tgt.value.id == "_classifier_metadata"
+                        and isinstance(tgt.slice, ast.Constant)
+                        and tgt.slice.value == "sports_subtype"
+                    ):
+                        found = True
+                        break
+        assert found, "pipeline.py must inject sports_subtype"
 
     def test_pipeline_injects_game_type(self):
         import ast

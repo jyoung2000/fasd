@@ -120,6 +120,31 @@ def _is_animated_mode(content_type) -> bool:
     return val in ("animation", "animation_dialogue")
 
 
+def _is_action_mode(content_type) -> bool:
+    """Content types where motion centroid is a useful fallback anchor.
+
+    Used to decide whether to run the attention_anchor stream for
+    non-dialogue content. Unlike dialogue modes (which need the anchor to
+    bridge listener/reaction gaps), action content needs the anchor so
+    the motion centroid priority level 5 can carry the camera through
+    long faceless stretches.
+    """
+    if content_type is None:
+        return False
+    val = getattr(content_type, "value", content_type)
+    return val in (
+        "animation",           # anime action
+        "sports",
+        "sports_basketball",
+        "sports_racing",
+        "music_video",
+        "gameplay",
+        "gameplay_moba",
+        "gameplay_tps",
+        "gameplay_racing",
+    )
+
+
 @dataclass
 class _FrameSaliencyAdapter:
     """FrameSaliency-compatible wrapper built from a group of
@@ -283,16 +308,18 @@ def build_required_regions(
 
     dialogue_mode = _is_dialogue_mode(content_type)
     animated_mode = _is_animated_mode(content_type)
+    action_mode = _is_action_mode(content_type)
 
     # ── Attention anchor stream ──
-    # For dialogue modes (live-action and animated), build a dense
-    # per-frame AttentionAnchor timeline so frames with no face
-    # RequiredRegion still have *something* for the camera solver to
-    # anchor on. This is the Opus-level fallback: bridge faces across
-    # 1.5s gaps, fall back to saliency peaks, and never leave a frame
-    # without an anchor in the long run.
+    # For dialogue modes: bridge faces across 1.5s gaps, fall back to
+    # saliency peaks. For action modes (sports / anime action / music /
+    # gameplay): same dense per-frame timeline, but lower promotion
+    # confidence — motion centroid becomes the load-bearing fallback when
+    # no face is available. Never leave a frame without an anchor in the
+    # long run.
     anchor_by_time: dict = {}
-    if dialogue_mode and frame_faces:
+    _run_anchor_stream = frame_faces and (dialogue_mode or action_mode)
+    if _run_anchor_stream:
         try:
             from backend.services.attention_anchor import build_attention_anchors
             _anchors = build_attention_anchors(
@@ -478,6 +505,76 @@ def build_required_regions(
             if not _overlaps_any(candidate, frame_regions, 0.3):
                 frame_regions.append(candidate)
 
+        # ── Sports object regions ──
+        # For sports content: non-person objects (ball, car) become
+        # preferred anchors so the solver follows the action even when
+        # no face is visible. In basketball, the ball is the subject; in
+        # racing, the car is; in generic sports, fall back to the largest
+        # player body. Scoreboard preservation is handled via cy floor.
+        _ct_val = getattr(content_type, "value", content_type) if content_type else None
+        if _ct_val in ("sports", "sports_basketball", "sports_racing"):
+            for obj in obj_by_time.get(ts_key, []):
+                class_name = getattr(obj, "class_name", "")
+                # Basketball: track the ball
+                if _ct_val == "sports_basketball" and class_name == "sports ball":
+                    cx = float(getattr(obj, "x", 50)) / 100.0
+                    cy = float(getattr(obj, "y", 50)) / 100.0
+                    hw = float(getattr(obj, "w", 10)) / 200.0
+                    hh = float(getattr(obj, "h", 10)) / 200.0
+                    ball_region = RequiredRegion(
+                        timestamp=ff.timestamp,
+                        cx=cx, cy=cy,
+                        half_width=max(0.05, hw),
+                        half_height=max(0.05, hh),
+                        score=0.55,
+                        tier="preferred",
+                        source="object",
+                        weight=0.7,
+                    )
+                    if not _overlaps_any(ball_region, frame_regions, 0.3):
+                        frame_regions.append(ball_region)
+                # Racing: track the largest vehicle (lead car)
+                elif _ct_val == "sports_racing" and class_name in (
+                    "car", "truck", "motorcycle",
+                ):
+                    cx = float(getattr(obj, "x", 50)) / 100.0
+                    cy = float(getattr(obj, "y", 50)) / 100.0
+                    # Racing: bias toward lower third (car sits below midframe)
+                    cy = min(0.75, max(0.50, cy))
+                    hw = float(getattr(obj, "w", 15)) / 200.0
+                    hh = float(getattr(obj, "h", 15)) / 200.0
+                    car_region = RequiredRegion(
+                        timestamp=ff.timestamp,
+                        cx=cx, cy=cy,
+                        half_width=max(0.08, hw),
+                        half_height=max(0.05, hh),
+                        score=0.65,   # higher than ball — car IS the subject
+                        tier="preferred",
+                        source="object",
+                        weight=0.8,
+                    )
+                    if not _overlaps_any(car_region, frame_regions, 0.3):
+                        frame_regions.append(car_region)
+                # Generic sports: large moving person body (player) when no face
+                elif _ct_val == "sports" and class_name == "person":
+                    if not any(r.source == "face" for r in frame_regions):
+                        cx = float(getattr(obj, "x", 50)) / 100.0
+                        cy = float(getattr(obj, "y", 45)) / 100.0
+                        hw = float(getattr(obj, "w", 12)) / 200.0
+                        hh = float(getattr(obj, "h", 20)) / 200.0
+                        player_region = RequiredRegion(
+                            timestamp=ff.timestamp,
+                            cx=cx, cy=cy,
+                            half_width=max(0.06, hw),
+                            half_height=max(0.08, hh),
+                            score=0.50,
+                            tier="preferred",
+                            source="object",
+                            weight=0.6,
+                        )
+                        if not _overlaps_any(player_region, frame_regions, 0.3):
+                            frame_regions.append(player_region)
+
         # ── Saliency regions: preferred tier ──
         sal_frame = sal_by_time.get(ts_key)
         if sal_frame:
@@ -564,23 +661,38 @@ def build_required_regions(
                     ar.weight = floor
                     _hard_floor_boosts += 1
 
-        # ── Attention anchor fallback (dialogue modes) ──
+        # ── Attention anchor fallback (dialogue + action modes) ──
         # If no face RequiredRegion survived for this frame, promote the
         # dense AttentionAnchor to a required region so the camera
         # solver always has something to lock onto. Without this the
         # crop drifts onto background motion during faceless action
         # beats (the primary symptom from the K S01E12 sanity run).
-        if dialogue_mode and not any(r.source == "face" for r in frame_regions):
+        #
+        # Dialogue mode: min_conf=0.3 (bridge faces aggressively).
+        # Action mode: min_conf=0.5 (only promote strong motion/saliency
+        # centroids, and cap the region weight lower so the solver
+        # treats it as a soft hint rather than a locked target).
+        if _run_anchor_stream and not any(r.source == "face" for r in frame_regions):
             anchor = anchor_by_time.get(ts_key)
-            if anchor is not None:
+            _min_anchor_conf = 0.3 if dialogue_mode else 0.5
+            if anchor is not None and float(getattr(anchor, "confidence", 0.0)) >= _min_anchor_conf:
+                _anchor_conf = float(getattr(anchor, "confidence", 0.0))
+                if dialogue_mode:
+                    _score = max(0.3, min(0.9, 0.3 + 0.5 * _anchor_conf))
+                    _weight = max(0.3, min(0.9, 0.3 + 0.5 * _anchor_conf))
+                else:
+                    # Action mode: cap score and weight lower so faces in
+                    # adjacent frames still dominate the solver.
+                    _score = max(0.3, min(0.7, _anchor_conf))
+                    _weight = max(0.3, min(0.7, _anchor_conf))
                 frame_regions.append(RequiredRegion(
                     timestamp=ff.timestamp,
                     cx=anchor.cx, cy=anchor.cy,
                     half_width=anchor.half_width, half_height=anchor.half_height,
-                    score=max(0.3, min(0.9, 0.3 + 0.5 * anchor.confidence)),
+                    score=_score,
                     tier="required",
                     source="saliency" if anchor.source in ("saliency_peak",) else "face",
-                    weight=max(0.3, min(0.9, 0.3 + 0.5 * anchor.confidence)),
+                    weight=_weight,
                     is_active_speaker=False,
                 ))
 
@@ -649,23 +761,36 @@ def promote_preferred_to_required(
     This is what makes anime and gameplay work — saliency becomes
     load-bearing exactly when faces are absent.
 
-    No-op for TALKING_HEAD / CINEMATIC_DIALOGUE: for those modes a frame
-    with no face means "wait" — let camera_path.py smooth through it
-    rather than fabricating a new anchor from background saliency.
+    For dialogue modes (TALKING_HEAD / CINEMATIC_DIALOGUE): only promote
+    high-confidence (score >= 0.6) preferred regions. This prevents
+    fabricating a saliency anchor during a speaker pause while still
+    giving the solver a target for truly faceless frames (cutaway b-roll,
+    over-the-shoulder inserts) where the attention anchor stream didn't
+    already bridge the gap.
     """
-    if _is_dialogue_mode(content_type):
-        logger.info("[SaliencyV2] promote_preferred_to_required skipped (dialogue mode)")
-        return
     promoted = 0
+    dialogue_mode = _is_dialogue_mode(content_type)
     for frame_regions in regions_per_frame:
         has_required = any(r.tier == "required" for r in frame_regions)
         if has_required or not frame_regions:
             continue
         preferred = [r for r in frame_regions if r.tier == "preferred"]
-        if preferred:
+        if not preferred:
+            continue
+
+        if dialogue_mode:
+            # In dialogue mode: only promote high-confidence saliency so we
+            # don't anchor on background motion during a brief speaker pause.
+            high_conf = [r for r in preferred if r.score >= 0.6]
+            if not high_conf:
+                continue
+            best = max(high_conf, key=lambda r: r.score)
+        else:
             best = max(preferred, key=lambda r: r.score)
-            best.tier = "required"
-            promoted += 1
+
+        best.tier = "required"
+        promoted += 1
+
     if promoted > 0:
         logger.info("RequiredRegions: promoted %d preferred→required (no-face frames)",
                     promoted)
