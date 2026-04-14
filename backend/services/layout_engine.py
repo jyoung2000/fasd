@@ -455,16 +455,22 @@ def _plan_layout_impl(
     # solver and reintroducing the 2-Hz stair-stepping this phase was
     # supposed to eliminate. If ANY shot is low-confidence, skip the
     # override and let the L1 solver handle smoothing.
-    _any_low_conf_shots = any(
-        getattr(s, "detector_confidence", "high") == "low" for s in shots
-    )
+    _low_conf_shots = [
+        s for s in shots
+        if getattr(s, "detector_confidence", "high") == "low"
+    ]
+    _low_conf_frac = len(_low_conf_shots) / max(len(shots), 1)
+    # Threshold gate: only skip the override when a majority-ish of shots
+    # are low-confidence. A single spurious shot (e.g. lighting flicker
+    # on a static-background panel) should not disable the whole override
+    # and reintroduce 2-Hz stair-stepping across the full clip.
+    _any_low_conf_shots = _low_conf_frac > 0.30
     if _any_low_conf_shots:
         logger.info(
-            "[%s] [Layout+Solver] panel short-shot override SKIPPED: shot "
-            "detector confidence is low (opencv fallback on %d shots). "
+            "[%s] [Layout+Solver] panel short-shot override SKIPPED: %.0f%% "
+            "of shots are low-confidence (threshold 30%%). "
             "Trusting L1 solver.",
-            job_id, sum(1 for s in shots
-                        if getattr(s, "detector_confidence", "high") == "low"),
+            job_id, _low_conf_frac * 100,
         )
     if is_panel and not _any_low_conf_shots and face_registry and getattr(face_registry, "slots", None):
         _source_aspect = (

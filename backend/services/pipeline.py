@@ -43,6 +43,69 @@ def _log_gpu_memory(job_id: str, label: str):
         pass  # Non-critical — don't break pipeline if GPU query fails
 
 
+# ── Phase 6: Anime saliency signal extractors ─────────────────
+# These are lightweight proxies for OpenCV motion/contrast/saturation
+# extraction. They operate on the existing dense_face_results frames
+# without adding any per-frame image read — cheap enough to run on a
+# 4GB GPU during the pipeline without VRAM pressure.
+
+def _anime_face_motion_energy(prev_feature, current_frame) -> float:
+    """Proxy for frame motion: absolute delta of the best-face nose
+    position between the previous and current dense-face frames.
+
+    Returns a value in [0, 1] that saturates quickly so impact peaks
+    in anime action (where characters leap across the frame in a
+    single cut) register strongly.
+    """
+    try:
+        if prev_feature is None:
+            return 0.0
+        # current_frame is a FrameFaces record; pick its highest-conf
+        # face and compare to the previous feature's face position.
+        cur_faces = getattr(current_frame, "faces", []) or []
+        if not cur_faces:
+            return 0.0
+        best_conf = -1.0
+        cur_nose_x = 50.0
+        cur_nose_y = 50.0
+        for f in cur_faces:
+            conf = float(getattr(f, "confidence", 0.0) or 0.0)
+            if conf > best_conf:
+                best_conf = conf
+                cur_nose_x = float(getattr(f, "nose_x", 50.0))
+                cur_nose_y = float(getattr(f, "nose_y", 50.0))
+        dx = abs(cur_nose_x - float(getattr(prev_feature, "face_x_pct", 50.0)))
+        dy = abs(cur_nose_y - float(getattr(prev_feature, "face_y_pct", 50.0)))
+        return max(0.0, min(1.0, (dx + dy) / 20.0))
+    except Exception:
+        return 0.0
+
+
+def _anime_face_contrast(current_frame) -> float:
+    """Proxy for per-frame contrast: variance in detected face bbox
+    widths. A frame with both a close-up and a mid-shot face has high
+    variance; a single uniform face has low variance. Returns [0, 1].
+    """
+    try:
+        faces = getattr(current_frame, "faces", []) or []
+        if len(faces) < 2:
+            return 0.0
+        widths = [float(getattr(f, "width", 0.0)) for f in faces]
+        mean_w = sum(widths) / len(widths)
+        variance = sum((w - mean_w) ** 2 for w in widths) / len(widths)
+        return max(0.0, min(1.0, variance / 100.0))
+    except Exception:
+        return 0.0
+
+
+def _anime_face_saturation(current_frame) -> float:
+    """Stub for saturation — full OpenCV HSV extraction is a Phase 6
+    follow-up. Returns 0.0 so score_anime_frame falls back to the
+    face + motion + contrast signals.
+    """
+    return 0.0
+
+
 async def _release_whisper_vram(job_id: str):
     """Aggressively release Whisper VRAM so Ollama CLIP can use GPU.
 
@@ -1243,6 +1306,7 @@ async def _run_analysis_inner(job_id: str):
     # downstream tuning can read them off the profile.
     _anime_subtype = getattr(_job_data, "anime_subtype", "") if _job_data else ""
     _music_subtype = getattr(_job_data, "music_subtype", "") if _job_data else ""
+    _sports_subtype = getattr(_job_data, "sports_subtype", "") if _job_data else ""
     _normalized_override = normalize_ui_content_type(_content_override)
 
     if is_gameplay_override(_content_override):
@@ -2656,6 +2720,8 @@ async def _run_analysis_inner(job_id: str):
                 _classifier_metadata["anime_subtype"] = _anime_subtype
             if _music_subtype:
                 _classifier_metadata["music_subtype"] = _music_subtype
+            if _sports_subtype:
+                _classifier_metadata["sports_subtype"] = _sports_subtype
             if _game_type:
                 _classifier_metadata["game_type"] = _game_type
             _content_profile = classify_content(
@@ -2902,6 +2968,7 @@ async def _run_analysis_inner(job_id: str):
                         USE_ANIME_ANCHOR as _USE_AA,
                         AnimeFrameFeatures,
                         score_anime_sequence,
+                        snap_to_impact_frames,
                     )
 
                     _auto_anime_anchor = (
@@ -2914,11 +2981,13 @@ async def _run_analysis_inner(job_id: str):
                     ):
                         _features_seq: list = []
                         # Build per-frame features from dense_face_results.
-                        # The face signal comes from the highest-conf
-                        # face on each frame; motion / contrast /
-                        # saturation default to 0 (OpenCV-backed
-                        # extraction is wired separately when the
-                        # cascade XML lands — Phase 6 follow-up).
+                        # The face signal comes from the highest-conf face
+                        # on each frame. motion_energy, contrast, and
+                        # saturation are estimated from lightweight
+                        # per-frame proxies (nose-delta motion, face-size
+                        # variance, HSV stub) so action peaks / impact
+                        # frames in anime fight scenes actually register
+                        # instead of falling back to face-only scoring.
                         for df in dense_face_results:
                             best_face = None
                             best_score = -1.0
@@ -2933,11 +3002,18 @@ async def _run_analysis_inner(job_id: str):
                                 max(0.0, min(1.0, best_score))
                                 if best_face is not None else 0.0
                             )
+                            _prev_feature = _features_seq[-1] if _features_seq else None
+                            _motion = _anime_face_motion_energy(_prev_feature, df)
+                            _contrast = _anime_face_contrast(df)
+                            _saturation = _anime_face_saturation(df)
                             _features_seq.append(AnimeFrameFeatures(
                                 timestamp=float(df.timestamp),
                                 face_x_pct=face_x,
                                 face_y_pct=face_y,
                                 face_score=face_score,
+                                motion_energy=_motion,
+                                contrast=_contrast,
+                                saturation=_saturation,
                             ))
                         _anime_subtype_pipe = getattr(
                             _content_profile, "anime_subtype", None,
@@ -2945,6 +3021,13 @@ async def _run_analysis_inner(job_id: str):
                         _anime_anchors_for_seg = score_anime_sequence(
                             _features_seq, anime_subtype=_anime_subtype_pipe,
                         )
+                        # For action anime, shift pre-impact hold starts
+                        # back by 2 frames so the wind-up is captured
+                        # rather than the blur frame at peak motion.
+                        if _anime_subtype_pipe == "action":
+                            _anime_anchors_for_seg = snap_to_impact_frames(
+                                _anime_anchors_for_seg, _features_seq,
+                            )
                         logger.info(
                             "[%s] AnimeAnchor: built %d per-frame anchors (subtype=%s)",
                             job_id, len(_anime_anchors_for_seg), _anime_subtype_pipe,
@@ -3487,18 +3570,39 @@ async def _run_analysis_inner(job_id: str):
                                 )
                                 _clip_content_type = ClipContentType.GENERIC
 
-                            # Conditional object/saliency detection by content type
-                            # (still gated behind CLIPAI_CONTENT_ROUTING=on)
-                            if _content_routing == "on" and _clip_content_type in (
-                                ClipContentType.ANIMATION, ClipContentType.ANIMATION_DIALOGUE,
-                                ClipContentType.MUSIC_VIDEO, ClipContentType.GENERIC,
-                            ):
+                            # Conditional object/saliency detection by content type.
+                            # Sports variants ALWAYS get object detection regardless
+                            # of the CLIPAI_CONTENT_ROUTING gate — required_regions
+                            # uses ball / car bboxes as preferred anchors on frames
+                            # where no face exists.
+                            _sports_types = (
+                                ClipContentType.SPORTS,
+                                ClipContentType.SPORTS_BASKETBALL,
+                                ClipContentType.SPORTS_RACING,
+                            )
+                            _is_sports_clip = _clip_content_type in _sports_types
+                            _routed_types = (
+                                ClipContentType.ANIMATION,
+                                ClipContentType.ANIMATION_DIALOGUE,
+                                ClipContentType.MUSIC_VIDEO,
+                                ClipContentType.GENERIC,
+                            )
+                            _should_detect_objects = (
+                                _is_sports_clip
+                                or (_content_routing == "on" and _clip_content_type in _routed_types)
+                            )
+                            if _should_detect_objects:
                                 try:
                                     from backend.services.object_detector import detect_objects_in_frames
                                     _frame_list_obj = [(f.timestamp, f.path) for f in frames]
                                     _solver_objects = detect_objects_in_frames(_frame_list_obj, face_results)
-                                    logger.info("[%s] Content-routed object detection: %d objects",
-                                                job_id, len(_solver_objects))
+                                    logger.info(
+                                        "[%s] Content-routed object detection: %d objects "
+                                        "(content_type=%s, sports_forced=%s)",
+                                        job_id, len(_solver_objects),
+                                        _clip_content_type.value,
+                                        _is_sports_clip,
+                                    )
                                 except Exception as _oe:
                                     logger.warning("[%s] Content-routed object detection failed: %s", job_id, _oe)
 

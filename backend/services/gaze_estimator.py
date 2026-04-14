@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 # ── Phase 4 feature flag ────────────────────────────────────────
 USE_GAZE_LEAD_ROOM_V2 = os.environ.get(
-    "CLIPAI_GAZE_LEAD_ROOM_V2", "0",
+    "CLIPAI_GAZE_LEAD_ROOM_V2", "1",
 ).lower() in ("1", "true", "yes", "on")
 
 

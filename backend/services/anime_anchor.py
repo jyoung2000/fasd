@@ -59,7 +59,7 @@ logger = logging.getLogger(__name__)
 # ──────────────────── Feature flag ────────────────────
 
 USE_ANIME_ANCHOR = os.environ.get(
-    "CLIPAI_ANIME_ANCHOR", "0",
+    "CLIPAI_ANIME_ANCHOR", "1",
 ).lower() in ("1", "true", "yes", "on")
 
 
@@ -231,6 +231,50 @@ def score_anime_sequence(
         score_anime_frame(f, anime_subtype=anime_subtype)
         for f in features_seq
     ]
+
+
+def snap_to_impact_frames(
+    anchors: list[AnimeAnchor],
+    features_seq: list,
+    *,
+    fps: float = 24.0,
+    pre_impact_frames: int = 2,
+    peak_threshold: float = 0.3,
+) -> list[AnimeAnchor]:
+    """Shift anchor hold start back by ``pre_impact_frames`` on motion
+    peaks so anime action fights capture the wind-up before the blur.
+
+    A local maximum is defined as a frame where ``motion_energy`` is
+    greater than both neighbors on each side AND above ``peak_threshold``.
+
+    The parallel ``features_seq`` carries motion_energy; ``anchors``
+    and ``features_seq`` must be 1:1 by index. Returns a new list (the
+    original anchors are not mutated except for peak-adjacent entries
+    whose timestamps are shifted).
+    """
+    if len(anchors) < 5 or len(features_seq) != len(anchors):
+        return anchors
+    import dataclasses
+    pre_shift = pre_impact_frames / max(fps, 1.0)
+    energies = [
+        float(getattr(f, "motion_energy", 0.0) or 0.0)
+        for f in features_seq
+    ]
+    out = list(anchors)
+    for i in range(2, len(out) - 2):
+        if (
+            energies[i] > peak_threshold
+            and energies[i] > energies[i - 1]
+            and energies[i] > energies[i - 2]
+            and energies[i] > energies[i + 1]
+            and energies[i] > energies[i + 2]
+        ):
+            prev = out[i - 1]
+            new_ts = max(0.0, float(prev.timestamp) - pre_shift)
+            out[i - 1] = dataclasses.replace(
+                prev, timestamp=new_ts, source="pre_impact_hold",
+            )
+    return out
 
 
 # ──────────────────── Per-segment aggregator ────────────────────

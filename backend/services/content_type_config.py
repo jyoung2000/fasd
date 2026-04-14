@@ -19,6 +19,8 @@ class ContentType(str, Enum):
     GAMING = "gaming"
     VLOG = "vlog"
     SPORTS = "sports"
+    SPORTS_BASKETBALL = "sports_basketball"
+    SPORTS_RACING = "sports_racing"
     MUSIC_VIDEO = "music_video"
     ANIME = "anime"
     ANIMATION_DIALOGUE = "animation_dialogue"
@@ -145,6 +147,47 @@ CONTENT_TYPE_CONFIG = {
         # Intent tracking — snappy, fast cuts demand fast response
         "intent_ema_alpha": 0.55,
         "intent_switch_margin": 0.10,
+    },
+    ContentType.SPORTS_BASKETBALL: {
+        "apply_lead_room": False,
+        "wide_master_on_multi_face": True,
+        "allow_tracking": True,
+        "allow_motion_tracking": True,
+        "use_split_screen_on_overlap": False,
+        "prefer_wide_master": True,
+        "preserve_scoreboard": True,
+        "tracking_max_velocity_pct_per_sec": 35.0,  # ball moves very fast
+        "fallback_preference": "blur_fill",
+        "ease_speaker_turn_ms": 0,
+        "ease_shot_cut_ms": 0,
+        "ease_subject_walk_ms": 0,
+        "speaker_confidence_threshold": 0.6,
+        "speaker_coverage_threshold": 0.60,
+        "dense_dominance_threshold": 0.70,
+        "multi_speaker_threshold": 0.20,
+        "intent_ema_alpha": 0.60,
+        "intent_switch_margin": 0.08,
+    },
+    ContentType.SPORTS_RACING: {
+        "apply_lead_room": False,
+        "wide_master_on_multi_face": True,
+        "allow_tracking": True,
+        "allow_motion_tracking": True,
+        "use_split_screen_on_overlap": False,
+        "prefer_wide_master": True,
+        "preserve_scoreboard": True,
+        "prefer_lower_third": True,
+        "tracking_max_velocity_pct_per_sec": 30.0,
+        "fallback_preference": "blur_fill",
+        "ease_speaker_turn_ms": 0,
+        "ease_shot_cut_ms": 0,
+        "ease_subject_walk_ms": 0,
+        "speaker_confidence_threshold": 0.6,
+        "speaker_coverage_threshold": 0.60,
+        "dense_dominance_threshold": 0.70,
+        "multi_speaker_threshold": 0.20,
+        "intent_ema_alpha": 0.45,
+        "intent_switch_margin": 0.12,
     },
     ContentType.MUSIC_VIDEO: {
         "apply_lead_room": False,

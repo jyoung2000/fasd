@@ -67,7 +67,8 @@ async def _stream_multipart_to_disk(
       - A 1 MB write buffer batches small safe-flushes into fewer syscalls.
 
     Returns (total_bytes_written, original_filename, language, subtitle_language,
-             content_type_override, game_type, anime_subtype, music_subtype).
+             content_type_override, game_type, anime_subtype, music_subtype,
+             sports_subtype).
     """
     boundary_bytes = f"--{boundary}".encode()
     crlf = b"\r\n"
@@ -80,6 +81,7 @@ async def _stream_multipart_to_disk(
     game_type = ""
     anime_subtype = ""
     music_subtype = ""
+    sports_subtype = ""
     total_bytes = 0
     out_file = None
     write_buf = bytearray()
@@ -177,6 +179,8 @@ async def _stream_multipart_to_disk(
                                 anime_subtype = field_data.decode("utf-8", errors="replace").strip()
                             if field_name == "music_subtype":
                                 music_subtype = field_data.decode("utf-8", errors="replace").strip()
+                            if field_name == "sports_subtype":
+                                sports_subtype = field_data.decode("utf-8", errors="replace").strip()
                             in_field_part = False
 
                         del buf[:next_bnd]
@@ -211,6 +215,7 @@ async def _stream_multipart_to_disk(
         game_type,
         anime_subtype,
         music_subtype,
+        sports_subtype,
     )
 
 
@@ -262,6 +267,7 @@ async def upload_video(
             game_type,
             anime_subtype,
             music_subtype,
+            sports_subtype,
         ) = await _stream_multipart_to_disk(
             request, boundary, tmp_path,
         )
@@ -308,6 +314,7 @@ async def upload_video(
     gt = game_type.strip().lower() if game_type else ""
     anime_sub = anime_subtype.strip().lower() if anime_subtype else ""
     music_sub = music_subtype.strip().lower() if music_subtype else ""
+    sports_sub = sports_subtype.strip().lower() if sports_subtype else ""
 
     now = datetime.now(timezone.utc).isoformat()
     job = JobResult(
@@ -321,6 +328,7 @@ async def upload_video(
         game_type=gt,
         anime_subtype=anime_sub,
         music_subtype=music_sub,
+        sports_subtype=sports_sub,
         status=JobStatus.QUEUED,
         progress=0,
         progress_message="Uploaded, waiting for analysis",

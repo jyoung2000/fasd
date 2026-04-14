@@ -115,6 +115,28 @@ def _get_content_params():
             prefer_stationary=False,
             shot_threshold=27.0,
         ),
+        # ── Sports presets ──
+        ClipContentType.SPORTS: SolverParams(
+            smoothing_alpha=0.45,
+            panning_residual_threshold=0.10,
+            stationary_slack=0.05,
+            prefer_stationary=False,
+            shot_threshold=20.0,
+        ),
+        ClipContentType.SPORTS_BASKETBALL: SolverParams(
+            smoothing_alpha=0.50,
+            panning_residual_threshold=0.12,
+            stationary_slack=0.03,
+            prefer_stationary=False,
+            shot_threshold=18.0,
+        ),
+        ClipContentType.SPORTS_RACING: SolverParams(
+            smoothing_alpha=0.40,
+            panning_residual_threshold=0.08,
+            stationary_slack=0.08,
+            prefer_stationary=False,
+            shot_threshold=22.0,
+        ),
     }
 
 

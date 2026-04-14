@@ -52,6 +52,13 @@ class ClipContentType(str, Enum):
     GAMEPLAY_TPS = "gameplay_tps"      # third-person action (GTA, Elden Ring)
     GAMEPLAY_RACING = "gameplay_racing"  # racing / driving
     STREAM = "stream"                  # facecam + gameplay
+    # ── Sports sub-categories ──
+    # Dedicated solver tuning + object-tracking integration for broadcast
+    # sports highlights. Basketball tracks ball/player; racing anchors on
+    # the lead car in the lower third.
+    SPORTS = "sports"                  # generic sport (broadcast highlights)
+    SPORTS_BASKETBALL = "sports_basketball"
+    SPORTS_RACING = "sports_racing"
     GENERIC = "generic"
 
 
@@ -65,7 +72,7 @@ _CONTENT_TYPE_MAP = {
     ContentType.MUSIC_VIDEO.value: ClipContentType.MUSIC_VIDEO,
     ContentType.GAMING.value: ClipContentType.GAMEPLAY,
     ContentType.NARRATIVE.value: ClipContentType.GENERIC,
-    ContentType.SPORTS.value: ClipContentType.GENERIC,
+    ContentType.SPORTS.value: ClipContentType.SPORTS,
     ContentType.UNKNOWN.value: ClipContentType.GENERIC,
 }
 
@@ -107,6 +114,10 @@ class ContentProfile:
     # Drives ClipContentType.GAMEPLAY_* routing in classify_clip. Phase
     # 7 uses this to pick per-genre action centers.
     gameplay_subtype: Optional[str] = None
+    # sports_subtype: "basketball" | "racing" | None. Drives
+    # ClipContentType.SPORTS_BASKETBALL / SPORTS_RACING routing for
+    # per-sport solver tuning + object tracking (ball, car).
+    sports_subtype: Optional[str] = None
     # game_type: free-form game key from the existing game sub-dropdown
     # (e.g. "valorant", "league_of_legends"). Plumbed end-to-end so
     # Phase 7 can look up GAME_HUD_LAYOUTS without re-reading the job.
@@ -169,6 +180,7 @@ def classify_content(
         from backend.services.content_type_strings import (
             normalize_anime_subtype,
             normalize_music_subtype,
+            normalize_sports_subtype,
             normalize_ui_content_type,
         )
 
@@ -200,6 +212,14 @@ def classify_content(
             # (gameplay_moba → "moba"); always trust the normalized
             # value rather than a separate metadata field.
             profile.gameplay_subtype = normalized.gameplay_subtype
+            # Sports subtype: trust the token's encoded value first,
+            # then allow a separate metadata override for callers that
+            # pass the bare "sports" token.
+            if normalized.content_type == ContentType.SPORTS:
+                profile.sports_subtype = (
+                    normalized.sports_subtype
+                    or normalize_sports_subtype(metadata.get("sports_subtype"))
+                )
             profile.game_type = (metadata.get("game_type") or "").strip().lower()
             profile.signals = {
                 "user_override": normalized.raw,
@@ -209,11 +229,12 @@ def classify_content(
                 "anime_subtype": profile.anime_subtype,
                 "music_subtype": profile.music_subtype,
                 "gameplay_subtype": profile.gameplay_subtype,
+                "sports_subtype": profile.sports_subtype,
                 "game_type": profile.game_type or None,
             }
             _log(
                 "user override %r → %s (conf=1.00, panel=%s, animated=%s, "
-                "anime_sub=%s, music_sub=%s, gameplay_sub=%s, game=%s)",
+                "anime_sub=%s, music_sub=%s, gameplay_sub=%s, sports_sub=%s, game=%s)",
                 normalized.raw,
                 normalized.content_type.value,
                 normalized.is_multi_speaker_panel,
@@ -221,6 +242,7 @@ def classify_content(
                 profile.anime_subtype,
                 profile.music_subtype,
                 profile.gameplay_subtype,
+                profile.sports_subtype,
                 profile.game_type or None,
             )
             return profile
@@ -231,8 +253,8 @@ def classify_content(
     signals["cut_rate"] = round(cut_rate, 1)
 
     if cut_rate >= 10:
-        scores["narrative"] += 3.0
-        scores["sports"] += 1.0
+        scores["narrative"] += 2.0   # reduced from 3.0 (was swallowing sports)
+        scores["sports"] += 2.5      # increased from 1.0
     elif 2 < cut_rate < 10:
         scores["vlog"] += 1.5
         scores["narrative"] += 1.0
@@ -343,6 +365,20 @@ def classify_content(
             else:
                 profile.motion_profile = "high"
                 scores["sports"] += 0.5
+
+    # ── Signal 8: Sports motion signature ──
+    # Broadcast sports: many frames show players from behind, wide-angle
+    # court/field shots, or the ball alone — all with zero detected
+    # faces. Combined with high face x-stdev on frames that DO have
+    # faces, this is the strongest sports discriminator against
+    # narrative.
+    if (
+        signals.get("zero_face_pct", 0) > 0.40
+        and signals.get("face_x_stdev", 0) > 12
+        and cut_rate >= 8
+    ):
+        scores["sports"] = scores.get("sports", 0) + 3.0
+        signals["sports_motion_signature"] = True
 
     # ── Signal 7: Music video detection ──
     # Very high cut rate + low speech fraction signals music video
@@ -627,6 +663,23 @@ def classify_clip(
             base_type = ClipContentType.STREAM
         elif gameplay_sub == "fps":
             base_type = ClipContentType.GAMEPLAY
+        # Sports sub-type routing: promote to per-sport ClipContentType
+        # so the solver params + object-tracking fallbacks pick up the
+        # right behavior.
+        sports_sub = getattr(content_profile, "sports_subtype", None)
+        if base_type == ClipContentType.SPORTS:
+            if sports_sub == "basketball":
+                base_type = ClipContentType.SPORTS_BASKETBALL
+                logger.info(
+                    "[ContentClassifier] sports_subtype=basketball → "
+                    "SPORTS_BASKETBALL",
+                )
+            elif sports_sub == "racing":
+                base_type = ClipContentType.SPORTS_RACING
+                logger.info(
+                    "[ContentClassifier] sports_subtype=racing → "
+                    "SPORTS_RACING",
+                )
         # Fix 3: MULTI_SPEAKER_PANEL promotion takes precedence over
         # CINEMATIC_DIALOGUE and the animation branch below — a seated
         # panel is a panel regardless of whether the raw classifier

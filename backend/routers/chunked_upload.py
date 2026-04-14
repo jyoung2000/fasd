@@ -62,6 +62,8 @@ class InitRequest(BaseModel):
     # "auto" — let the heuristic classifier decide.
     anime_subtype: str = ""
     music_subtype: str = ""
+    # Sports sub-dropdown: "basketball" | "racing" | "" (auto).
+    sports_subtype: str = ""
     chunk_size: Optional[int] = None
 
 
@@ -199,6 +201,7 @@ async def init_upload(req: InitRequest):
         "game_type": req.game_type,
         "anime_subtype": req.anime_subtype,
         "music_subtype": req.music_subtype,
+        "sports_subtype": req.sports_subtype,
         "ext": ext,
         "chunk_size": chunk_size,
         "total_chunks": total_chunks,
@@ -536,6 +539,7 @@ async def _assemble_and_finalize(upload_id: str, job_id: str, file_hash: str):
     gt = info.get("game_type", "").strip().lower()
     anime_sub = info.get("anime_subtype", "").strip().lower()
     music_sub = info.get("music_subtype", "").strip().lower()
+    sports_sub = info.get("sports_subtype", "").strip().lower()
 
     logger.info("[%s] Upload complete: %s → %s (%.1f MB, QA: %s)",
                 upload_id, filename, video_path, file_size_mb,
@@ -553,6 +557,7 @@ async def _assemble_and_finalize(upload_id: str, job_id: str, file_hash: str):
         game_type=gt,
         anime_subtype=anime_sub,
         music_subtype=music_sub,
+        sports_subtype=sports_sub,
         status=JobStatus.QUEUED,
         progress=0,
         progress_message="Uploaded, waiting for analysis",

@@ -49,7 +49,7 @@ from typing import Optional
 # ── Feature flag ─────────────────────────────────────────────────
 
 USE_THIRDS_BIAS = os.environ.get(
-    "CLIPAI_THIRDS_BIAS", "0",
+    "CLIPAI_THIRDS_BIAS", "1",
 ).lower() in ("1", "true", "yes", "on")
 
 

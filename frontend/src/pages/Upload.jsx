@@ -313,6 +313,7 @@ export default function Upload() {
   // values server-side via normalize_anime_subtype / normalize_music_subtype.
   const [animeSubtype, setAnimeSubtype] = useState('');
   const [musicSubtype, setMusicSubtype] = useState('');
+  const [sportsSubtype, setSportsSubtype] = useState('');
   const [uploading, setUploading] = useState(false);
   const [uploadDone, setUploadDone] = useState(false);
   const [progress, setProgress] = useState(0);
@@ -502,6 +503,7 @@ export default function Upload() {
             game_type: gameType,
             anime_subtype: animeSubtype,
             music_subtype: musicSubtype,
+            sports_subtype: sportsSubtype,
             chunk_size: CHUNK_SIZE,
           }),
         });
@@ -1157,7 +1159,9 @@ export default function Upload() {
               <option value="stream">Stream / Facecam + Gameplay</option>
             </optgroup>
             <optgroup label="Sports">
-              <option value="sports">Sports broadcast</option>
+              <option value="sports">Sports — Auto-detect</option>
+              <option value="sports_basketball">Sports — Basketball</option>
+              <option value="sports_racing">Sports — Racing / Motorsport</option>
             </optgroup>
           </select>
         </div>
@@ -1229,6 +1233,40 @@ export default function Upload() {
           </select>
           <p style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 4 }}>
             Performance and narrative use beat-snapped pulse cuts; Lyric stays static.
+          </p>
+        </div>
+      )}
+
+      {/* Sports sub-type selector */}
+      {selectedFile && !uploading && contentTypeOverride === 'sports' && (
+        <div style={{ marginTop: 12 }}>
+          <label
+            htmlFor="sports-subtype-select"
+            style={{ display: 'block', fontSize: 13, color: 'var(--text-secondary)', marginBottom: 6 }}
+          >
+            Sport
+          </label>
+          <select
+            id="sports-subtype-select"
+            value={sportsSubtype}
+            onChange={(e) => setSportsSubtype(e.target.value)}
+            style={{
+              width: '100%',
+              padding: '10px 12px',
+              background: 'var(--bg-panel)',
+              color: 'var(--text-primary)',
+              border: '1px solid var(--border)',
+              fontSize: 14,
+              borderRadius: 'var(--radius-sm)',
+              outline: 'none',
+            }}
+          >
+            <option value="">Auto-detect sport</option>
+            <option value="basketball">Basketball</option>
+            <option value="racing">Racing / Motorsport</option>
+          </select>
+          <p style={{ fontSize: 11, color: 'var(--text-tertiary)', marginTop: 4 }}>
+            Basketball tracks the ball + players. Racing anchors on the lead car in the lower third.
           </p>
         </div>
       )}

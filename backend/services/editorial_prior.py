@@ -52,7 +52,7 @@ logger = logging.getLogger(__name__)
 # ──────────────────── Feature flag ────────────────────
 
 USE_EDITORIAL_PRIOR = os.environ.get(
-    "CLIPAI_EDITORIAL_PRIOR", "0",
+    "CLIPAI_EDITORIAL_PRIOR", "1",
 ).lower() in ("1", "true", "yes", "on")
 
 

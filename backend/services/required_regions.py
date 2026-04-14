@@ -120,6 +120,26 @@ def _is_animated_mode(content_type) -> bool:
     return val in ("animation", "animation_dialogue")
 
 
+def _sports_mode_kind(content_type) -> str:
+    """Return the sports sub-kind: "basketball" | "racing" | "sports" | "".
+
+    Empty string = not a sports content type. Used to inject object
+    regions (ball / car) as preferred anchors on frames where no face
+    region exists so the solver doesn't drift to background during a
+    player-from-behind shot or mid-air ball frame.
+    """
+    if content_type is None:
+        return ""
+    val = getattr(content_type, "value", content_type)
+    if val == "sports_basketball":
+        return "basketball"
+    if val == "sports_racing":
+        return "racing"
+    if val == "sports":
+        return "sports"
+    return ""
+
+
 @dataclass
 class _FrameSaliencyAdapter:
     """FrameSaliency-compatible wrapper built from a group of
@@ -283,6 +303,7 @@ def build_required_regions(
 
     dialogue_mode = _is_dialogue_mode(content_type)
     animated_mode = _is_animated_mode(content_type)
+    sports_kind = _sports_mode_kind(content_type)
 
     # ── Attention anchor stream ──
     # For dialogue modes (live-action and animated), build a dense
@@ -477,6 +498,87 @@ def build_required_regions(
             )
             if not _overlaps_any(candidate, frame_regions, 0.3):
                 frame_regions.append(candidate)
+
+        # ── Sports object regions (preferred tier) ──
+        # For broadcast sports, inject ball / car bboxes as preferred
+        # anchors on frames with no face region so the solver stays
+        # near the play instead of drifting to background stands or
+        # empty track.
+        if sports_kind:
+            _has_required = any(
+                r.tier == "required" for r in frame_regions
+            )
+            if not _has_required:
+                _frame_objs = obj_by_time.get(ts_key, [])
+                _best_obj = None
+                _best_weight = 0.0
+                _bias_lower_third = False
+                if sports_kind == "basketball":
+                    _balls = [
+                        o for o in _frame_objs
+                        if getattr(o, "class_name", "") == "sports ball"
+                    ]
+                    if _balls:
+                        _best_obj = max(
+                            _balls,
+                            key=lambda o: float(getattr(o, "confidence", 0.0)),
+                        )
+                        _best_weight = 0.5
+                    else:
+                        _persons = [
+                            o for o in _frame_objs
+                            if getattr(o, "class_name", "") == "person"
+                        ]
+                        if _persons:
+                            _best_obj = max(
+                                _persons,
+                                key=lambda o: (
+                                    float(getattr(o, "w", 0)) * float(getattr(o, "h", 0))
+                                    * float(getattr(o, "confidence", 0.0))
+                                ),
+                            )
+                            _best_weight = 0.3
+                elif sports_kind == "racing":
+                    _vehicles = [
+                        o for o in _frame_objs
+                        if getattr(o, "class_name", "") in ("car", "truck", "motorcycle")
+                    ]
+                    if _vehicles:
+                        _best_obj = max(
+                            _vehicles,
+                            key=lambda o: float(getattr(o, "w", 0)) * float(getattr(o, "h", 0)),
+                        )
+                        _best_weight = 0.6
+                        _bias_lower_third = True
+                else:
+                    if _frame_objs:
+                        _best_obj = max(
+                            _frame_objs,
+                            key=lambda o: (
+                                float(getattr(o, "w", 0)) * float(getattr(o, "h", 0))
+                                * float(getattr(o, "confidence", 0.0))
+                            ),
+                        )
+                        _best_weight = 0.35
+                if _best_obj is not None:
+                    _cx = float(getattr(_best_obj, "x", 50)) / 100.0
+                    _cy = float(getattr(_best_obj, "y", 50)) / 100.0
+                    _hw = (float(getattr(_best_obj, "w", 15)) / 100.0) / 2.0
+                    _hh = (float(getattr(_best_obj, "h", 15)) / 100.0) / 2.0
+                    if _bias_lower_third:
+                        _cy = min(0.75, max(0.55, _cy))
+                    candidate = RequiredRegion(
+                        timestamp=ff.timestamp,
+                        cx=_cx, cy=_cy,
+                        half_width=max(_hw, 0.05),
+                        half_height=max(_hh, 0.05),
+                        score=_best_weight,
+                        tier="preferred",
+                        source="object",
+                        weight=_best_weight,
+                    )
+                    if not _overlaps_any(candidate, frame_regions, 0.3):
+                        frame_regions.append(candidate)
 
         # ── Saliency regions: preferred tier ──
         sal_frame = sal_by_time.get(ts_key)

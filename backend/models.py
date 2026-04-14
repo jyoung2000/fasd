@@ -178,6 +178,10 @@ class JobResult(BaseModel):
     # Phase 2 music-video sub-dropdown: "performance" | "narrative" | "lyric" | "" (auto).
     # Phase 5 reads this to set beat-snap aggressiveness.
     music_subtype: str = ""
+    # Sports sub-dropdown: "basketball" | "racing" | "" (auto).
+    # Drives classify_clip SPORTS_BASKETBALL / SPORTS_RACING routing
+    # and the per-sport solver params + object-tracking fallbacks.
+    sports_subtype: str = ""
     filler_events: list[dict] = []  # [{start, end, type, text}] from filler word detection
     emphasis_keywords: list[str] = []  # Words to highlight in captions
     thumbnail_path: Optional[str] = None  # Absolute path to OG preview thumbnail JPG

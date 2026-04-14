@@ -179,6 +179,36 @@ def build_reframe_segments(
     _apply_lead_room = cfg.get("apply_lead_room", False) if cfg else False
     _allow_motion_tracking = cfg.get("allow_motion_tracking", False) if cfg else False
 
+    # ── Music-video subtype tuning ──
+    # Narrative/lyric/performance sub-types each tweak a handful of
+    # knobs that were otherwise identical for the entire music_video
+    # bucket. These overrides mirror the fields the config would have
+    # supplied if each subtype had its own CONTENT_TYPE_CONFIG entry.
+    _music_subtype = (
+        getattr(content_profile, "music_subtype", None)
+        if content_profile else None
+    )
+    if ct == "music_video" and _music_subtype:
+        if _music_subtype == "narrative":
+            # Narrative MV = cinematic dialogue rules: lead room on,
+            # slower ease on speaker turns, wide on multi-face shots.
+            _apply_lead_room = True
+            _ease_speaker_ms = 500
+            _wide_on_multi = True
+        elif _music_subtype == "lyric":
+            # Lyric video: center-hold, no cuts on speaker turn,
+            # long min hold (the camera basically doesn't move).
+            _apply_lead_room = False
+            _ease_speaker_ms = 0
+            _wide_on_multi = False
+            _min_hold = max(_min_hold, 3.0)
+        elif _music_subtype == "performance":
+            # Performance MV: snap cuts on beat, wide on group shots,
+            # no lead-room offset (vocalist is usually centered).
+            _apply_lead_room = False
+            _wide_on_multi = True
+            _ease_speaker_ms = 0
+
     # ── Initialize subject confidence estimator ──
     _confidence_estimator = None
     try:
@@ -1769,6 +1799,48 @@ def build_reframe_segments(
             music_snap_count, pulse_cut_count,
         )
 
+    # ── Stage 11b: Music-video formation shot detection ──
+    # When ≥3 faces span ≥55% of the frame width in a majority of the
+    # segment's dense frames, we're looking at a group choreography
+    # shot. A single-face crop there shoves 2 dancers off-screen and
+    # destroys the composition — force wide_master instead.
+    formation_wide_count = 0
+    try:
+        if ct == "music_video" and dense_faces:
+            for seg in raw_segments:
+                if seg.layout in (
+                    "wide_master", "split", "grid", "blur_fill",
+                    "stacked_gameplay",
+                ):
+                    continue
+                _window = [
+                    df for df in dense_faces
+                    if seg.start <= df.timestamp < seg.end
+                ]
+                if not _window:
+                    continue
+                _formation_count = sum(
+                    1 for df in _window if _is_group_formation_frame(df)
+                )
+                if _formation_count / len(_window) >= 0.5:
+                    seg.layout = "wide_master"
+                    seg.strategy = "wide_master"
+                    seg.active_slot = None
+                    seg.subject_x = source_width / 2.0
+                    seg.reason = "formation_shot"
+                    seg.confidence = max(seg.confidence, 0.9)
+                    formation_wide_count += 1
+    except Exception as e:
+        logger.warning(
+            "[%s] Formation-shot detection failed (non-fatal): %s",
+            job_id, e,
+        )
+    if formation_wide_count > 0:
+        _log(
+            "MusicFormation: %d segments set to WIDE_MASTER (group choreography)",
+            formation_wide_count,
+        )
+
     # ── Exit: enforce half-open [start, end) contiguity ──
     # Sort, snap adjacent boundaries to exact equality, and assert no overlaps.
     raw_segments.sort(key=lambda s: s.start)
@@ -2129,6 +2201,23 @@ def _is_multi_speaker_crowd(
     active_slots = sum(1 for cnt in slot_counts.values()
                        if cnt / total >= MULTI_SPEAKER_THRESHOLD)
     return active_slots >= 3
+
+
+def _is_group_formation_frame(frame_faces, min_span_pct: float = 55.0) -> bool:
+    """Return True when 3+ faces are spread across ≥min_span_pct of frame width.
+
+    Signals group choreography (ensemble performance, dance formation)
+    where a tight single-face crop destroys the composition. Human
+    editors hold wide in these cases.
+
+    ``frame_faces`` is a dense_face record with ``.faces`` where each
+    face has ``.nose_x`` in 0-100 percent.
+    """
+    faces = getattr(frame_faces, "faces", []) or []
+    if len(faces) < 3:
+        return False
+    xs = [float(getattr(f, "nose_x", 50)) for f in faces]
+    return (max(xs) - min(xs)) >= min_span_pct
 
 
 def _slot_to_x(active_slot: Optional[int], face_registry, source_width: int = 1920) -> float:

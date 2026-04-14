@@ -59,7 +59,7 @@ logger = logging.getLogger(__name__)
 # ──────────────────── Feature flag ────────────────────
 
 USE_GAMEPLAY_TRACKER = os.environ.get(
-    "CLIPAI_GAMEPLAY_TRACKER", "0",
+    "CLIPAI_GAMEPLAY_TRACKER", "1",
 ).lower() in ("1", "true", "yes", "on")
 
 

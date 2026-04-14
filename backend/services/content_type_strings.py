@@ -83,6 +83,7 @@ class NormalizedContentType:
     anime_subtype: Optional[str] = None
     music_subtype: Optional[str] = None
     gameplay_subtype: Optional[str] = None
+    sports_subtype: Optional[str] = None
     is_gameplay_fastpath: bool = False
     raw: str = ""
 
@@ -156,6 +157,22 @@ _UI_TO_ENUM: dict[str, dict] = {
         "gameplay_subtype": "stream",
     },
     "sports": {"content_type": ContentType.SPORTS},
+    "sports_basketball": {
+        "content_type": ContentType.SPORTS,
+        "sports_subtype": "basketball",
+    },
+    "sports_racing": {
+        "content_type": ContentType.SPORTS,
+        "sports_subtype": "racing",
+    },
+    "basketball": {
+        "content_type": ContentType.SPORTS,
+        "sports_subtype": "basketball",
+    },
+    "racing": {
+        "content_type": ContentType.SPORTS,
+        "sports_subtype": "racing",
+    },
 
     # ── Special no-op tokens ──
     "": None,
@@ -172,6 +189,9 @@ _VALID_ANIME_SUBTYPES: frozenset[str] = frozenset({
 })
 _VALID_MUSIC_SUBTYPES: frozenset[str] = frozenset({
     "performance", "narrative", "lyric", "auto",
+})
+_VALID_SPORTS_SUBTYPES: frozenset[str] = frozenset({
+    "basketball", "racing", "auto",
 })
 
 
@@ -213,6 +233,22 @@ def normalize_music_subtype(value: Optional[str]) -> Optional[str]:
     return key
 
 
+def normalize_sports_subtype(value: Optional[str]) -> Optional[str]:
+    """Validate a ``sports_subtype`` UI value. See ``normalize_anime_subtype``."""
+    if not value:
+        return None
+    key = str(value).strip().lower()
+    if not key or key == "auto":
+        return None
+    if key not in _VALID_SPORTS_SUBTYPES:
+        logger.debug(
+            "content_type_strings: unknown sports_subtype %r — ignoring",
+            value,
+        )
+        return None
+    return key
+
+
 def normalize_ui_content_type(token: Optional[str]) -> Optional[NormalizedContentType]:
     """Normalize a UI content-type token to an enum + flag bundle.
 
@@ -247,6 +283,7 @@ def normalize_ui_content_type(token: Optional[str]) -> Optional[NormalizedConten
         anime_subtype=spec.get("anime_subtype"),
         music_subtype=spec.get("music_subtype"),
         gameplay_subtype=spec.get("gameplay_subtype"),
+        sports_subtype=spec.get("sports_subtype"),
         is_gameplay_fastpath=bool(spec.get("gameplay_fastpath", False)),
         raw=key,
     )
