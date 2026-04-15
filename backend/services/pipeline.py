@@ -15,9 +15,16 @@ from backend import database
 from backend.services.frame_extractor import (
     get_video_metadata,
     extract_frames,
+    extract_frames_at_timestamps,
     extract_audio,
     frame_to_base64,
 )
+from backend.services.adaptive_frame_sampler import (
+    AdaptiveSamplingInputs,
+    adaptive_sampling_enabled,
+    compute_adaptive_frame_times,
+)
+from backend.services.vlm_fusion import apply_fusion_to_scene, fusion_enabled
 from backend.services.transcription import transcribe_audio, transcribe_audio_subprocess
 from backend.services.ai_orchestrator import AIOrchestrator
 from backend.services.prompts import load_prompts
@@ -2229,6 +2236,82 @@ async def _run_analysis_inner(job_id: str):
                 JobStatus.ANALYZING_SCENES,
                 f"Analyzing frame {frames_done}/{frames_total} via {provider_name} ({pct}%)")
 
+        # ── Phase 4 adaptive VLM frame sampling ──
+        # After the uniform-stride extractor + face detect have run,
+        # we have shot cuts and a face-conf timeline. Compute an
+        # adaptive schedule and, if it is meaningfully smaller than
+        # the uniform set, re-extract just those frames for VLM
+        # analysis. The uniform set is kept for face/ASD — only the
+        # VLM call uses the adaptive subset. ASD margin timeline and
+        # clip-candidate starts are not available at this call site
+        # (clip detection runs after scene analysis); the sampler
+        # degrades gracefully when those signals are empty.
+        vlm_frames = frames  # default: VLM analyzes the full uniform set
+        if adaptive_sampling_enabled() and metadata["duration"] > 60:
+            try:
+                _src_face = dense_face_results or face_results
+                face_conf_timeline = [
+                    (fr.timestamp, max((f.confidence for f in fr.faces), default=0.0))
+                    for fr in _src_face
+                ]
+                adaptive_inputs = AdaptiveSamplingInputs(
+                    duration_seconds=float(metadata["duration"]),
+                    shot_cuts=list(scene_cut_timestamps or []),
+                    face_conf_timeline=face_conf_timeline,
+                    asd_margin_timeline=[],
+                    clip_candidate_starts=[],
+                )
+                adaptive_ts = compute_adaptive_frame_times(adaptive_inputs)
+                # Only re-extract if the adaptive set is at least 25%
+                # smaller — otherwise the I/O cost outweighs the VLM
+                # savings.
+                if adaptive_ts and len(adaptive_ts) <= int(0.75 * len(frames)):
+                    adaptive_dir = os.path.join(
+                        os.path.dirname(frames_dir), "frames_adaptive",
+                    )
+                    try:
+                        vlm_frames = await extract_frames_at_timestamps(
+                            video_path, adaptive_dir, adaptive_ts,
+                            cancel_check=cancel_check,
+                            video_codec=metadata.get("codec_name", ""),
+                        )
+                        logger.info(
+                            "[%s] Adaptive VLM sampling: %d → %d frames (%.0f%% reduction)",
+                            job_id, len(frames), len(vlm_frames),
+                            100 * (1 - len(vlm_frames) / max(1, len(frames))),
+                        )
+                        # Attach face data to the adaptive frames
+                        # (nearest-neighbor by timestamp).
+                        if _src_face:
+                            face_by_ts = sorted(
+                                _src_face, key=lambda fr: fr.timestamp,
+                            )
+                            for vf in vlm_frames:
+                                nearest = min(
+                                    face_by_ts,
+                                    key=lambda fr: abs(fr.timestamp - vf.timestamp),
+                                )
+                                if abs(nearest.timestamp - vf.timestamp) < 1.5:
+                                    vf.face_data = nearest
+                    except Exception as adapt_err:
+                        logger.warning(
+                            "[%s] Adaptive extraction failed (%s) — falling back to uniform set",
+                            job_id, adapt_err,
+                        )
+                        vlm_frames = frames
+                else:
+                    logger.info(
+                        "[%s] Adaptive sampling skipped: schedule %d vs uniform %d "
+                        "(not >=25%% smaller)",
+                        job_id, len(adaptive_ts) if adaptive_ts else 0, len(frames),
+                    )
+            except Exception as adapt_outer_err:
+                logger.warning(
+                    "[%s] Adaptive sampling preparation failed (%s) — using uniform set",
+                    job_id, adapt_outer_err,
+                )
+                vlm_frames = frames
+
         # Phase 2 — content-type-aware vision routing. We pass the
         # user's explicit ``content_type_override`` (normalized) if
         # set; the OpenRouter provider uses that to swap in Qwen3-VL
@@ -2237,7 +2320,7 @@ async def _run_analysis_inner(job_id: str):
         # through the preset default unchanged.
         try:
             scenes_result, provider = await orchestrator.analyze_frames(
-                frames, job_id, progress_callback=_scene_progress,
+                vlm_frames, job_id, progress_callback=_scene_progress,
                 content_type=_normalized_override or None,
             )
         except CancelledError:
@@ -2884,35 +2967,81 @@ async def _run_analysis_inner(job_id: str):
                 # 3. Fallback → largest face with slot center snapping
                 is_closeup = (len(best_dfr.faces) == 1 and best_dfr.faces[0].width > 12.0)
 
-                if _is_continuous or is_closeup:
-                    # Dominant-subject / closeup: use raw face position (no slot snap)
-                    dominant = _select_dominant_face(best_dfr.faces)
-                    if dominant:
+                if fusion_enabled():
+                    # Phase 3 — confidence-weighted fusion. Pick the
+                    # best face candidate (same selection as legacy)
+                    # but blend with the VLM signal rather than
+                    # hard-overwriting. The legacy branches still
+                    # determine WHICH face we trust; fusion just
+                    # decides HOW MUCH.
+                    best_face = None
+                    if _is_continuous or is_closeup:
+                        best_face = _select_dominant_face(best_dfr.faces)
+                    elif face_registry and face_registry.multi_speaker:
+                        speaking = [f for f in best_dfr.faces if f.lip_aperture > 0.03]
+                        if speaking:
+                            best_face = max(speaking, key=lambda f: f.lip_aperture)
+                        elif best_dfr.primary_face_idx >= 0:
+                            best_face = best_dfr.faces[best_dfr.primary_face_idx]
+                    elif best_dfr.primary_face_idx >= 0:
+                        best_face = best_dfr.faces[best_dfr.primary_face_idx]
+
+                    if best_face is not None:
                         old_sx = scene.subject_x
-                        scene.subject_x = int(round(dominant.nose_x))
+                        # VLM signal — derived from the parsed
+                        # scene.subject_box if present (Phase 1
+                        # grounded output), else fall back to the
+                        # model's legacy subject_x.
+                        vlm_x = float(scene.subject_x)
+                        if scene.subject_box:
+                            box = scene.subject_box
+                            vlm_x = ((box[0] + box[2]) / 2.0) * 100.0
+                        vlm_conf = float(scene.vlm_confidence or 0.0)
+                        # If the VLM didn't report a confidence
+                        # (legacy parser), treat its subject_x as a
+                        # low-confidence hint.
+                        if vlm_conf == 0.0 and scene.subject_x != 50:
+                            vlm_conf = 0.5
+                        apply_fusion_to_scene(
+                            scene,
+                            face_x=float(best_face.nose_x),
+                            face_conf=float(best_face.confidence),
+                            vlm_x=vlm_x,
+                            vlm_conf=vlm_conf,
+                        )
                         if abs(old_sx - scene.subject_x) > 5:
                             enriched += 1
-                elif face_registry and face_registry.multi_speaker:
-                    # Multi-speaker: prefer active speaker, snap to slot center
-                    speaking = [f for f in best_dfr.faces if f.lip_aperture > 0.03]
-                    target_face = None
-                    if speaking:
-                        target_face = max(speaking, key=lambda f: f.lip_aperture)
-                    elif best_dfr.primary_face_idx >= 0:
-                        target_face = best_dfr.faces[best_dfr.primary_face_idx]
-                    if target_face:
-                        slot = face_registry.nearest_slot(target_face.nose_x)
-                        if slot:
+                else:
+                    # ── Legacy hard-override path (unchanged) ──
+                    if _is_continuous or is_closeup:
+                        # Dominant-subject / closeup: use raw face position (no slot snap)
+                        dominant = _select_dominant_face(best_dfr.faces)
+                        if dominant:
                             old_sx = scene.subject_x
-                            scene.subject_x = int(round(slot.x_center))
+                            scene.subject_x = int(round(dominant.nose_x))
                             if abs(old_sx - scene.subject_x) > 5:
                                 enriched += 1
-                elif best_dfr.primary_face_idx >= 0:
-                    primary = best_dfr.faces[best_dfr.primary_face_idx]
-                    old_sx = scene.subject_x
-                    scene.subject_x = int(round(primary.nose_x))
-                    if abs(old_sx - scene.subject_x) > 5:
-                        enriched += 1
+                    elif face_registry and face_registry.multi_speaker:
+                        # Multi-speaker: prefer active speaker, snap to slot center
+                        speaking = [f for f in best_dfr.faces if f.lip_aperture > 0.03]
+                        target_face = None
+                        if speaking:
+                            target_face = max(speaking, key=lambda f: f.lip_aperture)
+                        elif best_dfr.primary_face_idx >= 0:
+                            target_face = best_dfr.faces[best_dfr.primary_face_idx]
+                        if target_face:
+                            slot = face_registry.nearest_slot(target_face.nose_x)
+                            if slot:
+                                old_sx = scene.subject_x
+                                scene.subject_x = int(round(slot.x_center))
+                                if abs(old_sx - scene.subject_x) > 5:
+                                    enriched += 1
+                    elif best_dfr.primary_face_idx >= 0:
+                        primary = best_dfr.faces[best_dfr.primary_face_idx]
+                        old_sx = scene.subject_x
+                        scene.subject_x = int(round(primary.nose_x))
+                        if abs(old_sx - scene.subject_x) > 5:
+                            enriched += 1
         if enriched > 0:
             logger.info("[%s] Dense face data overrode subject_x on %d/%d scenes", job_id, enriched, len(scenes))
 

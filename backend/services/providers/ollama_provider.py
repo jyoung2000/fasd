@@ -57,6 +57,44 @@ VISION_CONCURRENCY = 1
 
 logger = logging.getLogger(__name__)
 
+# ── Phase 2 parity — content-type vision routing for Ollama ──
+# Maps content type → Ollama model id. All entries must be quantized
+# 4-bit variants that fit in <3GB VRAM (GTX 1650 has 4GB total and
+# qwen2.5:3b-instruct text model occupies ~1.8GB during co-residence).
+# Users without these models pulled fall through to OLLAMA_VISION_MODEL.
+_OLLAMA_CONTENT_TYPE_VISION_OVERRIDES = {
+    # Anime / animation: minicpm-v handles non-photographic content
+    # (cel-shaded faces, mascots) better than llava/moondream.
+    "anime": "minicpm-v:8b-2.6-q4_0",
+    "animation": "minicpm-v:8b-2.6-q4_0",
+    "anime_dialogue": "minicpm-v:8b-2.6-q4_0",
+    "animation_dialogue": "minicpm-v:8b-2.6-q4_0",
+    "cartoon": "minicpm-v:8b-2.6-q4_0",
+    # Gameplay: qwen2.5-vl handles HUDs / text-on-screen better than
+    # moondream's 1.8B. q4 fits in 4GB if text model is unloaded first.
+    "gameplay": "qwen2.5vl:7b-q4_K_M",
+    "gameplay_fps": "qwen2.5vl:7b-q4_K_M",
+    "gameplay_moba": "qwen2.5vl:7b-q4_K_M",
+    "gameplay_tps": "qwen2.5vl:7b-q4_K_M",
+    "gameplay_racing": "qwen2.5vl:7b-q4_K_M",
+    "stream": "qwen2.5vl:7b-q4_K_M",
+}
+
+
+def select_ollama_vision_model_for_content(content_type, preset_default: str) -> str:
+    """Return the Ollama vision model id for a given content type.
+
+    Mirrors ``openrouter_provider.select_vision_model_for_content``.
+    Unknown types always return the preset default
+    (``settings.OLLAMA_VISION_MODEL``).
+    """
+    if content_type is None:
+        return preset_default
+    key = getattr(content_type, "value", None) or str(content_type)
+    return _OLLAMA_CONTENT_TYPE_VISION_OVERRIDES.get(
+        key.lower(), preset_default,
+    )
+
 # ── Dynamic timeout & speed measurement ─────────────────────────────
 _measured_speeds: dict[str, dict] = {}  # model_name -> {"eval_tok_s": float, "gen_tok_s": float, "samples": int}
 
@@ -144,6 +182,9 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
     def __init__(self):
         self._host = settings.OLLAMA_HOST
         self._vision_model = settings.OLLAMA_VISION_MODEL
+        # Capture the configured default so ``apply_vision_model_override``
+        # can revert when ``content_type`` is None.
+        self._base_vision_model = settings.OLLAMA_VISION_MODEL
         self._text_model = settings.OLLAMA_TEXT_MODEL
         self._summary_model = self._text_model
         self._total_tokens = 0
@@ -171,6 +212,36 @@ class OllamaProvider(ChunkedClipDetectionMixin, AIProvider):
     async def close(self):
         """Close the shared HTTP client. Call when provider is no longer needed."""
         await self._client.aclose()
+
+    def apply_vision_model_override(self, content_type) -> str:
+        """Swap the active vision model based on ``content_type`` (Phase 2 parity).
+
+        Mirrors ``OpenRouterProvider.apply_vision_model_override``. The
+        orchestrator already calls this on every analyze_frames invocation;
+        we just need to honor it. If the requested model isn't pulled in
+        Ollama, ``_call_vision`` will get a 404 and the orchestrator will
+        fall back to the next provider in the chain — but we ALSO log a
+        clear "model not pulled" hint so the user can ``ollama pull`` it.
+
+        Reverting to ``None`` or any content type that isn't in the
+        override map restores the base vision model captured in
+        ``__init__``.
+        """
+        resolved = select_ollama_vision_model_for_content(
+            content_type, self._base_vision_model,
+        )
+        if resolved == self._vision_model:
+            return resolved
+
+        logger.info(
+            "Ollama: routing %s content to vision model %s (was %s). "
+            "If this model is not pulled, run: ollama pull %s",
+            getattr(content_type, "value", content_type) or "unknown",
+            resolved, self._vision_model, resolved,
+        )
+        self._vision_model = resolved
+        # _ensure_model_active will swap it into VRAM on the next vision call
+        return resolved
 
     async def unload_models(self):
         """Unload all models from VRAM so other processes (Whisper) can use the GPU."""
