@@ -385,6 +385,32 @@ DEFAULT_SUMMARY_PROMPT = (
     '- content_category: Specific (e.g. "food review", "tech unboxing", "comedy sketch")\n'
 )
 
+# ── VLM upgrade Phase 5 — editorial crop QA prompt ────────────────
+# Used by backend.services.crop_qa.score_crop_quality to re-score
+# each rendered segment's output frames. The VLM's answer is parsed
+# as JSON and fed into decide_recovery() to decide whether to
+# re-solve the crop with looser constraints or fall through to a
+# safety-center crop. Gated behind CLIPAI_CROP_QA; see
+# docs/vlm_upgrade/PHASE_5_NOTES.md.
+DEFAULT_CROP_QA_PROMPT = (
+    "You are reviewing a vertical 9:16 crop of a horizontal source video. "
+    "Look at this output frame and answer:\n\n"
+    "- head_in_frame: bool — is the main subject's head fully inside the "
+    "frame (not cut off at top/bottom/sides)?\n"
+    "- awkward_crop: bool — is there an awkward edge cut (hand chopped "
+    "mid-gesture, half a face, body cut at the neck)?\n"
+    "- subject_partially_off_frame: bool — is the subject visible but "
+    "partially clipped at a frame edge?\n"
+    "- dead_space_dominant: bool — is more than 50% of the frame empty/"
+    "non-subject space?\n"
+    "- quality_score: 0-10. 10 = perfect editorial framing (subject "
+    "well-placed with appropriate headroom, no awkward cuts). 7+ = "
+    "acceptable. 5-6 = noticeable problems but watchable. <5 = "
+    "unwatchable, must re-frame.\n\n"
+    "Return JSON only."
+)
+
+
 DEFAULT_SEO_PROMPT = (
     "You write social media captions and tags like a real person — not a marketer, "
     "not a robot. Think of how popular creators actually post on YouTube, TikTok, "
