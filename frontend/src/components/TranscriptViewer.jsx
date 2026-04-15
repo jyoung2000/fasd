@@ -1,6 +1,7 @@
 import React, { useState, useMemo, useCallback, useRef, useEffect } from 'react';
 import useResponsive from '../hooks/useResponsive';
 import TranscriptionCoverageBadge from './TranscriptionCoverageBadge';
+import { spokenWindow } from '../utils/subtitleTiming';
 
 const SPEAKER_COLORS_LIST = [
   'var(--accent-cyan)',
@@ -118,32 +119,43 @@ export default function TranscriptViewer({ transcript, onSeek, jobId, onSpeakerR
 
   // Determine which segment is currently playing (by original transcript index).
   //
-  // Whisper transcripts almost always have small gaps between segments —
-  // during normal playback `currentTime` lands inside one of those gaps
-  // most of the time. The legacy implementation iterated ``filtered`` and
-  // returned -1 in any gap, which dropped the blue highlight and stopped
-  // the auto-scroll for the majority of playback.
+  // Uses ``spokenWindow`` from ``utils/subtitleTiming`` so the active-line
+  // highlight tracks Whisper's per-word timestamps when available — the
+  // segment-level start/end that Whisper emits are ±100–300 ms boundary
+  // estimates, which read as "highlight is a half beat late." Per-word
+  // timestamps are much tighter. Sharing the helper with
+  // ``SubtitleOverlay`` also guarantees the transcript highlight and the
+  // burned-in subtitle agree on when a line is "being spoken."
   //
-  // Fix: iterate over the full ``transcript`` (so search/time-range
-  // filters can't accidentally suppress the lookup), and when
-  // ``currentTime`` lands in a gap keep the most recently spoken segment
-  // "active" for up to 5 s. Beyond 5 s of silence we drop the highlight —
-  // at that point nothing is actually being spoken.
+  // Gap-hold: when ``currentTime`` lands in a short gap between two
+  // segments, we keep the most recently ended segment "active" for up to
+  // ``GAP_HOLD_SEC``. Tuned down from the legacy 5.0 s (which read as
+  // "stuck on an old line") to 0.75 s — that covers Whisper's typical
+  // inter-segment gaps (50–400 ms) plus a breath without lingering past
+  // when a listener would say the line is done.
   const activeOriginalIdx = useMemo(() => {
     if (currentTime == null || !transcript.length) return -1;
-    const GAP_HOLD_SEC = 5.0;
+    const GAP_HOLD_SEC = 0.75;
+
     let lastEndedIdx = -1;
     let lastEndedTime = -Infinity;
     for (let i = 0; i < transcript.length; i++) {
       const seg = transcript[i];
-      if (seg.start <= currentTime && currentTime < seg.end) {
-        return i;
-      }
-      if (seg.end <= currentTime && seg.end > lastEndedTime) {
-        lastEndedTime = seg.end;
+      const win = spokenWindow(seg);
+      // Direct hit on the spoken window.
+      if (win.start <= currentTime && currentTime < win.end) return i;
+      // Track the most recently *ended* spoken window for gap-hold
+      // fallback. (Note: this is the window end, not ``seg.end``, so
+      // the fallback honors per-word timestamps too.)
+      if (win.end <= currentTime && win.end > lastEndedTime) {
+        lastEndedTime = win.end;
         lastEndedIdx = i;
       }
     }
+    // If we're sitting in a gap shorter than GAP_HOLD_SEC, hold the
+    // previous line. If any segment had already *started* we'd have hit
+    // the direct branch above, so reaching here means the next line
+    // hasn't begun yet and holding is safe.
     if (lastEndedIdx >= 0 && currentTime - lastEndedTime <= GAP_HOLD_SEC) {
       return lastEndedIdx;
     }

@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { outlineTextShadow } from '../utils/textOutline';
+import { spokenWindow, isSpokenAt } from '../utils/subtitleTiming';
 import useTimelineStore from '../stores/timelineStore';
 
 // ── Backend-matching constants (ass_generator.py / clip_exporter.py) ──────
@@ -86,8 +87,20 @@ function getCurrentWordIndex(segment, relativeTime, speakerRates) {
   const words = text.split(/\s+/).filter(Boolean);
   if (words.length <= 1) return words.length === 1 ? 0 : -1;
 
+  // Shared speaker-rate scaling — applies to *both* branches below so
+  // the word-timestamp path and the estimation path give consistent
+  // results for fast/slow speakers. (The old code hardcoded +0.10 in
+  // the word-timestamp branch, which is correct only for the 3.0 wps
+  // reference speaker; fast speakers over-anticipated and slow
+  // speakers under-anticipated.) This also matches the backend
+  // ``_net_offset = anticipation - _AUDIO_BUFFER_S`` formula in
+  // ``backend/services/ass_generator.py``.
+  const speakerWps = (speakerRates && speakerRates[segment.speaker]) || 3.0;
+  const rateScale = Math.max(0.6, Math.min(1.6, 3.0 / speakerWps));
+  const anticipation = _ANTICIPATION_S * rateScale;
+
   if (segment.words && segment.words.length === words.length) {
-    const adjusted = relativeTime + 0.10 - _AUDIO_BUFFER_S;
+    const adjusted = relativeTime + anticipation - _AUDIO_BUFFER_S;
     if (adjusted < segment.words[0].start) return -1;
     for (let i = 0; i < segment.words.length; i++) {
       if (adjusted < segment.words[i].end) return i;
@@ -98,9 +111,6 @@ function getCurrentWordIndex(segment, relativeTime, speakerRates) {
   const totalChars = words.reduce((sum, w) => sum + w.length, 0);
   if (totalChars === 0) return -1;
   const segDuration = segment.end - segment.start;
-  const speakerWps = (speakerRates && speakerRates[segment.speaker]) || 3.0;
-  const rateScale = Math.max(0.6, Math.min(1.6, 3.0 / speakerWps));
-  const anticipation = _ANTICIPATION_S * rateScale;
   const elapsed = (relativeTime - segment.start) + anticipation - _AUDIO_BUFFER_S;
   if (elapsed < 0) return -1;
 
@@ -338,43 +348,62 @@ export default function SubtitleOverlay({
   const currentSubtitle = useMemo(() => {
     if (!subtitlesEnabled || clipSegments.length === 0) return null;
 
-    // Compute effective end for a segment — when active word highlighting is on,
-    // extend past seg.end if the last word's timestamp exceeds it.
-    const effectiveEnd = (seg) => {
-      if (!activeWordEnabled || !seg.words || seg.words.length === 0) return seg.end;
-      const lastWord = seg.words[seg.words.length - 1];
-      const lastWordEnd = lastWord.end || lastWord.endTime || seg.end;
-      return Math.max(seg.end, lastWordEnd + 0.05);
-    };
-
-    // Direct hit (using effective end so last word doesn't get cut off)
-    const direct = clipSegments.find((seg) => seg.start <= relTime && relTime < effectiveEnd(seg));
+    // Direct hit against the spoken window (prefers per-word
+    // timestamps, falls back to segment-level — see
+    // ``utils/subtitleTiming.js`` for the math). Using the same
+    // predicate here and in ``TranscriptViewer`` guarantees the overlay
+    // and the active-line highlight agree on when a line is active,
+    // and removes the timing inconsistency the old ``effectiveEnd``
+    // introduced between ``activeWordEnabled`` on vs off.
+    const direct = clipSegments.find((seg) => isSpokenAt(seg, relTime));
     if (direct) return direct;
 
-    // Gap bridging: hold previous segment during small gaps to prevent flashing
-    const MAX_GAP_FILL = 0.5;
+    // Gap bridging: when the playhead sits in a small gap between two
+    // segments, hold the *previous* segment so the overlay doesn't
+    // flash off/on. Tightened from 0.5 s → 0.35 s — anything longer
+    // reads as lingering. We always bound the bridge by the next
+    // segment's spoken start, so we can't carry a segment past when
+    // the next speaker actually begins.
+    const MAX_GAP_FILL = 0.35;
     for (let i = 0; i < clipSegments.length - 1; i++) {
-      const seg = clipSegments[i];
-      const nextSeg = clipSegments[i + 1];
-      const segEnd = effectiveEnd(seg);
-      if (relTime >= segEnd && relTime < nextSeg.start && (nextSeg.start - segEnd) < MAX_GAP_FILL) {
-        return seg;
+      const cur = clipSegments[i];
+      const nxt = clipSegments[i + 1];
+      const curWin = spokenWindow(cur);
+      const nxtWin = spokenWindow(nxt);
+      if (
+        relTime >= curWin.end &&
+        relTime < nxtWin.start &&
+        nxtWin.start - curWin.end < MAX_GAP_FILL
+      ) {
+        return cur;
       }
     }
+    // Tail: after the last segment ends, don't hold — let it clear.
     return null;
-  }, [subtitlesEnabled, clipSegments, relTime, activeWordEnabled]);
+  }, [subtitlesEnabled, clipSegments, relTime]);
 
   // Find the original timeline item for the current subtitle (for selection)
   const currentTimelineItem = useMemo(() => {
     if (!currentSubtitle) return null;
     // If the subtitle came directly from timeline (has id), use it
     if (currentSubtitle.id) {
-      return subtitleItems.find((it) => it.id === currentSubtitle.id) || null;
+      const direct = subtitleItems.find((it) => it.id === currentSubtitle.id);
+      if (direct) return direct;
     }
-    // Fallback: match by time proximity (for split segments)
-    return subtitleItems.find(
-      (it) => Math.abs(it.start - currentSubtitle.start) < 0.15 && Math.abs(it.end - currentSubtitle.end) < 0.15
-    ) || null;
+    // Split-chunk fallback: match by *overlap* rather than endpoint
+    // proximity. ``splitSegmentsByMaxWords`` can move chunk boundaries
+    // further than the old 0.15 s endpoint tolerance, so endpoint
+    // matching silently dropped chunks. Overlap matching also
+    // correctly picks the parent item even when word-timestamp
+    // boundary nudging pulls the chunk start slightly before the
+    // parent item's nominal start.
+    return (
+      subtitleItems.find(
+        (it) =>
+          it.start <= currentSubtitle.start + 0.05 &&
+          it.end >= currentSubtitle.end - 0.05,
+      ) || null
+    );
   }, [currentSubtitle, subtitleItems]);
 
   // Click-to-select: select the subtitle timeline item.
