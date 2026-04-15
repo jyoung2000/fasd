@@ -952,6 +952,175 @@ def build_active_speaker_timeline_v2(
     return events
 
 
+def build_active_speaker_timeline_v3(
+    face_results: list,
+    transcript_segments: list,
+    asd_scores: list,           # list[ASDResult] from light_asd.score_faces_for_clip
+    face_registry=None,
+    window_seconds: float = 0.5,
+    shot_cuts: list = None,
+    audio_path: str = None,
+    p_speaking_threshold: float = 0.5,
+) -> list:
+    """V3: Audio-visual active speaker timeline driven by Light-ASD.
+
+    Mirrors the v2 signature but consumes per-frame Light-ASD speaking
+    probabilities instead of computing lip motion + audio sync from
+    landmarks. Crucially handles two cases v2 cannot:
+      - Overlapping speech: emits multiple co-active SpeakerEvents at
+        the same timestamp when more than one face crosses the
+        p_speaking threshold.
+      - Off-camera speakers: returns slot_id=-1 for transcript segments
+        where no on-screen face has p_speaking above threshold.
+
+    Post-processing (dwell collapse, shot-reverse tolerance, VAD
+    bridging) reuses the same helpers as v2 so the L1 solver sees a
+    timeline shape it already understands.
+    """
+    if not face_results or not transcript_segments:
+        return []
+
+    if not asd_scores:
+        logger.info("[SpeakerV3] No ASD scores — returning empty timeline")
+        return []
+
+    # Index ASD scores by (rounded timestamp, face_idx) for O(1) lookup.
+    asd_by_key: dict = {}
+    for s in asd_scores:
+        key = (round(float(s.timestamp), 3), int(s.face_idx))
+        asd_by_key[key] = float(s.p_speaking)
+
+    # Per-frame index of the FrameFaces objects so we can resolve face_idx
+    # → identity_id when emitting SpeakerEvents.
+    frame_map = {}
+    for fr in face_results:
+        frame_map[round(float(fr.timestamp), 3)] = fr
+    frame_times = sorted(frame_map.keys())
+
+    events: list = []
+
+    for seg in transcript_segments:
+        seg_start = seg.start if hasattr(seg, "start") else seg.get("start", 0)
+        seg_end = seg.end if hasattr(seg, "end") else seg.get("end", 0)
+
+        nearby_times = [
+            t for t in frame_times
+            if seg_start - window_seconds <= t <= seg_end + window_seconds
+        ]
+        if not nearby_times:
+            events.append(SpeakerEvent(
+                start=seg_start, end=seg_end, slot_id=-1, confidence=0.0,
+            ))
+            continue
+
+        # Aggregate p_speaking per identity_id over the segment window.
+        id_scores: dict = {}  # identity_id → max p_speaking observed
+        id_avg: dict = {}     # identity_id → list of p_speaking samples
+        for t in nearby_times:
+            fr = frame_map[t]
+            for fi, face in enumerate(fr.faces):
+                iid = getattr(face, "identity_id", -1)
+                if iid < 0:
+                    continue
+                p = asd_by_key.get((t, fi), 0.0)
+                if p > id_scores.get(iid, -1.0):
+                    id_scores[iid] = p
+                id_avg.setdefault(iid, []).append(p)
+
+        if not id_scores:
+            events.append(SpeakerEvent(
+                start=seg_start, end=seg_end, slot_id=-1, confidence=0.0,
+            ))
+            continue
+
+        # Co-active speakers: any identity whose max p_speaking crosses
+        # the threshold gets its own SpeakerEvent at this segment's
+        # timestamps. v2 could not represent overlapping speech.
+        active_ids = [
+            iid for iid, p in id_scores.items() if p >= p_speaking_threshold
+        ]
+
+        if not active_ids:
+            # Off-camera speaker: transcript says someone spoke but no
+            # face crosses threshold. Emit slot_id=-1 so downstream
+            # handling can keep the camera on the previous active slot.
+            events.append(SpeakerEvent(
+                start=seg_start, end=seg_end, slot_id=-1, confidence=0.0,
+            ))
+            continue
+
+        # Mark speaking faces for downstream consumers.
+        for t in nearby_times:
+            fr = frame_map[t]
+            for face in fr.faces:
+                if getattr(face, "identity_id", -1) in active_ids:
+                    face.is_speaking = True
+
+        for iid in active_ids:
+            samples = id_avg.get(iid, [])
+            avg_p = sum(samples) / len(samples) if samples else id_scores[iid]
+            events.append(SpeakerEvent(
+                start=seg_start, end=seg_end,
+                slot_id=int(iid),
+                confidence=float(min(1.0, max(0.0, avg_p))),
+            ))
+
+    if not events:
+        return []
+
+    # Sort by start so the merge / collapse helpers see a monotonic stream.
+    events.sort(key=lambda e: (e.start, e.slot_id))
+
+    # Same-speaker run merge (per slot_id), reused from v2's merge step.
+    by_slot: dict = {}
+    for ev in events:
+        by_slot.setdefault(ev.slot_id, []).append(ev)
+    merged_all: list = []
+    for sid, evs in by_slot.items():
+        evs.sort(key=lambda e: e.start)
+        merged: list = [evs[0]]
+        for ev in evs[1:]:
+            if ev.start - merged[-1].end < 1.0:
+                merged[-1] = SpeakerEvent(
+                    start=merged[-1].start, end=ev.end,
+                    slot_id=sid,
+                    confidence=max(merged[-1].confidence, ev.confidence),
+                )
+            else:
+                merged.append(ev)
+        merged_all.extend(merged)
+    events = sorted(merged_all, key=lambda e: (e.start, e.slot_id))
+
+    # Reuse the v2 post-processing chain for solver-friendliness:
+    events, collapsed_runs = _collapse_short_runs(events)
+    events, offscreen_count = _apply_shot_reverse_tolerance(
+        events, transcript_segments, face_results, shot_cuts or [], face_registry,
+    )
+
+    if audio_path:
+        try:
+            vad_intervals = build_vad_presence(audio_path)
+        except Exception as e:
+            logger.info("[SpeakerV3] VAD bridging skipped (%s)", e)
+            vad_intervals = []
+        if vad_intervals:
+            events, bridged_count = _apply_vad_bridging(events, vad_intervals)
+            if bridged_count > 0:
+                logger.info(
+                    "[SpeakerV3] VAD bridged %d speaker event extensions (v3)",
+                    bridged_count,
+                )
+
+    logger.info(
+        "[SpeakerV3] %d events, %d unique speakers (collapsed_runs=%d, "
+        "offscreen=%d, threshold=%.2f)",
+        len(events),
+        len(set(e.slot_id for e in events if e.slot_id >= 0)),
+        collapsed_runs, offscreen_count, p_speaking_threshold,
+    )
+    return events
+
+
 def map_speakers_to_face_slots(
     transcript_segments: list,
     face_registry,

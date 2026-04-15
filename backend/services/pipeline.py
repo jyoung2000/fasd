@@ -2935,14 +2935,54 @@ async def _run_analysis_inner(job_id: str):
             # Use V2 (identity-based) with dense data when available
             _speaker_face_data = dense_face_results if dense_face_results else face_results
             _shot_cuts_for_speaker = scene_cut_timestamps if scene_cut_timestamps else []
-            if dense_face_results:
+            # Phase C: optional Light-ASD audio-visual backend behind
+            # CLIPAI_ASD_BACKEND=light_asd. Falls back to v2 if the model
+            # produced no scores. Default OFF — v2 stays the production
+            # path until content-type validation confirms parity.
+            asd_backend = os.environ.get("CLIPAI_ASD_BACKEND", "heuristic").lower()
+            if asd_backend == "light_asd" and dense_face_results:
+                try:
+                    from backend.services.light_asd import score_faces_for_clip
+                    from backend.services.active_speaker import (
+                        build_active_speaker_timeline_v3,
+                    )
+                    asd_scores = score_faces_for_clip(
+                        video_path=video_path,
+                        face_results=_speaker_face_data,
+                        audio_wav_path=audio_path,
+                    )
+                    if asd_scores:
+                        active_speaker_events = build_active_speaker_timeline_v3(
+                            _speaker_face_data, transcript,
+                            asd_scores=asd_scores,
+                            face_registry=face_registry,
+                            window_seconds=0.5,
+                            shot_cuts=_shot_cuts_for_speaker,
+                            audio_path=audio_path,
+                        )
+                    else:
+                        logger.info(
+                            "[%s] Light-ASD produced no scores — falling "
+                            "back to v2 heuristic ASD",
+                            job_id,
+                        )
+                        asd_backend = "heuristic"
+                except Exception as e:
+                    logger.warning(
+                        "[%s] Light-ASD path failed (non-fatal): %s — "
+                        "falling back to v2",
+                        job_id, e,
+                    )
+                    asd_backend = "heuristic"
+
+            if not active_speaker_events and dense_face_results:
                 active_speaker_events = build_active_speaker_timeline_v2(
                     _speaker_face_data, transcript, face_registry,
                     window_seconds=0.5,
                     shot_cuts=_shot_cuts_for_speaker,
                     audio_path=audio_path,
                 )
-            else:
+            elif not active_speaker_events:
                 active_speaker_events = build_active_speaker_timeline(
                     _speaker_face_data, transcript, face_registry,
                     window_seconds=0.5 if dense_face_results else 2.0,

@@ -29,6 +29,19 @@ anime face detector no-ops without it — `detect_anime_faces()`
 returns `AnimeDetectionResult(skipped_reason="cascade not found: ...")`
 when the XML is missing. Do **not** delete it.
 
+### `light_asd.onnx` (Phase C)
+
+- **Auto-downloaded:** lazily by `backend/services/light_asd.py` from
+  the upstream Light-ASD release on first use when
+  `CLIPAI_ASD_BACKEND=light_asd` is set. Pulled to
+  `backend/models/light_asd.onnx`.
+- **Used by:** the v3 active speaker timeline
+  (`build_active_speaker_timeline_v3`) for audio-visual ASD that
+  handles overlapping speech and off-camera speakers — both v2-impossible.
+- **CPU-only** via onnxruntime CPUExecutionProvider. Default OFF; the
+  v2 lip-aperture heuristic stays as the production path until
+  Jalon's content-corpus validation confirms parity or improvement.
+
 ### `yolo11n.pt` and `yolo11n-pose.pt` (Phase B)
 
 - **Auto-downloaded:** by `ultralytics` on first use when
