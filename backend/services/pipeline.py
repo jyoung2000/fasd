@@ -1124,9 +1124,82 @@ async def _run_analysis_inner(job_id: str):
         except Exception as e:
             logger.warning("[%s] Face detection failed (non-fatal): %s", job_id, e)
 
+    # ── Early stylization hint (Phase 2) ──
+    # Hoisted ABOVE the dense-pass gate so stylized clips (anime,
+    # cartoon-shooter games, MOBA, racing, …) still run the dense
+    # pass even when the sparse FaceMesh / YuNet pass returned
+    # empty / unreliable results. The hint is True when any of:
+    #
+    #   1. The user explicitly picked a stylized content type in
+    #      the dropdown (anime / cartoon / animation / animated /
+    #      gameplay / fps / moba / tps / racing).
+    #   2. ``ANIME_MODE_DETECTED`` is set (the human-pose verifier
+    #      already concluded the sparse pass was looking at
+    #      cartoon / anime characters).
+    #   3. The user set a ``game_type`` (e.g. "tf2", "valorant")
+    #      via the gameplay sub-dropdown.
+    #
+    # When neither face_results NOR the early hint is set, the
+    # dense pass is skipped (live-action with no faces — e.g. a
+    # B-roll landscape clip — has nothing to track).
+    _early_stylized_hint = False
+    _early_anime_hint = False
+    try:
+        from backend.services.face_detector import ANIME_MODE_DETECTED
+    except ImportError:
+        ANIME_MODE_DETECTED = False
+    _early_override_for_hint = (
+        getattr(job, "content_type_override", "") or ""
+    ).strip().lower()
+    _early_game_type_for_hint = (
+        getattr(job, "game_type", "") or ""
+    ).strip()
+    if _early_override_for_hint in (
+        "anime", "cartoon", "animation", "animated",
+    ):
+        _early_anime_hint = True
+        _early_stylized_hint = True
+        logger.info(
+            "[%s] Early stylized hint = True (user override=%s, anime branch)",
+            job_id, _early_override_for_hint,
+        )
+    if _early_override_for_hint in (
+        "gaming", "gameplay", "fps", "moba", "tps", "racing",
+        "gameplay_fps", "gameplay_moba", "gameplay_tps",
+        "gameplay_racing", "hero_shooter",
+    ):
+        _early_stylized_hint = True
+        logger.info(
+            "[%s] Early stylized hint = True (user override=%s, gameplay branch)",
+            job_id, _early_override_for_hint,
+        )
+    if _early_game_type_for_hint:
+        _early_stylized_hint = True
+        logger.info(
+            "[%s] Early stylized hint = True (user picked game_type=%s)",
+            job_id, _early_game_type_for_hint,
+        )
+    if not _early_anime_hint and ANIME_MODE_DETECTED:
+        _early_anime_hint = True
+        _early_stylized_hint = True
+        logger.info(
+            "[%s] Early stylized hint = True (ANIME_MODE_DETECTED)",
+            job_id,
+        )
+
     # ── Dense face detection (1fps, CPU-only) ──
     # Runs on CPU, no GPU conflict. For 4K VP9 this can take 3-5 minutes.
-    if settings.SUBJECT_TRACKING_ENABLED and face_results:
+    # Gate: enter the dense pass when EITHER the sparse pass found
+    # faces OR the early stylized hint is set. On pure-anime /
+    # cartoon-shooter content the sparse FaceMesh pass commonly
+    # returns ~zero faces (the human-trained models reject stylized
+    # characters), and the dense pass is the only place that runs
+    # the lbpcascade_animeface augmentation + the stylization
+    # demotion pass. Without this loosening, animated and gameplay
+    # jobs got 0 dense face tracking.
+    if settings.SUBJECT_TRACKING_ENABLED and (
+        face_results or _early_stylized_hint
+    ):
         try:
             from backend.services.face_detector import detect_faces_dense
             video_duration = metadata.get("duration", 0)
@@ -1196,6 +1269,7 @@ async def _run_analysis_inner(job_id: str):
                     min_confidence=0.4,
                     extract_embeddings=True,
                     progress_callback=_dense_progress,
+                    is_stylized=_early_stylized_hint,
                 ),
             )
             dense_with_faces = sum(1 for r in dense_face_results if r.faces)
@@ -1221,10 +1295,13 @@ async def _run_analysis_inner(job_id: str):
     elif _content_override not in ("podcast", "movie"):
         # Auto-detect: only if user didn't declare a non-gameplay type
         try:
-            from backend.services.face_detector import classify_gameplay_content
+            from backend.services.face_detector import (
+                build_classification_hint,
+                classify_gameplay_content_with_scores,
+            )
             _dense_or_sparse = dense_face_results or face_results
             _sample_paths = [f.path for f in frames[:30]] if frames else []
-            _gp_result = classify_gameplay_content(
+            _gp_result, _gp_scores = classify_gameplay_content_with_scores(
                 _dense_or_sparse, len(_dense_or_sparse), _sample_paths,
             )
             if _gp_result == "gameplay":
@@ -1232,6 +1309,51 @@ async def _run_analysis_inner(job_id: str):
                 logger.info("[%s] Auto-detected gameplay content", job_id)
             else:
                 logger.info("[%s] Gameplay auto-detection result: %s", job_id, _gp_result)
+
+            # ── Phase 3: classification hint ──
+            # When the auto-router didn't pick gameplay BUT the HUD or
+            # stylization signals were close, surface a banner so the
+            # user can confirm. We also fire on ANIME_MODE_DETECTED
+            # since it's a separate signal that the content isn't
+            # live-action.
+            try:
+                _user_overridden = bool(
+                    _content_override
+                    and _content_override.strip().lower() not in ("", "auto")
+                )
+                _anime_mode_now = False
+                try:
+                    from backend.services.face_detector import (
+                        ANIME_MODE_DETECTED as _ANIME_NOW,
+                    )
+                    _anime_mode_now = bool(_ANIME_NOW)
+                except ImportError:
+                    pass
+                _hint = build_classification_hint(
+                    _gp_result, _gp_scores,
+                    user_overridden=_user_overridden,
+                    anime_mode_detected=_anime_mode_now,
+                )
+                if _hint:
+                    await database.update_job_status(
+                        job_id, classification_hint=_hint,
+                    )
+                    logger.warning(
+                        "[%s] LIKELY_%s_MISCLASSIFIED: hud=%.2f, "
+                        "stylization=%.2f, face_ratio=%.2f. "
+                        "User should consider picking a %s content type.",
+                        job_id,
+                        _hint["suggested_content_type"].upper(),
+                        _gp_scores.get("hud", 0.0),
+                        _gp_scores.get("stylization", 0.0),
+                        _gp_scores.get("face_ratio", 0.0),
+                        _hint["suggested_content_type"],
+                    )
+            except Exception as _hint_exc:
+                logger.warning(
+                    "[%s] classification_hint build failed (non-fatal): %s",
+                    job_id, _hint_exc,
+                )
         except Exception as e:
             logger.warning("[%s] Gameplay detection failed (non-fatal): %s", job_id, e)
 

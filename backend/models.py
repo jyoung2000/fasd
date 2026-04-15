@@ -162,6 +162,21 @@ class JobResult(BaseModel):
     tracking_mode: str = ""  # "continuous" | "multi_cluster" | "gameplay" — set by pipeline after face analysis
     content_type_override: str = ""  # "auto" | "gameplay" | "podcast" | "movie" — user override from upload UI
     game_type: str = ""  # "overwatch" | "valorant" | "apex_legends" | "marvel_rivals" | "fortnite" | "generic_fps" | "auto"
+    # Phase 3 — populated by the auto-router when classification was
+    # low-confidence (e.g. high HUD score but face-route was picked,
+    # or the human-pose verifier rejected most face detections).
+    # Shape:
+    #   {
+    #     "suggested_content_type": "gaming" | "anime" | ...,
+    #     "suggested_game_type": "generic_fps" | "" (optional),
+    #     "reason": "high_hud_score" | "high_face_rejection" | ...,
+    #     "scores": {"hud": 0.72, "face_ratio": 0.42,
+    #                "stylization": 0.55, "crosshair": 0.10},
+    #   }
+    # Advisory only — does NOT change analysis behavior. The
+    # frontend Analysis page reads this to render a banner with a
+    # CTA that opens the content-type dropdown pre-filled.
+    classification_hint: dict = {}
     filler_events: list[dict] = []  # [{start, end, type, text}] from filler word detection
     emphasis_keywords: list[str] = []  # Words to highlight in captions
     thumbnail_path: Optional[str] = None  # Absolute path to OG preview thumbnail JPG

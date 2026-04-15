@@ -2093,8 +2093,87 @@ export default function Analysis() {
     );
   };
 
+  // Phase 3 — classification hint banner. The pipeline writes
+  // job.classification_hint when auto-routing was low-confidence
+  // (e.g. cartoon-shooter HUD detected but face-route was picked,
+  // or anime mode fired after live-action classification). The
+  // banner is suppressed when the user already overrode the type.
+  const classificationHint = job?.classification_hint || null;
+  const userAlreadyOverrode = !!(
+    job?.content_type_override
+    && String(job.content_type_override).toLowerCase() !== 'auto'
+  );
+  const showClassificationHint = !!(
+    classificationHint?.suggested_content_type
+    && !userAlreadyOverrode
+  );
+  const handleAcceptClassificationHint = useCallback(async () => {
+    if (!classificationHint?.suggested_content_type) return;
+    try {
+      const body = {
+        content_type_override: classificationHint.suggested_content_type,
+      };
+      if (classificationHint.suggested_game_type) {
+        body.game_type = classificationHint.suggested_game_type;
+      }
+      // Re-trigger analysis with the corrected routing so the
+      // gameplay / anime path runs from scratch — must invalidate
+      // the cached scenes / face registry / dense results.
+      const res = await fetch(`/api/jobs/${jobId}/reanalyze`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (res.ok) {
+        fetchJob();
+      } else {
+        console.warn('[Analysis] reanalyze failed:', res.status);
+      }
+    } catch (err) {
+      console.warn('[Analysis] classification hint accept error:', err?.message || err);
+    }
+  }, [classificationHint, jobId, fetchJob]);
+
   return (
     <div>
+      {/* Phase 3: routing-failure banner */}
+      {showClassificationHint && (
+        <div
+          data-testid="classification-hint-banner"
+          style={{
+            margin: '8px 16px',
+            padding: '12px 16px',
+            background: '#fef3c7',
+            borderLeft: '4px solid #f59e0b',
+            borderRadius: 4,
+            color: '#78350f',
+            fontSize: 13,
+          }}
+        >
+          <div style={{ marginBottom: 6 }}>
+            This looks like <strong>{classificationHint.suggested_content_type}</strong>{' '}
+            content. Reframing will work better if you confirm the type.
+          </div>
+          <button
+            type="button"
+            onClick={handleAcceptClassificationHint}
+            style={{
+              marginTop: 4,
+              padding: '4px 10px',
+              background: '#d97706',
+              color: '#fff',
+              border: 'none',
+              borderRadius: 3,
+              fontSize: 12,
+              fontWeight: 600,
+              cursor: 'pointer',
+            }}
+          >
+            Set content type to {classificationHint.suggested_content_type} →
+          </button>
+        </div>
+      )}
+
       {/* Loading overlay while subject tracking computes for new AR */}
       {trackingLoading && (
         <div style={{

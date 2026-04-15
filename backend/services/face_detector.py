@@ -736,6 +736,80 @@ def detect_faces_batch(
     return final_results
 
 
+def _demote_stylized_faces(
+    results: list, *, demotion_factor: float = 0.3, window: int = 5,
+) -> int:
+    """Demote YuNet face detections in stylized content.
+
+    Cartoon-character faces (TF2, Overwatch, Marvel Rivals) and
+    anime characters produce confident YuNet detections that pollute
+    the registry: the camera then "tracks" a non-human face. When
+    called on stylized content this helper multiplies each face's
+    confidence by ``demotion_factor`` UNLESS the face has an SFace
+    embedding cluster match across the next ``window`` frames (a
+    real human face that re-appears) OR ``is_human`` is already
+    False (an anime-cascade detection that the augmentation pass
+    already marked).
+
+    Returns the number of demoted faces. Operates in place on
+    ``results`` so downstream code keeps the bbox coordinates but
+    sees a low-confidence weight.
+    """
+    if not results:
+        return 0
+
+    try:
+        import numpy as np
+    except ImportError:
+        return 0
+
+    # Collect (frame_idx, face, embedding) for all live-action
+    # faces with embeddings.
+    indexed = []
+    for fi, fr in enumerate(results):
+        for face in getattr(fr, "faces", []) or []:
+            if not getattr(face, "is_human", True):
+                continue  # anime cascade detection — leave alone
+            emb = getattr(face, "identity_embedding", None)
+            if emb is None:
+                indexed.append((fi, face, None))
+                continue
+            arr = np.asarray(emb, dtype=np.float32).flatten()
+            n = float(np.linalg.norm(arr))
+            if n <= 1e-9:
+                indexed.append((fi, face, None))
+                continue
+            indexed.append((fi, face, arr / n))
+
+    demoted = 0
+    for i, (fi, face, ne) in enumerate(indexed):
+        if ne is None:
+            # No embedding — can't cluster; demote conservatively.
+            try:
+                face.confidence = float(face.confidence) * demotion_factor
+                demoted += 1
+            except Exception:
+                continue
+            continue
+        matched = False
+        for j, (fj, _other_face, oe) in enumerate(indexed):
+            if i == j or oe is None:
+                continue
+            if abs(fj - fi) > window:
+                continue
+            sim = float(np.dot(ne, oe))
+            if sim > 0.4:
+                matched = True
+                break
+        if not matched:
+            try:
+                face.confidence = float(face.confidence) * demotion_factor
+                demoted += 1
+            except Exception:
+                continue
+    return demoted
+
+
 def detect_faces_dense(
     video_path: str,
     start: float,
@@ -744,6 +818,7 @@ def detect_faces_dense(
     min_confidence: float = 0.5,
     extract_embeddings: bool = True,
     progress_callback=None,
+    is_stylized: bool = False,
 ) -> list:
     """Dense face detection for a clip's time range.
 
@@ -754,6 +829,18 @@ def detect_faces_dense(
 
     For a 30-second clip at 0.5s intervals = 60 frames.
     At ~10ms per frame (YuNet + SFace) = ~600ms total. Fast enough for export.
+
+    Args:
+        video_path: Source video file.
+        start, end: Time range in seconds.
+        sample_rate: Inter-frame interval in seconds.
+        min_confidence: YuNet/FaceMesh confidence floor.
+        extract_embeddings: Whether to merge YuNet+SFace embeddings.
+        progress_callback: Optional callback for progress reporting.
+        is_stylized: Phase 2 — when True, runs ``_demote_stylized_faces``
+            after detection so YuNet hits on cartoon-character heads
+            don't pollute the face registry. Caller is the pipeline,
+            which passes the early stylized hint.
     """
     import re as _re
     import subprocess
@@ -879,6 +966,21 @@ def detect_faces_dense(
                                 best_yf = yf
                         if best_yf and best_dist < 10:
                             mf.identity_embedding = best_yf.identity_embedding
+
+        # Phase 2: demote YuNet hits on cartoon / anime characters
+        # when the caller signaled stylized content. Faces that
+        # cluster across nearby frames via SFace embeddings are
+        # left alone (real humans); singletons get their confidence
+        # multiplied by 0.3 so the face registry treats them as
+        # noise instead of building a slot around them.
+        if is_stylized:
+            n_demoted = _demote_stylized_faces(results)
+            if n_demoted:
+                logger.info(
+                    "[DenseFaces] Stylized demotion: %d faces dropped to "
+                    "0.3× confidence (no cluster match)",
+                    n_demoted,
+                )
 
         if progress_callback:
             progress_callback("complete", len(results), len(frame_paths))
@@ -1019,6 +1121,194 @@ def detect_hud_corner_brightness(sample_frame_paths: list[str]) -> float:
     return max_corner_score
 
 
+def detect_stylization(sample_frame_paths: list[str]) -> float:
+    """Return a 0-1 score for how 'cartoon/stylized' the frames look.
+
+    Combines three cheap signals across up to 30 sample frames:
+
+      - mean saturation > 130 (cartoon games + anime are high-sat,
+        live-action footage rarely exceeds 100)
+      - edge density > 0.10 (hard outlines + UI strokes vs. soft
+        skin / hair gradients of real footage)
+      - large uniform regions > 0.30 (flat color fills typical of
+        cel-shaded characters and cartoon backgrounds)
+
+    Returns 0.0 on missing dependencies (cv2 / numpy) so callers
+    can fall back to the original face-only routing. Score is the
+    average of the three booleans across the sampled frames, so:
+
+      - 1.0 when all three signals fire on every sampled frame
+        (TF2 / Overwatch / Marvel Rivals / anime)
+      - 0.0 when none fire (live podcast, vlog, talking head)
+      - ~0.4-0.6 for borderline content (saturated music videos,
+        animated whiteboard explainers)
+
+    The classifier uses 0.4 as the "is stylized" cutoff because
+    real cartoon games consistently land above that and live
+    action consistently lands below.
+    """
+    try:
+        import cv2  # type: ignore
+        import numpy as np
+    except ImportError:
+        return 0.0
+
+    if not sample_frame_paths:
+        return 0.0
+
+    high_sat_hits = 0
+    high_edge_hits = 0
+    flat_region_hits = 0
+    n_scored = 0
+
+    for frame_path in sample_frame_paths[:30]:
+        img = cv2.imread(str(frame_path))
+        if img is None:
+            continue
+        n_scored += 1
+
+        # Saturation signal — cartoon palettes are aggressively saturated
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        mean_sat = float(np.mean(hsv[:, :, 1]))
+        if mean_sat > 130:
+            high_sat_hits += 1
+
+        # Edge density signal — hard outlines / UI strokes
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray, 80, 160)
+        edge_density = float(np.count_nonzero(edges)) / max(edges.size, 1)
+        if edge_density > 0.10:
+            high_edge_hits += 1
+
+        # Flat-region signal — large connected components of similar
+        # color. We approximate via a coarse downsample + variance:
+        # cel-shaded frames have low local variance over big tiles.
+        small = cv2.resize(gray, (32, 18))
+        # Compute the fraction of 4×4 tiles whose stdev is < 8 (flat).
+        flat_tiles = 0
+        total_tiles = 0
+        for y in range(0, small.shape[0], 4):
+            for x in range(0, small.shape[1], 4):
+                tile = small[y:y + 4, x:x + 4]
+                if tile.size < 4:
+                    continue
+                total_tiles += 1
+                if float(np.std(tile)) < 8.0:
+                    flat_tiles += 1
+        if total_tiles > 0 and (flat_tiles / total_tiles) > 0.30:
+            flat_region_hits += 1
+
+    if n_scored == 0:
+        return 0.0
+
+    sat_score = high_sat_hits / n_scored
+    edge_score = high_edge_hits / n_scored
+    flat_score = flat_region_hits / n_scored
+    return (sat_score + edge_score + flat_score) / 3.0
+
+
+def build_classification_hint(
+    decision: str,
+    scores: dict,
+    *,
+    user_overridden: bool = False,
+    anime_mode_detected: bool = False,
+) -> dict:
+    """Build the ``classification_hint`` dict for a job (Phase 3).
+
+    Returns ``{}`` when no hint applies (clean classification, or
+    user overridden — we don't second-guess explicit user choice).
+    Otherwise returns a dict with:
+
+      - ``suggested_content_type`` (``"gaming"`` or ``"anime"``)
+      - ``suggested_game_type`` (``"generic_fps"`` or ``""``)
+      - ``reason`` — one of ``"high_hud_score"``,
+        ``"high_stylization"``, ``"anime_mode_detected"``,
+        ``"high_face_rejection"``
+      - ``scores`` — the raw signals so the UI can show a
+        confidence indicator if it wants
+
+    Decision rules:
+
+      - If the user already picked a content type, return ``{}``
+        — they win, no banner.
+      - If the auto-router picked NOT gameplay AND the HUD score
+        is > 0.4 OR stylization > 0.5: suggest ``"gaming"``.
+      - If anime_mode_detected fired AFTER classification was
+        locked to live-action: suggest ``"anime"``.
+      - Otherwise: ``{}``.
+
+    Advisory only — does NOT change analysis routing. The UI
+    surfaces a banner with a CTA that triggers a re-analysis with
+    the corrected ``content_type_override``.
+    """
+    if user_overridden:
+        return {}
+
+    hud = float(scores.get("hud", 0.0) or 0.0)
+    face_ratio = float(scores.get("face_ratio", 0.0) or 0.0)
+    stylization = float(scores.get("stylization", 0.0) or 0.0)
+    crosshair = float(scores.get("crosshair", 0.0) or 0.0)
+
+    # Anime suggestion — fires when the human-pose verifier
+    # rejected most face detections AFTER classification ran.
+    if anime_mode_detected and decision != "gameplay":
+        return {
+            "suggested_content_type": "anime",
+            "suggested_game_type": "",
+            "reason": "anime_mode_detected",
+            "scores": {
+                "hud": round(hud, 2),
+                "face_ratio": round(face_ratio, 2),
+                "stylization": round(stylization, 2),
+                "crosshair": round(crosshair, 2),
+            },
+        }
+
+    # Gaming suggestion — fires when auto-router didn't pick
+    # gameplay but the HUD or stylization signals were close.
+    if decision != "gameplay" and (hud > 0.4 or stylization > 0.5):
+        return {
+            "suggested_content_type": "gaming",
+            "suggested_game_type": "generic_fps",
+            "reason": "high_hud_score" if hud > 0.4 else "high_stylization",
+            "scores": {
+                "hud": round(hud, 2),
+                "face_ratio": round(face_ratio, 2),
+                "stylization": round(stylization, 2),
+                "crosshair": round(crosshair, 2),
+            },
+        }
+
+    return {}
+
+
+def classify_gameplay_content_with_scores(
+    dense_face_data: list,
+    total_frames: int,
+    sample_frame_paths: list[str],
+) -> tuple[str, dict]:
+    """Same as :func:`classify_gameplay_content` but returns ``(decision, scores)``.
+
+    The ``scores`` dict contains the four signals the classifier
+    computed (face_ratio, crosshair, hud, stylization) so the
+    pipeline can populate ``job.classification_hint`` without
+    re-running the helpers.
+    """
+    decision = classify_gameplay_content(
+        dense_face_data, total_frames, sample_frame_paths,
+    )
+    scores = _last_classification_scores.copy()
+    return decision, scores
+
+
+# Module-level cache of the most recent classification's scores so
+# ``classify_gameplay_content_with_scores`` can return them without
+# re-running the four detectors. Populated by
+# ``classify_gameplay_content`` on every call.
+_last_classification_scores: dict = {}
+
+
 def classify_gameplay_content(
     dense_face_data: list,
     total_frames: int,
@@ -1026,12 +1316,34 @@ def classify_gameplay_content(
 ) -> str:
     """Classify whether video content is gameplay footage.
 
-    Uses three signals:
-      1. Face rarity — fewer than 5% of frames have a face
-      2. Crosshair persistence — stable center element across frames
-      3. HUD corner brightness — high saturation in corner regions
+    Uses four signals:
 
-    Returns: 'gameplay' | 'unknown' | 'not_gameplay'
+      1. **face_ratio**       — fraction of dense frames with a
+         live-action face. Live podcast clips run ~0.6-0.9; FPS
+         gameplay runs ~0.0-0.1. Cartoon-shooter clips with huge
+         character models can run 0.3-0.6 because YuNet locks
+         onto the cartoon faces — that's why we need signal 4.
+      2. **crosshair_score**  — temporal stability of the center
+         4×4 patch. FPS clips with a fixed reticle score > 0.6.
+      3. **hud_score**        — corner saturation persistence.
+         Bright HUDs in any corner score > 0.5.
+      4. **stylization_score** — high saturation + edge density +
+         flat regions. Cartoon games and anime score > 0.4; live
+         action scores < 0.2.
+
+    Returns: ``'gameplay'`` | ``'unknown'`` | ``'not_gameplay'``.
+
+    The rule:
+
+      - Strong crosshair → always gameplay.
+      - HUD + stylization → gameplay (TF2 / Overwatch / Apex
+        cartoon-shooter fingerprint, regardless of face_ratio).
+      - HUD + low face_ratio → gameplay (original live-action FPS
+        gate, preserved verbatim for back-compat).
+      - High face_ratio AND low stylization → not_gameplay (real
+        live-action talking-head content).
+      - Very low face_ratio → unknown (let other signals decide).
+      - Otherwise → not_gameplay.
     """
     # Signal 1: face rarity
     frames_with_face = sum(
@@ -1040,22 +1352,48 @@ def classify_gameplay_content(
     )
     face_ratio = frames_with_face / max(1, total_frames)
 
-    if face_ratio > 0.30:
-        return "not_gameplay"
-
     # Signal 2: crosshair detection
     crosshair_score = detect_crosshair_persistence(sample_frame_paths)
 
     # Signal 3: HUD edge density
     hud_score = detect_hud_corner_brightness(sample_frame_paths)
 
+    # Signal 4: cartoon / anime stylization
+    stylization_score = detect_stylization(sample_frame_paths)
+
     logger.info(
-        "Gameplay classification: face_ratio=%.2f, crosshair=%.2f, hud=%.2f",
-        face_ratio, crosshair_score, hud_score,
+        "Gameplay classification: face_ratio=%.2f, crosshair=%.2f, "
+        "hud=%.2f, stylization=%.2f",
+        face_ratio, crosshair_score, hud_score, stylization_score,
     )
 
-    if crosshair_score > 0.6 or (hud_score > 0.5 and face_ratio < 0.10):
+    # Cache the four scores so callers can populate
+    # ``job.classification_hint`` without re-running the detectors.
+    _last_classification_scores.clear()
+    _last_classification_scores.update({
+        "face_ratio": round(face_ratio, 3),
+        "crosshair": round(crosshair_score, 3),
+        "hud": round(hud_score, 3),
+        "stylization": round(stylization_score, 3),
+    })
+
+    # Strong gameplay signals win regardless of face_ratio.
+    if crosshair_score > 0.6:
         return "gameplay"
+    # Cartoon-shooter fingerprint: HUD + stylization. This is the
+    # TF2 / Overwatch / Marvel Rivals route — characters look like
+    # faces to YuNet so face_ratio is high, but the HUD + cartoon
+    # palette confirm it's gameplay.
+    if hud_score > 0.6 and stylization_score > 0.4:
+        return "gameplay"
+    # Original live-action FPS gate (low HUD threshold but requires
+    # near-zero faces). Kept verbatim so existing test fixtures pass.
+    if hud_score > 0.5 and face_ratio < 0.10:
+        return "gameplay"
+
+    # Real talking-head clips: lots of faces, no cartoon palette.
+    if face_ratio > 0.30 and stylization_score < 0.4:
+        return "not_gameplay"
 
     if face_ratio < 0.05:
         return "unknown"
