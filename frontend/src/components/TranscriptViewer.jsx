@@ -43,6 +43,12 @@ function toTXT(segments) {
   return segments.map((seg) => `[${formatTime(seg.start)}] ${seg.speaker}: ${seg.text}`).join('\n');
 }
 
+// After any wheel / touchmove / keydown on the scroll container we pause
+// auto-centering for this many milliseconds so the user's scroll doesn't
+// get yanked back by the animation. The next active-segment change past
+// the quiet window resumes it.
+const MANUAL_OVERRIDE_MS = 2500;
+
 export default function TranscriptViewer({ transcript, onSeek, jobId, onSpeakerRenamed, onTranscriptUpdated, onSpeakerColorChanged, onSpeakerAdded, speakerColors, timeRange, currentTime, maxHeight }) {
   const { isMobile } = useResponsive();
   const scrollContainerRef = useRef(null);
@@ -158,32 +164,53 @@ export default function TranscriptViewer({ transcript, onSeek, jobId, onSpeakerR
   // ``[0, scrollHeight - clientHeight]`` so we never request an
   // impossible position.
   //
-  // Manual-scroll override: after any wheel / touchmove / keydown on the
-  // container we pause auto-scroll for 2.5 s so the user's scroll doesn't
-  // get yanked back. The next segment boundary resumes it.
+  // Manual-scroll override: see MANUAL_OVERRIDE_MS above. A wheel /
+  // touchmove / keydown on the container pauses auto-centering and
+  // immediately kills any running centering animation so the user's
+  // input is not fought by the per-frame lerp. Initialize to
+  // ``-Infinity`` so the FIRST active-segment change after mount is
+  // never suppressed by a stale zero reference that happens to fall
+  // within the override window.
   const scrollAnimRef = useRef(null);
-  const lastUserScrollRef = useRef(0);
+  const lastUserScrollRef = useRef(-Infinity);
   useEffect(() => {
     const container = scrollContainerRef.current;
     if (!container) return;
     const onUserScroll = () => {
       lastUserScrollRef.current = performance.now();
+      // Kill the running auto-centering animation right away — without
+      // this the ~400 ms lerp would keep writing ``scrollTop`` on each
+      // frame and visibly yank the user back while they're trying to
+      // wheel. That's the "the transcript scroll doesn't work" symptom.
+      if (scrollAnimRef.current) {
+        cancelAnimationFrame(scrollAnimRef.current);
+        scrollAnimRef.current = null;
+      }
     };
-    container.addEventListener('wheel', onUserScroll, { passive: true });
-    container.addEventListener('touchmove', onUserScroll, { passive: true });
+    const wheelOpts = { passive: true };
+    const touchOpts = { passive: true };
+    container.addEventListener('wheel', onUserScroll, wheelOpts);
+    container.addEventListener('touchmove', onUserScroll, touchOpts);
     container.addEventListener('keydown', onUserScroll);
     return () => {
-      container.removeEventListener('wheel', onUserScroll);
-      container.removeEventListener('touchmove', onUserScroll);
+      container.removeEventListener('wheel', onUserScroll, wheelOpts);
+      container.removeEventListener('touchmove', onUserScroll, touchOpts);
       container.removeEventListener('keydown', onUserScroll);
     };
   }, []);
 
   useEffect(() => {
     if (activeOriginalIdx < 0) return;
-    const el = activeSegRef.current;
     const container = scrollContainerRef.current;
-    if (!el || !container) return;
+    if (!container) return;
+
+    // Resolve the active row. Prefer the callback ref, but fall back
+    // to a DOM query on the ``data-active`` attribute — under rapid
+    // re-renders (search typing, segment edits) the callback ref can
+    // briefly be ``null`` even though the row is present in the DOM.
+    const el =
+      activeSegRef.current || container.querySelector('[data-active="true"]');
+    if (!el) return;
 
     // Cancel any running animation
     if (scrollAnimRef.current) {
@@ -192,9 +219,8 @@ export default function TranscriptViewer({ transcript, onSeek, jobId, onSpeakerR
     }
 
     // Manual-scroll override: user wheel/touch/key within the last
-    // 2.5 s pauses auto-centering. The next active-segment change will
-    // resume it.
-    const MANUAL_OVERRIDE_MS = 2500;
+    // MANUAL_OVERRIDE_MS pauses auto-centering. The next
+    // active-segment change past the quiet window will resume it.
     if (performance.now() - lastUserScrollRef.current < MANUAL_OVERRIDE_MS) {
       return;
     }
@@ -211,7 +237,20 @@ export default function TranscriptViewer({ transcript, onSeek, jobId, onSpeakerR
     if (targetTop < 0) targetTop = 0;
     if (targetTop > maxScroll) targetTop = maxScroll;
 
+    // Already centered — nothing to animate. Avoids pointless rAF work
+    // and keeps the user free to scroll during long segments.
+    if (Math.abs(targetTop - container.scrollTop) < 2) return;
+
     const animate = () => {
+      // Per-frame user-input check: if the user wheeled / touched /
+      // keyed between the previous frame and this one, bail out so
+      // their scroll takes over cleanly. (Without this the animation
+      // keeps writing ``scrollTop`` and fights user input for the
+      // rest of the lerp.)
+      if (performance.now() - lastUserScrollRef.current < MANUAL_OVERRIDE_MS) {
+        scrollAnimRef.current = null;
+        return;
+      }
       const diff = targetTop - container.scrollTop;
       // If close enough, snap and stop
       if (Math.abs(diff) < 1) {
@@ -956,11 +995,23 @@ export default function TranscriptViewer({ transcript, onSeek, jobId, onSpeakerR
       {/* Segments */}
       <div
         ref={scrollContainerRef}
+        tabIndex={0}
         style={{
           maxHeight: maxHeight || 500,
-          overflow: 'auto',
+          overflowY: 'auto',
+          overflowX: 'hidden',
           position: 'relative',
           scrollbarGutter: 'stable',
+          // Stop wheel scrolls from chaining to the page when the
+          // transcript reaches top/bottom — without this the page
+          // scrolls instead and users perceive the transcript as "not
+          // scrollable".
+          overscrollBehavior: 'contain',
+          // Make sure nothing (CSS resets, parent styles) accidentally
+          // disables touch scrolling on the container.
+          touchAction: 'pan-y',
+          // Needed for keyboard scroll (PageUp/Down, arrows, space).
+          outline: 'none',
         }}
       >
         {filtered.map((seg, i) => {
