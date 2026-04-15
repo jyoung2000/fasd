@@ -1975,6 +1975,61 @@ Evicted 2 Ollama model(s) from VRAM before Whisper CUDA
 [Layout] Built from 69 reframe segments (skipped plan_layout second-solve)
 ```
 
+## Phase 11 — Detection stack upgrades (A/B flag rollout)
+
+Phase 11 adds four flag-gated upgrades to the detection stack. Each
+flag defaults to the existing behaviour and is promoted to default
+only after the matrix runner in
+`backend/scripts/measure_detection_stack_matrix.py` shows parity or
+improvement on every fixture. Hardware constraint: every new ONNX
+session uses `onnxruntime CPUExecutionProvider`. The GTX 1650 stays
+reserved for Whisper / Ollama.
+
+| Flag | Backend (off → on) | Default | Phase | Matrix delta |
+|---|---|---|---|---|
+| `CLIPAI_FACE_EMBEDDING` | SFace 128-d → ArcFace Buffalo_S 512-d | `sface` | A | _pending matrix run_ |
+| `CLIPAI_OBJECT_DETECTOR` | YOLOv8n → YOLO11n | `yolov8n` | B | _pending matrix run_ |
+| `CLIPAI_PERSON_USE_POSE` | bbox center → YOLO11n-pose head anchor | `false` | B | _pending matrix run_ |
+| `CLIPAI_ANIME_FACE_BACKEND` | lbpcascade Haar → YOLOv8-anime-face ONNX | `lbpcascade` | D | _pending matrix run_ |
+| `CLIPAI_ASD_BACKEND` | lip-aperture heuristic → Light-ASD audio-visual | `heuristic` | C | _pending matrix run_ |
+
+### Phase A — ArcFace embeddings
+
+_Fill in delta table from `measure_detection_stack_matrix.py` once
+the matrix has run on `synthetic_alternating_2s` and
+`multi_speaker_crowd_10s`._
+
+### Phase B — YOLO11n + pose anchor
+
+_Fill in delta table from `measure_detection_stack_matrix.py` once
+the matrix has run._
+
+### Phase C — Light-ASD
+
+_Fill in delta table from `measure_detection_stack_matrix.py` once
+the matrix has run. Note: keep the heuristic default until content-
+type-specific validation confirms parity on Jalon's actual corpus —
+gaming / anime / heavy-music-over-dialogue is where Light-ASD is most
+likely to regress._
+
+### Phase D — YOLO anime face
+
+_Fill in delta table from `measure_detection_stack_matrix.py` once
+the matrix has run on the anime fixtures._
+
+### Rollout order
+
+1. Land Phase A (ArcFace) behind `sface` default. Run matrix. Flip
+   default to `arcface` if every fixture improves or stays flat.
+2. Land Phase B (YOLO11n + pose). Validate. Flip
+   `CLIPAI_OBJECT_DETECTOR=yolo11n` default; leave pose opt-in until
+   human-eye QA on the VideoEditor preview.
+3. Land Phase D (YOLO anime). Validate on anime fixtures only. Flip
+   default after a clean run.
+4. Land Phase C (Light-ASD). **Keep off by default indefinitely**
+   until content-type validation confirms it works on Jalon's actual
+   corpus.
+
 ## Week 1 flag audit (post-Phase 11 / v4 universal reframing)
 
 After Phase 11 + the v4 universal-reframing commit (``fe7fa3e``), six
