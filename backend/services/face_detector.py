@@ -1296,45 +1296,170 @@ def detect_hud_corner_brightness(sample_frame_paths: list[str]) -> float:
     return max_corner_score
 
 
+def _verified_face_ratio(face_data: list) -> tuple[float, float]:
+    """Return ``(raw_face_ratio, verified_human_ratio)`` for a list
+    of :class:`FrameFaces`.
+
+    The raw ratio uses every frame that has any detection; the
+    verified ratio only counts frames that contain at least one
+    detection flagged ``is_human_verified`` by
+    :class:`HumanFaceVerifier`. On cartoon-FPS content like TF2,
+    YuNet + MediaPipe find 70 %+ raw face rate but < 15 %
+    verified rate — that divergence is the single most reliable
+    signal that the video is gameplay content, not a talking
+    head.
+
+    Returns ``(0.0, 0.0)`` if no frames are supplied.
+    """
+    if not face_data:
+        return 0.0, 0.0
+    total = len(face_data)
+    raw_hits = 0
+    verified_hits = 0
+    for f in face_data:
+        faces = getattr(f, "faces", None) or []
+        if not faces:
+            continue
+        raw_hits += 1
+        # A frame counts as verified if ANY face on it passed the
+        # human-face verifier.
+        if any(getattr(face, "is_human_verified", False) for face in faces):
+            verified_hits += 1
+    return raw_hits / total, verified_hits / total
+
+
 def classify_gameplay_content(
     dense_face_data: list,
     total_frames: int,
     sample_frame_paths: list[str],
+    *,
+    sparse_face_data=None,
+    filename=None,
 ) -> str:
     """Classify whether video content is gameplay footage.
 
-    Uses three signals:
-      1. Face rarity — fewer than 5% of frames have a face
-      2. Crosshair persistence — stable center element across frames
-      3. HUD corner brightness — high saturation in corner regions
+    Six signals, evaluated in order:
 
-    Returns: 'gameplay' | 'unknown' | 'not_gameplay'
+      1. **Filename keyword hint** — short-circuit match against
+         the game-name keyword bank in
+         :mod:`filename_gameplay_hint`. A hit returns
+         ``"gameplay"`` immediately so the pipeline can skip the
+         expensive dense face pass entirely.
+      2. **Sparse face rarity** — if the sparse FaceMesh pass
+         (passed via ``sparse_face_data``) found faces in fewer
+         than 5 % of frames, that's a strong gameplay signal
+         that is NOT polluted by YuNet's cartoon-character
+         false positives. This is the fix for the TF2
+         regression, where dense YuNet found 213 "faces" on
+         cartoon models but sparse FaceMesh found 0.
+      3. **Dense-vs-verified divergence** — if dense face
+         detection found faces in ≥ 30 % of frames BUT the
+         verified-human ratio is < 15 %, the dense pass is
+         firing on cartoon characters / mannequins. Promote to
+         ``"gameplay"`` instead of the legacy early-return
+         that branded the clip as ``"not_gameplay"``.
+      4. **Raw dense face rarity** — the legacy ≥ 30 % check.
+         Only applies when the verified ratio is also healthy
+         (i.e. not the cartoon case above).
+      5. **Crosshair persistence** — stable center element
+         across sample frames.
+      6. **HUD corner brightness** — high saturation in corner
+         regions indicating killfeed / minimap / ability bar.
+
+    Returns: ``'gameplay'`` | ``'unknown'`` | ``'not_gameplay'``.
     """
-    # Signal 1: face rarity
-    frames_with_face = sum(
-        1 for f in dense_face_data
-        if hasattr(f, 'faces') and f.faces
-    )
-    face_ratio = frames_with_face / max(1, total_frames)
+    # Signal 1: filename keyword hint. Cheapest + most reliable
+    # when it fires, and the short-circuit means we never let
+    # YuNet's cartoon false positives cloud the decision.
+    try:
+        from backend.services.filename_gameplay_hint import (
+            filename_gameplay_hint,
+        )
+        hint = filename_gameplay_hint(filename)
+        if hint.matched:
+            logger.info(
+                "Gameplay classification: filename hint match "
+                "'%s' → slug=%s genre=%s",
+                hint.source_token, hint.slug, hint.genre,
+            )
+            return "gameplay"
+    except Exception as e:
+        logger.debug("filename_gameplay_hint failed: %s", e)
 
-    if face_ratio > 0.30:
+    # Signal 2: sparse-pass face rarity. On cartoon FPS content
+    # the sparse FaceMesh pass (no YuNet augmentation) returns
+    # near-zero faces — a signal that dense-pass YuNet false
+    # positives will later overwrite.
+    sparse_raw_ratio = 0.0
+    if sparse_face_data is not None:
+        sparse_raw_ratio, _sparse_verified = _verified_face_ratio(
+            sparse_face_data,
+        )
+        if sparse_raw_ratio < 0.05 and len(sparse_face_data) >= 10:
+            # Confirm with a cheap pixel signal so we don't return
+            # "gameplay" on a black-frame clip.
+            crosshair_score = detect_crosshair_persistence(sample_frame_paths)
+            hud_score = detect_hud_corner_brightness(sample_frame_paths)
+            logger.info(
+                "Gameplay classification (sparse path): "
+                "sparse_ratio=%.2f, crosshair=%.2f, hud=%.2f",
+                sparse_raw_ratio, crosshair_score, hud_score,
+            )
+            if crosshair_score > 0.5 or hud_score > 0.4:
+                return "gameplay"
+            # Even without an HUD signal, a completely face-less
+            # sparse pass is suspicious enough to tag as
+            # ``"unknown"`` and let the filename / content
+            # classifier take the next shot — the legacy caller
+            # treats ``"unknown"`` as "skip the gameplay
+            # fast-path but don't declare this talking-head"
+            # which is the right middle-ground for faceless but
+            # non-HUD clips (B-roll, slideshows, etc.).
+            return "unknown"
+
+    # Signal 3 + 4: dense face stats.
+    raw_ratio, verified_ratio = _verified_face_ratio(dense_face_data)
+    if raw_ratio == 0.0 and total_frames > 0:
+        # Fallback to the legacy raw count when the verifier
+        # wasn't populated on this data (backwards compat).
+        frames_with_face = sum(
+            1 for f in dense_face_data
+            if hasattr(f, "faces") and f.faces
+        )
+        raw_ratio = frames_with_face / max(1, total_frames)
+
+    # Cartoon-contamination check: if the raw rate is high but
+    # the verified-human rate is very low, this is TF2-style
+    # content where YuNet is firing on cartoon characters.
+    if raw_ratio >= 0.30 and verified_ratio < 0.15:
+        logger.info(
+            "Gameplay classification: dense raw_ratio=%.2f but "
+            "verified_ratio=%.2f (%.0f%% non-human rejection) — "
+            "promoting to gameplay",
+            raw_ratio, verified_ratio,
+            (1.0 - verified_ratio / max(raw_ratio, 1e-6)) * 100.0,
+        )
+        return "gameplay"
+
+    if raw_ratio > 0.30:
         return "not_gameplay"
 
-    # Signal 2: crosshair detection
+    # Signal 5: crosshair detection
     crosshair_score = detect_crosshair_persistence(sample_frame_paths)
 
-    # Signal 3: HUD edge density
+    # Signal 6: HUD edge density
     hud_score = detect_hud_corner_brightness(sample_frame_paths)
 
     logger.info(
-        "Gameplay classification: face_ratio=%.2f, crosshair=%.2f, hud=%.2f",
-        face_ratio, crosshair_score, hud_score,
+        "Gameplay classification: face_ratio=%.2f, verified=%.2f, "
+        "crosshair=%.2f, hud=%.2f",
+        raw_ratio, verified_ratio, crosshair_score, hud_score,
     )
 
-    if crosshair_score > 0.6 or (hud_score > 0.5 and face_ratio < 0.10):
+    if crosshair_score > 0.6 or (hud_score > 0.5 and raw_ratio < 0.10):
         return "gameplay"
 
-    if face_ratio < 0.05:
+    if raw_ratio < 0.05:
         return "unknown"
 
     return "not_gameplay"

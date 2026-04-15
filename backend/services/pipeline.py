@@ -1132,6 +1132,73 @@ async def _run_analysis_inner(job_id: str):
         except Exception as e:
             logger.warning("[%s] Face detection failed (non-fatal): %s", job_id, e)
 
+    # ── Early gameplay pre-detection ──
+    #
+    # Runs on the SPARSE face pass (FaceMesh only, no YuNet) +
+    # filename hint, BEFORE the expensive dense pass. Fires on:
+    #
+    #   1. The user picked a gameplay override from the dropdown
+    #   2. The filename matches a known game title (e.g. "TF2",
+    #      "Valorant", "Apex Legends" — see
+    #      :mod:`filename_gameplay_hint`)
+    #   3. The sparse FaceMesh pass returned ~zero faces AND a
+    #      cheap HUD / crosshair signal fires on sample frames
+    #
+    # When it fires we:
+    #   * Skip the dense face pass entirely — saves ~90s on a
+    #     2.5 min clip, and avoids letting YuNet's cartoon-face
+    #     false positives override the gameplay decision
+    #   * Set ``_is_gameplay = True`` so the downstream reframe
+    #     path takes the center-crop fast-path
+    #
+    # Guarded by a try/except so any exception degrades cleanly
+    # back to the legacy post-dense detection block.
+    _early_is_gameplay = False
+    try:
+        from backend.services.content_type_strings import (
+            is_gameplay_override as _early_is_gp_override,
+        )
+        _early_ct_override = getattr(
+            job, "content_type_override", "",
+        ) or ""
+        if _early_is_gp_override(_early_ct_override):
+            _early_is_gameplay = True
+            logger.info(
+                "[%s] Early gameplay pre-detect: user override "
+                "'%s' — skipping dense face pass",
+                job_id, _early_ct_override,
+            )
+        else:
+            from backend.services.face_detector import (
+                classify_gameplay_content as _early_cgc,
+            )
+            _early_sample_paths = [
+                str(f.path) for f in frames[:30]
+            ] if frames else []
+            _early_filename = getattr(job, "filename", None) or ""
+            _early_result = _early_cgc(
+                face_results or [],  # dense slot unused on sparse path
+                len(face_results or []),
+                _early_sample_paths,
+                sparse_face_data=face_results or [],
+                filename=_early_filename,
+            )
+            if _early_result == "gameplay":
+                _early_is_gameplay = True
+                logger.info(
+                    "[%s] Early gameplay pre-detect: gameplay "
+                    "(filename='%s', sparse_faces=%d/%d) — "
+                    "skipping dense face pass",
+                    job_id, _early_filename,
+                    sum(1 for f in face_results or [] if f.faces),
+                    len(face_results or []),
+                )
+    except Exception as _early_e:
+        logger.debug(
+            "[%s] Early gameplay pre-detect failed (non-fatal): %s",
+            job_id, _early_e,
+        )
+
     # ── Early anime hint (Week 2 Part A) ──
     # Hoisted ABOVE the dense-pass gate so a pure-anime job (where the
     # sparse FaceMesh pass returned ~zero faces) can still enter the
@@ -1188,7 +1255,11 @@ async def _run_analysis_inner(job_id: str):
     # is the only place that runs the lbpcascade_animeface augmentation
     # — so without this gate-loosening, animated jobs got 0 dense face
     # tracking and the L1 solver had no per-second face anchors.
-    if settings.SUBJECT_TRACKING_ENABLED and (face_results or _early_anime_hint):
+    if (
+        settings.SUBJECT_TRACKING_ENABLED
+        and (face_results or _early_anime_hint)
+        and not _early_is_gameplay
+    ):
         try:
             from backend.services.face_detector import detect_faces_dense
 
@@ -1289,7 +1360,7 @@ async def _run_analysis_inner(job_id: str):
         normalize_ui_content_type,
     )
 
-    _is_gameplay = False
+    _is_gameplay = _early_is_gameplay  # Carry forward the early pre-detect result
     _job_data = await database.load_job(job_id)
     _content_override = getattr(_job_data, "content_type_override", "") if _job_data else ""
     _game_type = getattr(_job_data, "game_type", "") if _job_data else ""
@@ -1302,11 +1373,37 @@ async def _run_analysis_inner(job_id: str):
     _sports_subtype = getattr(_job_data, "sports_subtype", "") if _job_data else ""
     _normalized_override = normalize_ui_content_type(_content_override)
 
+    # If the filename hint fired in the early pre-detect, inherit the
+    # resolved game slug + genre so the downstream center-bias guard
+    # fires on the correct CENTER_BIAS_GENRES bucket.
+    _filename_game_slug = ""
+    _filename_game_genre = ""
+    try:
+        from backend.services.filename_gameplay_hint import (
+            filename_gameplay_hint as _pipeline_fgh,
+        )
+        _hint_obj = _pipeline_fgh(getattr(job, "filename", ""))
+        if _hint_obj.matched:
+            _filename_game_slug = _hint_obj.slug
+            _filename_game_genre = _hint_obj.genre
+    except Exception:
+        pass
+
     if is_gameplay_override(_content_override):
         _is_gameplay = True
         logger.info(
             "[%s] Content type override = %s (user-declared gameplay fast-path)",
             job_id, _normalized_override.raw if _normalized_override else _content_override,
+        )
+    elif _early_is_gameplay:
+        # Early pre-detect already decided gameplay from the sparse
+        # face pass + filename hint. Don't re-run the heuristic on
+        # the (skipped) dense pass.
+        logger.info(
+            "[%s] Gameplay detected (early pre-detect) — "
+            "filename_slug='%s' genre='%s'",
+            job_id, _filename_game_slug or "unknown",
+            _filename_game_genre or "unknown",
         )
     elif is_user_override(_content_override):
         # User picked a non-gameplay type (or stream) — respect it and
@@ -1319,14 +1416,22 @@ async def _run_analysis_inner(job_id: str):
             _normalized_override.content_type.value,
         )
     else:
-        # Auto-detect: run the face-rarity heuristic when the user
-        # picked "auto" / nothing / an unrecognized token.
+        # Auto-detect: run the (now-hardened) face-rarity heuristic
+        # when the user picked "auto" / nothing / an unrecognized
+        # token. Passes BOTH sparse and dense face data plus the
+        # filename so the detector can cross-check YuNet's cartoon
+        # false positives against FaceMesh-only sparse results and
+        # any filename keyword match.
         try:
             from backend.services.face_detector import classify_gameplay_content
             _dense_or_sparse = dense_face_results or face_results
             _sample_paths = [f.path for f in frames[:30]] if frames else []
             _gp_result = classify_gameplay_content(
-                _dense_or_sparse, len(_dense_or_sparse), _sample_paths,
+                _dense_or_sparse,
+                len(_dense_or_sparse),
+                _sample_paths,
+                sparse_face_data=face_results or None,
+                filename=getattr(job, "filename", None),
             )
             if _gp_result == "gameplay":
                 _is_gameplay = True
@@ -3078,6 +3183,47 @@ async def _run_analysis_inner(job_id: str):
             )
         except Exception as e:
             logger.warning("[%s] Content classification failed (non-fatal): %s", job_id, e)
+
+        # ── Gameplay subtype backfill ──
+        #
+        # When the early pre-detect (filename hint / sparse faces)
+        # flipped ``_is_gameplay=True`` but the content classifier
+        # settled on a non-gameplay content_type (common on TF2
+        # where cartoon-character face detection pushes the
+        # classifier toward "sports" or "narrative"), the
+        # resulting profile has ``gameplay_subtype=None`` — which
+        # means the CENTER_BIAS_GENRES guard in
+        # :mod:`reframe_segmenter` never fires. Backfill
+        # ``gameplay_subtype`` from the filename hint's genre (or
+        # a plain ``"gameplay"`` fallback) so the downstream
+        # center-bias path is active for every segment.
+        if _is_gameplay and _content_profile is not None:
+            _existing_sub = getattr(
+                _content_profile, "gameplay_subtype", None,
+            )
+            if not _existing_sub:
+                _backfill_sub = _filename_game_genre or "gameplay"
+                try:
+                    _content_profile.gameplay_subtype = _backfill_sub
+                    if _filename_game_slug and not getattr(
+                        _content_profile, "game_type", "",
+                    ):
+                        _content_profile.game_type = _filename_game_slug
+                    logger.info(
+                        "[%s] Gameplay subtype backfill: "
+                        "content_type=%s → gameplay_subtype='%s' "
+                        "(filename_slug='%s')",
+                        job_id,
+                        getattr(_content_profile, "content_type", "?"),
+                        _backfill_sub,
+                        _filename_game_slug or "-",
+                    )
+                except Exception as _bf_e:
+                    logger.debug(
+                        "[%s] Gameplay subtype backfill failed "
+                        "(non-fatal): %s",
+                        job_id, _bf_e,
+                    )
 
         # ── Anime dense re-run fallback (Week 2 Part A Option 1) ──
         # If the early anime hint was False (user didn't pick anime,
