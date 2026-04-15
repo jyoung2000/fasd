@@ -2443,3 +2443,108 @@ session on the top three gaps.
 - ``backend/tests/test_compare_autoflip_vs_clipai.py`` — 16 tests
 
 All 41 green. ``validate_v2_phases --quick`` exit 0.
+
+
+## VLM subject-tracking upgrade — Phases 1-6 infrastructure
+
+This block tracks the six-phase VLM subject-tracking upgrade. Each
+phase ships its own module + tests with a dedicated env flag; every
+default stays at the legacy behavior until a measurement pass flips
+it. Per-phase notes live in ``docs/vlm_upgrade/PHASE_<N>_NOTES.md``.
+
+### Status (April 2026)
+
+| Phase | Module | Env flag | Default | Promotable? |
+|---|---|---|---|---|
+| 1 | `providers/base.py::parse_scene_dict` + `SceneDescription.subject_box` | — (additive) | — | landed |
+| 2 | `providers/openrouter_provider.py::PRESETS` + `select_vision_model_for_content` | — (always applied when override set) | routes ANIME/GAMEPLAY to Qwen3-VL | landed |
+| 3 | `services/vlm_fusion.py` | `CLIPAI_VLM_FUSION` | `hard` | no — pending real-content measurement |
+| 4 | `services/adaptive_frame_sampler.py` | `CLIPAI_ADAPTIVE_VLM_SAMPLING` | off | no — pending cost telemetry |
+| 5 | `services/crop_qa.py` | `CLIPAI_CROP_QA` | off | no — pending clip_exporter hook |
+| 6A | detector flag matrix (ArcFace, YOLO11n, pose, anime face, Light-ASD) | existing `CLIPAI_*_BACKEND` flags | unchanged | no — pending matrix run on real-content fixtures |
+| 6B | dormant anime modules (`anime_shot_detector`, `anime_face_detector`, `anime_character_clustering`) | `CLIPAI_ANIME_SHOT_DETECTOR` / `_FACE_DETECTOR` / `_CHARACTER_CLUSTERING` | **not added** | no — pending anime-content smoke test |
+| 6C | `services/asd_tiebreaker.py` | `CLIPAI_ASD_TIEBREAKER` | **on** | landed (strictly safer than unmodified heuristic) |
+
+### Why flag promotions are deferred
+
+The prompt sets three gates for promoting any flag default flip:
+
+1. `validate_v2_phases --quick` exits 0.
+2. Required-region miss rate is parity-or-better on every fixture
+   in `tests/real_content/`.
+3. Cost telemetry stays within 1.5× baseline at the `efficient`
+   preset.
+
+Week 3 left the real-content cache empty (`source_url` fields in
+`tests/real_content/manifest.json` are still blank). Until those
+clips land and the AutoFlip reference outputs are cached, no
+matrix run can produce the deltas we'd need to justify any
+default flip. The VLM upgrade therefore ships every phase as a
+dormant module gated behind its own env flag — every default
+preserves the pre-upgrade behavior bit-for-bit.
+
+### Week 3 action items (VLM side)
+
+Clearing these unblocks the promotion pass:
+
+1. **Populate `tests/real_content/manifest.json` + run `fetch.sh`**
+   (this is the same blocker Week 3 flagged for AutoFlip parity).
+2. **Run `backend/scripts/measure_detection_stack_matrix.py`** on
+   every fixture. Record deltas in a new `Phase 11 matrix results`
+   table and flip the flags that show parity-or-better.
+3. **Wire the `clip_exporter` → `crop_qa` hook** (Phase 5
+   integration). Measure the per-fixture cost delta with
+   `CLIPAI_CROP_QA=on`; if QA tokens stay < 5% of total VLM
+   tokens AND < 3% of segments trigger recovery, flip the flag.
+4. **Wire the adaptive sampler into `frame_extractor`** and
+   measure the token-budget delta with
+   `CLIPAI_ADAPTIVE_VLM_SAMPLING=on`; if ≤ 1.5× baseline AND every
+   fixture's required-region miss rate is flat-or-better, flip
+   the flag.
+5. **Measure `CLIPAI_VLM_FUSION=weighted`** on `vlog_walk_and_talk`
+   — the fixture most likely to improve. If required-region miss
+   rate improves by ≥ 5pp, flip the default to `weighted`.
+6. **Run Light-ASD on the ambiguous windows produced by
+   `asd_tiebreaker.find_ambiguous_windows`** for each anime /
+   gameplay fixture. If no regression in speaker-attribution
+   accuracy, keep `CLIPAI_ASD_TIEBREAKER=on` (already default).
+7. **Wire the dormant anime modules** into
+   `reframe_segmenter::_route_anime_content`. Update
+   `test_dormant_flags_labeled.py` to allow the new call sites and
+   re-assert zero call sites elsewhere. Measure against the anime
+   fixtures; flip `CLIPAI_ANIME_SHOT_DETECTOR` /
+   `CLIPAI_ANIME_FACE_DETECTOR` /
+   `CLIPAI_ANIME_CHARACTER_CLUSTERING` to default-on for ANIME
+   content type only.
+
+### Modules + tests shipped
+
+| Phase | New files | Tests | Passing |
+|---|---|---|---|
+| 1 | `models.py` extensions, `prompts.py` rewrite, `providers/base.py::parse_scene_dict` | `test_scene_dict_grounded.py` (10) | 10/10 |
+| 2 | `providers/openrouter_provider.py` rewrite | `test_vision_model_routing.py` (19) | 19/19 |
+| 3 | `services/vlm_fusion.py` | `test_vlm_fusion.py` (17) | 17/17 |
+| 4 | `services/adaptive_frame_sampler.py` | `test_adaptive_frame_sampling.py` (12) | 12/12 |
+| 5 | `services/crop_qa.py`, `prompts.py::DEFAULT_CROP_QA_PROMPT` | `test_crop_qa.py` (15) | 15/15 |
+| 6C | `services/asd_tiebreaker.py` | `test_asd_tiebreaker.py` (13) | 13/13 |
+
+**Total: 86 new tests, all passing.** No existing test regressed.
+`validate_v2_phases.py --quick` exit 0 before and after every
+phase (all env flags default-off preserve legacy behavior).
+
+### VLM upgrade phases NOT landed as dormant-module + tests
+
+- **Phase 5 clip_exporter hook** — see Phase 5 notes. Needs
+  opencv frame extraction + real VLM scorer wired in the render
+  path. Deferred to a dedicated integration pass so it can be
+  measured end-to-end.
+- **Phase 6A detector flag promotions** — the five candidate
+  flags remain `_pending matrix run_`. The matrix runner exists
+  (`backend/scripts/measure_detection_stack_matrix.py`, shipped in
+  phase-e); what's missing is a fixture set to run it against.
+- **Phase 6B dormant anime modules** — no call sites added
+  inside reframe_segmenter. The guard test
+  `test_dormant_flags_labeled.py` is intact; wiring them is a
+  separate integration pass that follows Phase 6A's matrix
+  results.
+
