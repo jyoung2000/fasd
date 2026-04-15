@@ -19,6 +19,26 @@ logger = logging.getLogger(__name__)
 REGISTRY_USE_HUMAN_WEIGHT = os.environ.get("REGISTRY_USE_HUMAN_WEIGHT", "true").lower() in ("true", "1", "yes")
 REGISTRY_USE_COHESION_GATE = os.environ.get("REGISTRY_USE_COHESION_GATE", "true").lower() in ("true", "1", "yes")
 
+# ── Cosine-similarity thresholds for face identity matching ──
+# ArcFace 512-d embeddings have tighter within-class / looser between-class
+# distributions than SFace 128-d, so the per-pair similarity thresholds shift.
+# Read once at import time so the rest of the module can branch on simple
+# constants without re-reading the env var on every call.
+_FACE_EMB_BACKEND = os.environ.get("CLIPAI_FACE_EMBEDDING", "sface").lower()
+# Same-identity floor: pair-level cosine similarity above this is treated as
+# "same person." ArcFace separates classes better, so the threshold sits a hair
+# higher than for SFace while keeping recall.
+_SAME_ID_COSINE_THRESHOLD = 0.45 if _FACE_EMB_BACKEND == "arcface" else 0.40
+# Different-identity floor: pairs below this are confidently NOT the same
+# person. ArcFace's tighter class structure lets us be more permissive here
+# (a lower threshold still flags "different").
+_DIFF_ID_COSINE_THRESHOLD = 0.28 if _FACE_EMB_BACKEND == "arcface" else 0.35
+# Teleport-merge: collapse two slots that share x-position AND look like the
+# same identity. Held intentionally strict because false merges destroy the
+# multi-speaker structure. ArcFace separates better, so the threshold can be
+# slightly lower without losing precision.
+_TELEPORT_MERGE_COSINE_SIM = 0.65 if _FACE_EMB_BACKEND == "arcface" else 0.70
+
 
 @dataclass
 class FaceSlot:
@@ -529,7 +549,8 @@ def _merge_teleporting_embedding_slots(
             if ca is None or cb is None:
                 continue
             cos_sim = float(np.dot(ca, cb))
-            if cos_sim > 0.70:
+            # Threshold depends on CLIPAI_FACE_EMBEDDING backend
+            if cos_sim > _TELEPORT_MERGE_COSINE_SIM:
                 _union(a.slot_id, b.slot_id)
                 merges += 1
 
@@ -641,6 +662,20 @@ def build_face_registry_with_embeddings(
         logger.info(
             "Embedding coverage too low (%d/%d faces) — falling back to position-based registry",
             len(all_faces), total_faces,
+        )
+        return build_face_registry(face_results, min_appearances)
+
+    # Mixed-dimension guard: if the run mixes 128-d (SFace) and 512-d (ArcFace)
+    # embeddings — e.g. mid-run env-var flip — np.stack would raise. Detect
+    # the heterogeneity and fall back to position-based clustering instead of
+    # crashing the pipeline.
+    emb_dims = {len(f[0]) for f in all_faces}
+    if len(emb_dims) > 1:
+        logger.warning(
+            "Mixed embedding dimensions detected (%s) — falling back to "
+            "position-based registry. This usually means CLIPAI_FACE_EMBEDDING "
+            "changed mid-run.",
+            sorted(emb_dims),
         )
         return build_face_registry(face_results, min_appearances)
 
@@ -1014,7 +1049,8 @@ def assign_identities(face_results: list, registry: "FaceRegistry") -> None:
                         if sim > best_sim:
                             best_sim = sim
                             best_sid = sid
-                    if best_sid >= 0 and best_sim > 0.5:
+                    # Threshold depends on CLIPAI_FACE_EMBEDDING backend
+                    if best_sid >= 0 and best_sim > _SAME_ID_COSINE_THRESHOLD:
                         face.identity_id = best_sid
                         continue
                 except (ImportError, Exception):

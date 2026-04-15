@@ -30,7 +30,7 @@ class FaceInfo:
     nose_y: float         # Best estimate of face center y, 0-100
     confidence: float     # Detection confidence, 0-1
     lip_aperture: float = 0.0  # Mouth openness ratio (0=closed, 1=wide open)
-    identity_embedding: list = None  # 128-d face embedding for re-identification
+    identity_embedding: list = None  # 128-d (SFace) or 512-d (ArcFace) face embedding for re-identification
     identity_id: int = -1       # Assigned face slot from registry (-1 = unassigned)
     is_speaking: bool = False   # Set by active speaker detection
     y_bottom: float = 0.0      # Bottom of face bbox as % of frame (for vertical positioning)
@@ -124,6 +124,128 @@ def _extract_face_embeddings(frame_img, faces_info: list, detector) -> list:
             face.y_bottom = round((face.y_center + face.height / 2), 1)
         except Exception:
             pass  # Non-critical — face still usable without embedding
+
+    return faces_info
+
+
+# ── ArcFace (InsightFace buffalo_s) embedding backend ──
+# Module-level singleton so we don't reload the 16 MB ONNX per batch.
+# Routed via CLIPAI_FACE_EMBEDDING=arcface; defaults off.
+# CPU-only via onnxruntime CPUExecutionProvider — must NOT compete with
+# Whisper / Ollama on the GTX 1650 (4 GB VRAM is reserved for them).
+_ARCFACE_APP = None
+
+
+def _get_arcface_app():
+    """Lazy-load InsightFace ArcFace (buffalo_s pack), CPU-only.
+
+    Returns None if insightface / onnxruntime are unavailable so callers
+    can fall back to SFace. The model is cached after first load.
+    """
+    global _ARCFACE_APP
+    if _ARCFACE_APP is not None:
+        return _ARCFACE_APP
+    try:
+        from insightface.app import FaceAnalysis
+    except ImportError as e:
+        logger.warning("insightface not installed — ArcFace unavailable: %s", e)
+        return None
+    except Exception as e:
+        logger.warning("insightface import failed: %s", e)
+        return None
+
+    model_root = os.path.join(os.path.dirname(__file__), "..", "models", "insightface")
+    os.makedirs(model_root, exist_ok=True)
+    try:
+        app = FaceAnalysis(
+            name="buffalo_s",
+            root=model_root,
+            # CPU ONLY — GPU is reserved for Whisper/Ollama. Do not change.
+            providers=["CPUExecutionProvider"],
+            allowed_modules=["recognition"],  # skip det/landmark — we use YuNet
+        )
+        app.prepare(ctx_id=-1, det_size=(320, 320))
+        _ARCFACE_APP = app
+        logger.info("Loaded InsightFace buffalo_s (ArcFace, 512-d, CPU)")
+        return app
+    except Exception as e:
+        logger.warning("Failed to init InsightFace buffalo_s: %s", e)
+        return None
+
+
+def _extract_face_embeddings_arcface(frame_img, faces_info: list) -> list:
+    """Extract 512-d ArcFace embeddings using InsightFace buffalo_s.
+
+    We reuse the YuNet bbox/landmarks already attached to each FaceInfo —
+    InsightFace's recognition module needs an aligned face crop, and we
+    build it from the bbox + nose landmark to avoid running its own
+    detector twice.
+    """
+    import numpy as np
+
+    app = _get_arcface_app()
+    if app is None or not faces_info:
+        return faces_info
+
+    try:
+        from insightface.app.common import Face as IFace
+    except ImportError:
+        return faces_info
+
+    h, w = frame_img.shape[:2]
+    rec_model = None
+    # Pull the recognition model directly from the analysis app.
+    try:
+        for m in app.models.values():
+            if hasattr(m, "get_feat") or hasattr(m, "get"):
+                rec_model = m
+                break
+    except Exception:
+        rec_model = None
+    if rec_model is None:
+        logger.warning("ArcFace recognition model not found in buffalo_s pack")
+        return faces_info
+
+    for face in faces_info:
+        try:
+            # Convert our 0-100 percentage bbox back to absolute pixel coords
+            fx1 = max(0, int((face.x_center - face.width / 2) * w / 100))
+            fy1 = max(0, int((face.y_center - face.height / 2) * h / 100))
+            fx2 = min(w, int((face.x_center + face.width / 2) * w / 100))
+            fy2 = min(h, int((face.y_center + face.height / 2) * h / 100))
+            if fx2 - fx1 < 12 or fy2 - fy1 < 12:
+                continue  # too small to embed reliably
+
+            # Build the 5-point landmark array InsightFace expects:
+            # (right-eye, left-eye, nose, right-mouth, left-mouth) in pixels.
+            # YuNet only stores the nose tip on FaceInfo, so synthesize the
+            # other four from the bbox geometry — buffalo_s's alignCrop is
+            # robust to the approximation.
+            nose_x = face.nose_x * w / 100
+            nose_y = face.nose_y * h / 100
+            eye_y = fy1 + (fy2 - fy1) * 0.35
+            mouth_y = fy1 + (fy2 - fy1) * 0.75
+            kps = np.array([
+                [fx1 + (fx2 - fx1) * 0.35, eye_y],
+                [fx1 + (fx2 - fx1) * 0.65, eye_y],
+                [nose_x, nose_y],
+                [fx1 + (fx2 - fx1) * 0.38, mouth_y],
+                [fx1 + (fx2 - fx1) * 0.62, mouth_y],
+            ], dtype=np.float32)
+
+            iface = IFace(
+                bbox=np.array([fx1, fy1, fx2, fy2], dtype=np.float32),
+                kps=kps,
+            )
+            # InsightFace recognition models expose `get(img, face)` which
+            # returns a 512-d L2-normalized feature vector.
+            feat = rec_model.get(frame_img, iface)
+            if feat is None:
+                continue
+            face.identity_embedding = np.asarray(feat, dtype=np.float32).flatten().tolist()
+            face.y_bottom = round((face.y_center + face.height / 2), 1)
+        except Exception as e:
+            logger.debug("ArcFace embed failed for one face: %s", e)
 
     return faces_info
 
@@ -298,7 +420,17 @@ def _detect_with_opencv_dnn(frame_paths, min_confidence, extract_embeddings=True
 
         # Extract identity embeddings (YuNet only — Haar doesn't provide landmarks)
         if extract_embeddings and not use_haar and detector is not None and faces and img is not None:
-            faces = _extract_face_embeddings(img, faces, detector)
+            backend = os.environ.get("CLIPAI_FACE_EMBEDDING", "sface").lower()
+            if backend == "arcface":
+                faces = _extract_face_embeddings_arcface(img, faces)
+                # Graceful degrade: if ArcFace returned nothing, fall through to SFace
+                if not any(f.identity_embedding is not None for f in faces):
+                    logger.debug(
+                        "ArcFace returned no embeddings — falling back to SFace for this frame"
+                    )
+                    faces = _extract_face_embeddings(img, faces, detector)
+            else:
+                faces = _extract_face_embeddings(img, faces, detector)
 
         primary = -1
         if faces:

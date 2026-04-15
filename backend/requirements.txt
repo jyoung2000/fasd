@@ -36,3 +36,8 @@ torch>=2.0.0
 # about what is speech — the basis for detecting missed dialogue in
 # `backend.services.coverage_audit`.
 silero-vad>=5.0.0
+# ArcFace (InsightFace buffalo_s) for identity embeddings.
+# CPU-only via onnxruntime — must not compete with Whisper/Ollama on the GPU.
+# Enabled via CLIPAI_FACE_EMBEDDING=arcface (default: sface).
+insightface==0.7.3
+onnxruntime>=1.17.0

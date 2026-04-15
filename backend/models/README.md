@@ -29,6 +29,21 @@ anime face detector no-ops without it — `detect_anime_faces()`
 returns `AnimeDetectionResult(skipped_reason="cascade not found: ...")`
 when the XML is missing. Do **not** delete it.
 
+### `insightface/models/buffalo_s/` (ArcFace 512-d)
+
+- **Size:** ~16 MB (recognition pack only; full buffalo_s is ~25 MB)
+- **Source:** Auto-fetched by `insightface.app.FaceAnalysis(name='buffalo_s')`
+  on first use. The Dockerfile pre-downloads it so cold containers don't
+  stall on the first analysis run.
+- **Used by:** `backend/services/face_detector.py`
+  `_extract_face_embeddings_arcface()`.
+- **Why:** SFace 128-d under-separates identities — ArcFace 512-d gives
+  substantially tighter clusters and reduces speaker-slot flips on
+  multi-speaker fixtures. Enabled via the `CLIPAI_FACE_EMBEDDING=arcface`
+  env var (default `sface`). CPU-only via the onnxruntime
+  `CPUExecutionProvider` — must NOT touch the GPU (Whisper / Ollama
+  share the GTX 1650).
+
 ## How to re-download
 
 ```bash
