@@ -219,6 +219,152 @@ def to_face_info(detection: AnimeFaceDetection, *, identity_id: int = -1):
     )
 
 
+# ──────────────────── Phase D: YOLOv8-anime-face ONNX backend ────────────────────
+#
+# CLIPAI_ANIME_FACE_BACKEND=yolo_anime switches the detector from the
+# 2014-era lbpcascade Haar cascade to a deepghs YOLOv8-anime-face ONNX
+# model. The ONNX runs on CPU via onnxruntime CPUExecutionProvider — the
+# GTX 1650 stays reserved for Whisper / Ollama. The flag defaults to
+# lbpcascade so production behaviour is unchanged.
+
+_YOLO_ANIME_SESSION = None
+YOLO_ANIME_URL = (
+    "https://huggingface.co/deepghs/anime_face_detection/resolve/main/"
+    "face_detect_v1.4_s/model.onnx"
+)
+
+
+def _get_yolo_anime_session():
+    """Lazy-load the YOLOv8-anime-face ONNX session.
+
+    Returns None when onnxruntime isn't installed or the model can't be
+    fetched / loaded so callers can fall back to the lbpcascade tier.
+    Cached as a module-level singleton.
+    """
+    global _YOLO_ANIME_SESSION
+    if _YOLO_ANIME_SESSION is not None:
+        return _YOLO_ANIME_SESSION
+    try:
+        import onnxruntime as ort
+    except ImportError:
+        logger.warning(
+            "onnxruntime not installed — YOLOv8-anime-face unavailable",
+        )
+        return None
+
+    model_path = os.path.join(
+        os.path.dirname(__file__), "..", "models", "yolo_anime_face.onnx",
+    )
+    if not os.path.isfile(model_path):
+        os.makedirs(os.path.dirname(model_path), exist_ok=True)
+        try:
+            import urllib.request
+            logger.info("Downloading YOLOv8-anime-face ONNX model...")
+            urllib.request.urlretrieve(YOLO_ANIME_URL, model_path)
+        except Exception as e:
+            logger.warning("Failed to download YOLO anime face model: %s", e)
+            return None
+
+    try:
+        _YOLO_ANIME_SESSION = ort.InferenceSession(
+            model_path,
+            providers=["CPUExecutionProvider"],
+        )
+        logger.info("Loaded YOLOv8-anime-face ONNX session (CPU)")
+        return _YOLO_ANIME_SESSION
+    except Exception as e:
+        logger.warning("YOLO anime session init failed: %s", e)
+        return None
+
+
+def _detect_with_yolo_anime(
+    frame_path: str,
+    *,
+    timestamp: float = 0.0,
+    min_confidence: float = 0.4,
+) -> AnimeDetectionResult:
+    """Run YOLOv8-anime-face ONNX on a single frame.
+
+    Returns an AnimeDetectionResult with one AnimeFaceDetection per
+    surviving box (after the model's built-in NMS). Falls through to an
+    empty result on any failure so the caller can fall back to the
+    lbpcascade tier without a crash.
+    """
+    sess = _get_yolo_anime_session()
+    if sess is None:
+        return AnimeDetectionResult(
+            timestamp=timestamp, skipped_reason="yolo_anime: no session"
+        )
+    try:
+        import cv2
+        import numpy as np
+    except ImportError as exc:
+        return AnimeDetectionResult(
+            timestamp=timestamp,
+            skipped_reason=f"yolo_anime: missing deps: {exc}",
+        )
+
+    img = cv2.imread(frame_path)
+    if img is None:
+        return AnimeDetectionResult(
+            timestamp=timestamp,
+            skipped_reason=f"yolo_anime: cannot read frame: {frame_path}",
+        )
+    h, w = img.shape[:2]
+    if w <= 0 or h <= 0:
+        return AnimeDetectionResult(
+            timestamp=timestamp,
+            skipped_reason="yolo_anime: degenerate frame",
+        )
+
+    # Standard YOLOv8 preprocessing: resize to 640x640, BGR→RGB, normalize
+    # to 0-1, CHW, NCHW. The deepghs models export with NMS included so
+    # we get a flat (N, 6) output.
+    img_resized = cv2.resize(img, (640, 640))
+    img_rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
+    blob = img_rgb.transpose(2, 0, 1)[None].astype(np.float32) / 255.0
+
+    try:
+        outputs = sess.run(None, {sess.get_inputs()[0].name: blob})
+    except Exception as exc:
+        logger.debug("yolo_anime forward failed: %s", exc)
+        return AnimeDetectionResult(
+            timestamp=timestamp,
+            skipped_reason=f"yolo_anime: forward failed: {exc}",
+        )
+
+    preds = outputs[0]
+    if hasattr(preds, "ndim") and preds.ndim == 3:
+        preds = preds[0]
+
+    detections: list[AnimeFaceDetection] = []
+    sx, sy = w / 640.0, h / 640.0
+    for det in preds:
+        if len(det) < 5:
+            continue
+        conf = float(det[4])
+        if conf < min_confidence:
+            continue
+        x1, y1, x2, y2 = float(det[0]), float(det[1]), float(det[2]), float(det[3])
+        x1, x2 = x1 * sx, x2 * sx
+        y1, y2 = y1 * sy, y2 * sy
+        cx_pct = ((x1 + x2) / 2) / w * 100
+        cy_pct = ((y1 + y2) / 2) / h * 100
+        fw_pct = (x2 - x1) / w * 100
+        fh_pct = (y2 - y1) / h * 100
+        if fw_pct <= 0 or fh_pct <= 0:
+            continue
+        detections.append(AnimeFaceDetection(
+            x_center=float(cx_pct),
+            y_center=float(cy_pct),
+            width=float(fw_pct),
+            height=float(fh_pct),
+            confidence=conf,
+            source="yolo_anime",
+        ))
+    return AnimeDetectionResult(timestamp=timestamp, detections=detections)
+
+
 # ──────────────────── Cascade-backed detector ────────────────────
 
 
@@ -252,6 +398,20 @@ def detect_anime_faces(
         ``AnimeDetectionResult`` with ``detections`` and either
         ``has_faces`` or a ``skipped_reason``.
     """
+    # Phase D: route through YOLOv8-anime-face when requested. Falls
+    # through to the lbpcascade tier on any failure / empty result so
+    # the existing path still wins when the new model is unavailable.
+    backend = os.environ.get("CLIPAI_ANIME_FACE_BACKEND", "lbpcascade").lower()
+    if backend == "yolo_anime":
+        yres = _detect_with_yolo_anime(
+            frame_path,
+            timestamp=timestamp,
+            min_confidence=0.4,
+        )
+        if yres.has_faces:
+            return yres
+        # belt-and-suspenders: fall through to lbpcascade on empty.
+
     try:
         import cv2  # noqa: F401
     except ImportError as exc:
