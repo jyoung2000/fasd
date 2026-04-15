@@ -59,6 +59,13 @@ GAMING_SLA = {
     "event_precision_min": 0.95,
     "max_velocity_pct_per_sec": 30.0,
     "layout_target_tolerance": 0.05,  # 5% slack on layout target
+    # Phase 1 center-bias SLAs
+    "center_lock_pct_min": 0.90,      # >=90% of uncertain frames within
+                                      # ±5% of x=50 for CENTER_BIAS genres
+    "off_axis_drift_events_max": 0,   # hard zero — any drift > 10% off
+                                      # center without justification fails
+    "center_bias_regression_lock_min": 1.00,  # TF2-style fixtures must
+                                              # hit 100% center lock
 }
 
 
@@ -146,6 +153,78 @@ def _event_metrics(fixture: GamingFixture, detected: list) -> dict:
         "precision": round(precision, 3),
         "n_truth": len(truth),
         "n_detected": len(detected),
+    }
+
+
+def _center_lock_metrics(
+    tracked: list,
+    *,
+    conf_threshold: float = 0.6,
+    lock_tolerance_pct: float = 5.0,
+    drift_threshold_pct: float = 10.0,
+    in_pan_window_fn=None,
+) -> dict:
+    """Score the Phase 1 center-bias lock across a tracked path.
+
+    For each frame in ``tracked``:
+
+      - If the frame's ``confidence >= conf_threshold``, skip it
+        — the crosshair override is legitimately firing and no
+        center lock is expected.
+      - If an optional ``in_pan_window_fn(timestamp) -> bool``
+        returns True, skip it — the frame is inside a legitimate
+        HUD-pan window.
+      - Otherwise, check whether the tracked ``x_pct`` is within
+        ``lock_tolerance_pct`` of 50. If yes, count it toward the
+        locked bucket.
+      - Any frame whose tracked ``x_pct`` drifts more than
+        ``drift_threshold_pct`` from center without justification
+        counts as an ``off_axis_drift_event`` — hard fail.
+
+    Returns a dict with ``center_lock_pct`` (fraction of
+    uncertain frames within tolerance), ``off_axis_drift_events``
+    (absolute count), and ``n_uncertain`` (denominator).
+    """
+    if not tracked:
+        return {
+            "center_lock_pct": None,
+            "off_axis_drift_events": 0,
+            "n_uncertain": 0,
+        }
+
+    def _t(p):
+        return getattr(p, "timestamp", None) if hasattr(p, "timestamp") else p[0]
+
+    def _x(p):
+        return getattr(p, "x_pct", None) if hasattr(p, "x_pct") else p[1]
+
+    def _c(p):
+        return getattr(p, "confidence", 0.0) if hasattr(p, "confidence") else (
+            p[3] if isinstance(p, (tuple, list)) and len(p) > 3 else 0.0
+        )
+
+    n_uncertain = 0
+    n_locked = 0
+    drift_events = 0
+    for entry in tracked:
+        conf = _c(entry)
+        ts = _t(entry)
+        if conf >= conf_threshold:
+            continue
+        if in_pan_window_fn is not None and in_pan_window_fn(ts):
+            continue
+        n_uncertain += 1
+        x_pct = _x(entry) or 0.0
+        if abs(x_pct - 50.0) <= lock_tolerance_pct:
+            n_locked += 1
+        if abs(x_pct - 50.0) > drift_threshold_pct:
+            drift_events += 1
+
+    pct = (n_locked / n_uncertain) if n_uncertain else 1.0
+    return {
+        "center_lock_pct": round(pct, 3),
+        "off_axis_drift_events": drift_events,
+        "n_uncertain": n_uncertain,
     }
 
 
@@ -246,12 +325,26 @@ def score_fixture(fixture: GamingFixture) -> dict:
     # will swap this for the live path.
     truth = fixture.crosshair_truth or []
     tracked = []
-    for t, x, y in truth:
-        # Add ±0.5 % jitter so the metric isn't trivially zero
-        tracked.append(type("CF", (), {
-            "timestamp": t, "x_pct": x + 0.4, "y_pct": y + 0.3,
-            "confidence": 0.85,
-        })())
+
+    if fixture.center_bias_regression and not truth:
+        # Phase 1 regression fixture — simulate the always-emit
+        # fallback breadcrumbs that ``track_crosshair_path``
+        # produces for a clip with no detectable crosshair.
+        # Every frame is a (50, 50, 0.0) entry.
+        n_frames = int(round(fixture.video_duration * 30.0))
+        for i in range(n_frames):
+            t = i / 30.0
+            tracked.append(type("CF", (), {
+                "timestamp": t, "x_pct": 50.0, "y_pct": 50.0,
+                "confidence": 0.0,
+            })())
+    else:
+        for t, x, y in truth:
+            # Add ±0.5 % jitter so the metric isn't trivially zero
+            tracked.append(type("CF", (), {
+                "timestamp": t, "x_pct": x + 0.4, "y_pct": y + 0.3,
+                "confidence": 0.85,
+            })())
 
     crosshair_metrics = _crosshair_metrics(fixture, tracked)
 
@@ -286,6 +379,39 @@ def score_fixture(fixture: GamingFixture) -> dict:
 
     # Pan smoothness: walk the synthetic tracked path
     max_vel = _max_velocity_pct_per_sec(tracked)
+
+    # Phase 1 center-lock metrics. Skip non-center-bias genres
+    # (MOBA / TPS / racing) — their action can legitimately live
+    # off-center so the center-lock SLA would produce false failures.
+    center_bias_genre = fixture.genre in {
+        "fps", "gameplay_fps", "hero_shooter", "sandbox", "gameplay",
+    }
+    # Build a pan-window predicate from the fixture event truth so
+    # frames inside a legitimate HUD pan are excluded from the
+    # center-lock denominator.
+    labeled_pan_events = [
+        (ev_t, 0.8) for ev_t, ev_kind in (fixture.event_truth or [])
+        if ev_kind in ("kill", "ult")
+    ]
+
+    def _in_pan_window(ts: float) -> bool:
+        if ts is None:
+            return False
+        for ev_t, ev_d in labeled_pan_events:
+            if ev_t - 0.3 <= ts <= ev_t + ev_d + 0.3:
+                return True
+        return False
+
+    if center_bias_genre:
+        lock_metrics = _center_lock_metrics(
+            tracked, in_pan_window_fn=_in_pan_window,
+        )
+    else:
+        lock_metrics = {
+            "center_lock_pct": None,
+            "off_axis_drift_events": 0,
+            "n_uncertain": 0,
+        }
 
     # SLA evaluation
     failures = []
@@ -323,11 +449,34 @@ def score_fixture(fixture: GamingFixture) -> dict:
             f"{GAMING_SLA['max_velocity_pct_per_sec']}+slack"
         )
 
+    # Phase 1 center-lock SLA — only applies to center-bias genres.
+    if center_bias_genre and lock_metrics["center_lock_pct"] is not None:
+        lock_target = (
+            GAMING_SLA["center_bias_regression_lock_min"]
+            if fixture.center_bias_regression
+            else GAMING_SLA["center_lock_pct_min"]
+        )
+        if lock_metrics["center_lock_pct"] + 1e-9 < lock_target:
+            failures.append(
+                f"center_lock_pct={lock_metrics['center_lock_pct']:.2f} "
+                f"< target {lock_target:.2f}"
+            )
+        if lock_metrics["off_axis_drift_events"] > (
+            GAMING_SLA["off_axis_drift_events_max"]
+        ):
+            failures.append(
+                f"off_axis_drift_events="
+                f"{lock_metrics['off_axis_drift_events']} > "
+                f"{GAMING_SLA['off_axis_drift_events_max']}"
+            )
+
     return {
         "name": fixture.name,
         "genre": fixture.genre,
         "video_duration": fixture.video_duration,
         "crosshair": crosshair_metrics,
+        "center_lock": lock_metrics,
+        "center_bias_regression": fixture.center_bias_regression,
         "events": event_metrics,
         "max_velocity_pct_per_sec": round(max_vel, 2),
         "layout_distribution": distribution,
@@ -342,6 +491,7 @@ def emit_summary(row: dict) -> None:
     name = row["name"]
     cm = row.get("crosshair", {})
     em = row.get("events", {})
+    cl = row.get("center_lock", {})
     layouts = row.get("layout_distribution", {})
     layout_str = ", ".join(
         f"{k}={int(round(v * 100))}%" for k, v in layouts.items()
@@ -349,13 +499,24 @@ def emit_summary(row: dict) -> None:
     cross_part = ""
     if cm.get("mean") is not None:
         cross_part = f"crosshair_err: mean={cm['mean']:.1f}%, p95={cm['p95']:.1f}% | "
+    elif row.get("center_bias_regression"):
+        cross_part = "crosshair_err: n/a (no detectable crosshair in fixture) | "
     event_part = ""
     if em.get("recall") is not None:
         event_part = (
             f"events_recall={em['recall']:.2f}/precision={em['precision']:.2f} | "
         )
+    # Phase 1 center-lock metrics.
+    lock_part = ""
+    if cl.get("center_lock_pct") is not None:
+        lock_pct = int(round(cl["center_lock_pct"] * 100))
+        drift = cl.get("off_axis_drift_events", 0)
+        lock_part = (
+            f"center_lock_pct={lock_pct}% "
+            f"(off_axis_drift_events={drift}) | "
+        )
     print(
-        f"[gaming-parity] {name}: {cross_part}{event_part}"
+        f"[gaming-parity] {name}: {cross_part}{lock_part}{event_part}"
         f"layouts={{{layout_str}}} | "
         f"max_vel={row['max_velocity_pct_per_sec']:.1f}%/s | "
         f"sla={row['sla_status']}",

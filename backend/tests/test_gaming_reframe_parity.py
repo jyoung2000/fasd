@@ -14,7 +14,9 @@ def test_gaming_parity_all_fixtures_pass_slas():
     from backend.scripts.measure_gaming_reframe import run_all
 
     payload = run_all()
-    assert payload["fixture_count"] == 5
+    # Six fixtures now — the TF2 center-bias regression joined
+    # the set in this branch.
+    assert payload["fixture_count"] == 6
     failures = [
         r for r in payload["results"] if r["sla_status"] != "passed"
     ]
@@ -23,6 +25,26 @@ def test_gaming_parity_all_fixtures_pass_slas():
             f"{r['name']}: {r['sla_failures']}" for r in failures
         ]
         pytest.fail("Gaming parity SLA failures:\n  " + "\n  ".join(msgs))
+
+
+def test_tf2_regression_center_locks_at_100pct():
+    """Phase 1 TF2 regression fixture: cartoon-style FPS with no
+    crosshair. Must hit 100% center_lock_pct and 0 off_axis_drift
+    events. This is the regression target — before the Phase 1
+    center-bias branch landed, this clip would drift to x≈20-32."""
+    from backend.scripts.measure_gaming_reframe import run_all
+
+    payload = run_all(["tf2_clip"])
+    row = payload["results"][0]
+    assert row["sla_status"] == "passed", row["sla_failures"]
+    cl = row["center_lock"]
+    assert cl["center_lock_pct"] == 1.0, (
+        f"TF2 center_lock_pct={cl['center_lock_pct']}, expected 1.0"
+    )
+    assert cl["off_axis_drift_events"] == 0
+    # No crosshair truth → crosshair metric is n/a.
+    assert row["crosshair"]["mean"] is None
+    assert row["center_bias_regression"] is True
 
 
 def test_valorant_fixture_layout_target():

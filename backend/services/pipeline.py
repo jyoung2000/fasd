@@ -2260,7 +2260,23 @@ async def _run_analysis_inner(job_id: str):
         # Gameplay mode: override scene subject_x using the per-frame
         # crosshair path when available (Phase 1: FPS subtypes), or
         # fall back to the legacy hard-coded center (50) otherwise.
+        #
+        # Center-bias guard (Phase 1 hard-fallback spec): only
+        # high-confidence crosshair detections
+        # (``confidence >= GAMING_CROSSHAIR_CONF_THRESHOLD``, default
+        # 0.6) override the scene center. Low-confidence entries —
+        # including the hard-center breadcrumbs that
+        # ``track_crosshair_path`` now emits for every missed frame —
+        # resolve to exactly x=50. This kills the TF2 / Marvel
+        # Rivals-style regression where a stale or noisy detection
+        # would pull the crop off-axis on cartoon FPS content.
         if _is_gameplay and scenes_result:
+            try:
+                from backend.services.l1_camera_path import (
+                    GAMING_CROSSHAIR_CONF_THRESHOLD,
+                )
+            except Exception:
+                GAMING_CROSSHAIR_CONF_THRESHOLD = 0.6  # fallback literal
             ch_used = 0
             if crosshair_path:
                 # Build a sorted list for nearest-time lookup.
@@ -2288,7 +2304,11 @@ async def _run_analysis_inner(job_id: str):
                         candidates,
                         key=lambda c: abs(c.timestamp - mid_t),
                     )
-                    if abs(best.timestamp - mid_t) <= 1.0:
+                    if (
+                        abs(best.timestamp - mid_t) <= 1.0
+                        and getattr(best, "confidence", 0.0)
+                        >= GAMING_CROSSHAIR_CONF_THRESHOLD
+                    ):
                         scene.subject_x = int(round(best.x_pct))
                         ch_used += 1
                     else:

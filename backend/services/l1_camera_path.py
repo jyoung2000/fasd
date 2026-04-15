@@ -117,6 +117,46 @@ GAMING_PAN_ACTION_HOLD_SCALE = float(
     os.environ.get("GAMING_PAN_ACTION_HOLD_SCALE", "0.3"),
 )
 
+# ── Phase 3a (gaming): center-anchor unary weights ──
+#
+# Center bias is the safety net for everything else in the gaming
+# reframe pipeline. A strong per-frame center anchor is ALWAYS
+# present for shots in ``CENTER_BIAS_GENRES`` — when the crosshair
+# tracker is confident, a stronger crosshair unary wins; when the
+# crosshair is missing, only the center unary fires and the solver
+# locks to x = source_width / 2.  Saliency, motion, and
+# face-cluster anchors are explicitly suppressed for these genres
+# (they're the source of the TF2 off-center regression). Tunable
+# via env vars but the defaults match the spec.
+GAMING_CENTER_WEIGHT_DEFAULT = float(
+    os.environ.get("GAMING_CENTER_WEIGHT_DEFAULT", "1.5"),
+)
+GAMING_CENTER_WEIGHT_ACTIVE = float(
+    os.environ.get("GAMING_CENTER_WEIGHT_ACTIVE", "0.4"),
+)
+GAMING_CROSSHAIR_WEIGHT = float(
+    os.environ.get("GAMING_CROSSHAIR_WEIGHT", "2.0"),
+)
+GAMING_PAN_WEIGHT = float(
+    os.environ.get("GAMING_PAN_WEIGHT", "3.0"),
+)
+GAMING_CROSSHAIR_CONF_THRESHOLD = float(
+    os.environ.get("GAMING_CROSSHAIR_CONF_THRESHOLD", "0.6"),
+)
+
+# Gameplay_subtype values that qualify for the hard center bias.
+# MOBA / TPS / racing are deliberately excluded — their action
+# genuinely moves off center (lane fights, third-person character
+# offset, car in lower third) so they keep the existing
+# slot-center / motion-centroid / character-tracker anchor chain.
+CENTER_BIAS_GENRES = frozenset({
+    "fps",
+    "gameplay_fps",
+    "hero_shooter",
+    "sandbox",
+    "gameplay",
+})
+
 
 def build_face_anchor_targets(
     dense_faces: list,
@@ -1062,6 +1102,227 @@ def build_gaming_pan_targets(
 
         positions.append((round(t, 6), float(target_x)))
         weights.append(float(target_w))
+
+    return positions, weights
+
+
+def build_gaming_center_biased_targets(
+    *,
+    crosshair_path: Optional[list] = None,
+    events: Optional[list] = None,
+    start: float,
+    end: float,
+    target_fps: float = 30.0,
+    conf_threshold: float = None,  # type: ignore[assignment]
+    w_center_default: float = None,  # type: ignore[assignment]
+    w_center_active: float = None,  # type: ignore[assignment]
+    w_crosshair: float = None,  # type: ignore[assignment]
+    w_pan: float = None,  # type: ignore[assignment]
+    pan_hold_sec: float = None,  # type: ignore[assignment]
+    pan_ramp_sec: float = None,  # type: ignore[assignment]
+) -> tuple[list[tuple[float, float]], list[float]]:
+    """Build the center-biased gaming target stream for the L1 solver.
+
+    Phase 3a — this is the canonical target builder for shots whose
+    ``gameplay_subtype`` lives in :data:`CENTER_BIAS_GENRES`. It
+    combines three anchor behaviors into a single per-frame
+    ``(target_x, weight)`` stream the existing
+    :func:`solve_camera_path` / :func:`solve_camera_path_for_shot`
+    pipeline already consumes:
+
+    1. **Hard center anchor (default).** Every frame starts with a
+       unary term pulling toward ``target_x = 50`` (% of frame
+       width) at weight :data:`GAMING_CENTER_WEIGHT_DEFAULT`. This
+       is the safety net that guarantees a rollback to the
+       rock-solid "center-crop the action" default whenever every
+       other signal fails.
+
+    2. **Per-frame crosshair override.** When the crosshair
+       tracker entry at ``t`` carries
+       ``confidence >= conf_threshold`` (default 0.6), the unary
+       target switches to the tracked crosshair x and the weight
+       rises to :data:`GAMING_CROSSHAIR_WEIGHT`. The center anchor
+       is implicitly attenuated to
+       :data:`GAMING_CENTER_WEIGHT_ACTIVE` in this frame — since
+       the L1 solver consumes a single ``(target, weight)`` pair
+       per frame, the effective anchor is the crosshair position
+       at the higher weight (the attenuated center term is folded
+       into the smoothness prior). On low-confidence or missing
+       frames the crosshair override does NOT fire; saliency /
+       motion / face-cluster anchors are NEVER consulted here by
+       design.
+
+    3. **Time-windowed pan anchor (gaming events).** For each
+       :class:`gaming_event_detector.GamingEvent` with a
+       ``target_region`` the helper blends the current anchor
+       (center or crosshair) toward the region's centroid via a
+       triangular temporal weight — 0.3 s ease-in, ``pan_hold_sec``
+       hold at :data:`GAMING_PAN_WEIGHT`, 0.3 s ease-out. After the
+       pan window closes the stream returns to the center/crosshair
+       anchor and the solver's TV smoothness prior naturally eases
+       the crop back over ~0.3-0.5 s.
+
+    Args:
+        crosshair_path: List of :class:`CrosshairFrame`-shaped
+            objects (or ``(t, x, y, conf)`` tuples). May be empty
+            or ``None`` — every frame falls back to hard center.
+        events: List of :class:`GamingEvent` objects. Events whose
+            ``target_region`` is ``None`` (zoom-out signals) are
+            skipped here; Phase 4's layout chooser handles those.
+        start, end: Shot time range (seconds).
+        target_fps: Output sample rate.
+        conf_threshold: Crosshair confidence floor to accept the
+            per-frame override. Default
+            :data:`GAMING_CROSSHAIR_CONF_THRESHOLD`.
+        w_center_default / w_center_active: Center-anchor weights.
+            Defaults from the :data:`GAMING_CENTER_WEIGHT_*` env
+            vars.
+        w_crosshair: Crosshair override weight. Default
+            :data:`GAMING_CROSSHAIR_WEIGHT`.
+        w_pan: Pan target weight during the hold. Default
+            :data:`GAMING_PAN_WEIGHT`.
+        pan_hold_sec / pan_ramp_sec: Pan window shape. Defaults
+            from :data:`GAMING_PAN_HOLD_SEC` /
+            :data:`GAMING_PAN_RAMP_SEC`.
+
+    Returns:
+        ``(positions, weights)`` parallel lists at uniform
+        ``target_fps``. Positions are ``[(timestamp, x_pct), ...]``
+        in percent of source width; weights are the per-frame
+        data-fidelity weights for the L1 unary term. Callers that
+        want pixel coordinates should multiply by
+        ``source_width / 100`` before feeding the solver.
+    """
+    if end <= start:
+        return [], []
+
+    if conf_threshold is None:
+        conf_threshold = GAMING_CROSSHAIR_CONF_THRESHOLD
+    if w_center_default is None:
+        w_center_default = GAMING_CENTER_WEIGHT_DEFAULT
+    if w_center_active is None:
+        w_center_active = GAMING_CENTER_WEIGHT_ACTIVE
+    if w_crosshair is None:
+        w_crosshair = GAMING_CROSSHAIR_WEIGHT
+    if w_pan is None:
+        w_pan = GAMING_PAN_WEIGHT
+    if pan_hold_sec is None:
+        pan_hold_sec = GAMING_PAN_HOLD_SEC
+    if pan_ramp_sec is None:
+        pan_ramp_sec = GAMING_PAN_RAMP_SEC
+
+    dt = 1.0 / target_fps
+    n_frames = max(1, int((end - start) * target_fps))
+
+    # ── Normalize the crosshair path to (t, x, y, conf) tuples ──
+    ch_entries: list[tuple[float, float, float, float]] = []
+    for entry in crosshair_path or []:
+        if hasattr(entry, "timestamp"):
+            ch_entries.append((
+                float(entry.timestamp),
+                float(entry.x_pct),
+                float(getattr(entry, "y_pct", 50.0)),
+                float(getattr(entry, "confidence", 0.0)),
+            ))
+        else:
+            # (t, x, y, conf) tuple — pad with defaults if shorter.
+            t = float(entry[0])
+            x = float(entry[1]) if len(entry) > 1 else 50.0
+            y = float(entry[2]) if len(entry) > 2 else 50.0
+            c = float(entry[3]) if len(entry) > 3 else 0.0
+            ch_entries.append((t, x, y, c))
+    ch_entries.sort(key=lambda p: p[0])
+    ch_times = [e[0] for e in ch_entries]
+
+    def _lookup_crosshair(t: float) -> tuple[float, float] | None:
+        """Return (x_pct, conf) for the crosshair entry closest to
+        ``t`` within 0.1 s. None if no entry is close enough."""
+        if not ch_entries:
+            return None
+        import bisect
+        idx = bisect.bisect_left(ch_times, t)
+        candidates = []
+        if idx < len(ch_entries):
+            candidates.append(ch_entries[idx])
+        if idx > 0:
+            candidates.append(ch_entries[idx - 1])
+        if not candidates:
+            return None
+        best = min(candidates, key=lambda e: abs(e[0] - t))
+        if abs(best[0] - t) > 0.1:
+            return None
+        return (best[1], best[3])
+
+    # ── Pre-compute pan windows ──
+    pan_windows: list[tuple[float, float, float, float, float]] = []
+    for ev in events or []:
+        target_region = getattr(ev, "target_region", None)
+        if target_region is None:
+            continue
+        try:
+            tx = float(target_region[0]) + float(target_region[2]) / 2.0
+        except (TypeError, IndexError):
+            continue
+        ev_t = float(getattr(ev, "timestamp", 0.0))
+        ev_d = float(getattr(ev, "duration", pan_hold_sec))
+        win_start = ev_t - pan_ramp_sec
+        win_end = ev_t + ev_d + pan_ramp_sec
+        if win_end < start or win_start > end:
+            continue
+        pan_windows.append((win_start, ev_t, ev_t + ev_d, win_end, tx))
+
+    positions: list[tuple[float, float]] = []
+    weights: list[float] = []
+
+    for i in range(n_frames):
+        t = start + i * dt
+        if t >= end:
+            break
+
+        # Step 1: baseline center-or-crosshair anchor.
+        ch = _lookup_crosshair(t)
+        if ch is not None and ch[1] >= conf_threshold:
+            base_x = ch[0]
+            base_w = float(w_crosshair)
+            anchor_is_crosshair = True
+        else:
+            base_x = 50.0
+            base_w = float(w_center_default)
+            anchor_is_crosshair = False
+
+        # Step 2: pan window override.
+        target_x = base_x
+        target_w = base_w
+        for win_start, hold_start, hold_end, win_end, pan_x in pan_windows:
+            if win_start <= t <= win_end:
+                # Triangular weight in [0, 1]
+                if t < hold_start:
+                    span = max(hold_start - win_start, 1e-6)
+                    interp = (t - win_start) / span
+                elif t <= hold_end:
+                    interp = 1.0
+                else:
+                    span = max(win_end - hold_end, 1e-6)
+                    interp = max(0.0, 1.0 - (t - hold_end) / span)
+
+                # Blend the pan target into the base anchor.
+                target_x = (1.0 - interp) * base_x + interp * pan_x
+                # Weight scales between the base weight and the
+                # full pan weight. When the anchor is a confident
+                # crosshair the base weight is already higher than
+                # the center default; preserve that and ramp up
+                # to the pan weight only if it's strictly larger.
+                peak_w = max(float(w_pan), base_w)
+                target_w = (1.0 - interp) * base_w + interp * peak_w
+                break
+
+        positions.append((round(t, 6), float(target_x)))
+        weights.append(float(target_w))
+
+        # anchor_is_crosshair is unused in the current single-target
+        # form but retained for future callers that may want to
+        # plumb a second unary term per frame.
+        _ = anchor_is_crosshair
 
     return positions, weights
 

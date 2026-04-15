@@ -993,6 +993,7 @@ def build_reframe_segments(
             subject_anchor_for_game,
             subject_anchor_for_genre,
         )
+        from backend.services.l1_camera_path import CENTER_BIAS_GENRES
 
         _gp_subtype = (
             getattr(content_profile, "gameplay_subtype", None)
@@ -1002,9 +1003,50 @@ def build_reframe_segments(
             getattr(content_profile, "game_type", "")
             if content_profile else ""
         )
+        # Phase 1 center-bias guard: for FPS / hero-shooter / sandbox
+        # content the motion-centroid tracker is NEVER allowed to
+        # override the scene-level subject_x — those genres have
+        # their action locked to dead center, and the tracker was
+        # the single biggest source of off-center drift on cartoon
+        # FPS clips (TF2 / Marvel Rivals) where character models
+        # trip face/motion detection at (x ≈ 20-32). Instead we
+        # force every non-composite segment in those genres to
+        # ``subject_x = source_width / 2`` so the L1 solver starts
+        # from the hard center anchor. Non-center-bias gaming
+        # genres (MOBA / TPS / racing) still flow through the
+        # tracker because their action genuinely moves off-center.
+        _center_bias_active = (
+            _gp_subtype is not None
+            and _gp_subtype in CENTER_BIAS_GENRES
+        )
+        if _center_bias_active:
+            _center_px = source_width / 2.0
+            _bias_count = 0
+            for seg in raw_segments:
+                if seg.layout in (
+                    "split", "grid", "wide_master", "blur_fill",
+                    "stacked_gameplay",
+                ):
+                    continue
+                # Only overwrite segments whose current subject_x
+                # drifted off center — preserves the pipeline's
+                # high-confidence crosshair override when it ran.
+                if abs(seg.subject_x - _center_px) > 0.03 * source_width:
+                    seg.subject_x = _center_px
+                    seg.subject_source = (
+                        seg.subject_source or ""
+                    ) + "+center_bias"
+                    _bias_count += 1
+            if _bias_count:
+                _log(
+                    "Center-bias (%s): reset %d segment subject_x "
+                    "to dead center (source_width/2)",
+                    _gp_subtype, _bias_count,
+                )
         if (
             USE_GAMEPLAY_TRACKER
             and _gp_subtype
+            and not _center_bias_active
             and gameplay_motion_centroids is not None
         ):
             # Resolve the fallback anchor: prefer the specific

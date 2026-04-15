@@ -271,6 +271,18 @@ def detect_crosshair_xy(
 # ──────────────────── Multi-frame walker ────────────────────
 
 
+# ──────────────────── Fallback semantics ────────────────────
+#
+# How many consecutive missed detections we tolerate before the
+# EMA state is re-seeded back to ``DEFAULT_SEED_XY``. A short
+# blip (single frame miss inside a continuous detection) should
+# retain the prior position so the search resumes where the
+# crosshair actually is; a longer outage means the prior is
+# stale and the next real detection should start its search
+# from center.
+FALLBACK_RESEED_AFTER_DROPS = 3
+
+
 def track_crosshair_path(
     frame_paths: list,
     *,
@@ -279,14 +291,34 @@ def track_crosshair_path(
     confidence_floor: float = DEFAULT_CONFIDENCE_FLOOR,
     ema_tau_sec: float = DEFAULT_EMA_TAU_SEC,
 ) -> list[CrosshairFrame]:
-    """Walk frames in order, returning a smoothed crosshair path.
+    """Walk frames in order, returning a per-frame crosshair path.
 
     Seeds the first frame at ``seed_xy``, then uses each previous
     *smoothed* position as the prior for the next frame. Per-frame
     detections are EMA-smoothed with ``ema_tau_sec`` to kill jitter.
     Detections that move more than ``JITTER_REJECT_PCT_PER_100MS``
     in under 100 ms AND have confidence < ``confidence_floor + 0.1``
-    are dropped (they're almost always template-matching misfires).
+    are treated as jitter and emitted as fallback-center entries.
+
+    **Always-emit fallback semantics (Phase 1 center-bias):**
+
+    Every input frame produces exactly one :class:`CrosshairFrame`
+    in the returned list. Frames where the template matcher fails
+    (or the confidence floor / jitter guard rejects the detection)
+    emit a ``(timestamp, 50.0, 50.0, 0.0)`` entry — *never* a stale
+    prior position. The downstream L1 solver uses the ``confidence``
+    field to decide whether to weigh the crosshair anchor
+    (``confidence ≥ GAMING_CROSSHAIR_CONF_THRESHOLD``, default 0.6)
+    or fall back to the mandatory dead-center anchor. Without the
+    0.0-confidence breadcrumb the solver would have no way to
+    distinguish "no crosshair here" from "no frames observed" and
+    could inherit stale face-cluster / motion-centroid anchors on
+    cartoon-style FPS content like TF2 or Marvel Rivals.
+
+    When a run of ``FALLBACK_RESEED_AFTER_DROPS`` consecutive
+    fallback frames occurs, the internal EMA state is re-seeded
+    back to ``seed_xy`` so the next real detection begins its
+    search from center rather than from a long-stale prior.
 
     Args:
         frame_paths: List of ``(timestamp, path)`` tuples sorted
@@ -297,19 +329,47 @@ def track_crosshair_path(
         ema_tau_sec: EMA time constant.
 
     Returns:
-        List of :class:`CrosshairFrame` — one entry per frame
-        where a detection survived, in timestamp order.
+        One :class:`CrosshairFrame` per input frame in timestamp
+        order. Low-confidence / missing frames carry
+        ``x_pct=50.0, y_pct=50.0, confidence=0.0``.
     """
     if not frame_paths:
         return []
 
     sorted_frames = sorted(frame_paths, key=lambda p: p[0])
 
-    smoothed_x = float(seed_xy[0])
-    smoothed_y = float(seed_xy[1])
-    last_t: Optional[float] = None
+    # Fallback breadcrumbs always emit the hard-coded dead-center
+    # (50, 50) position per the Phase 1 center-bias spec — the
+    # downstream L1 solver treats ``confidence == 0.0`` as "anchor
+    # to center" and this guarantees it sees 50, 50 regardless of
+    # how the caller seeded the initial search prior.
+    fallback_x = 50.0
+    fallback_y = 50.0
+    seed_x = float(seed_xy[0])
+    seed_y = float(seed_xy[1])
+    smoothed_x = seed_x
+    smoothed_y = seed_y
+    last_real_t: Optional[float] = None
     saw_any = False
+    consecutive_drops = 0
     out: list[CrosshairFrame] = []
+
+    def _emit_fallback(ts: float) -> None:
+        """Append a hard-center breadcrumb for this frame."""
+        nonlocal consecutive_drops, smoothed_x, smoothed_y
+        out.append(CrosshairFrame(
+            timestamp=float(ts),
+            x_pct=fallback_x,
+            y_pct=fallback_y,
+            confidence=0.0,
+        ))
+        consecutive_drops += 1
+        if consecutive_drops >= FALLBACK_RESEED_AFTER_DROPS:
+            # Re-seed the search prior back to hard center so the
+            # next real detection doesn't resume its search window
+            # at a long-stale (and possibly off-axis) position.
+            smoothed_x = fallback_x
+            smoothed_y = fallback_y
 
     for ts, path in sorted_frames:
         det = detect_crosshair_xy(
@@ -319,26 +379,29 @@ def track_crosshair_path(
             confidence_floor=confidence_floor,
         )
         if det is None:
-            last_t = ts
+            _emit_fallback(ts)
             continue
         raw_x, raw_y, conf = det
 
         # Jitter reject: if the raw detection moved a lot in a
-        # very short time AND confidence is borderline, drop it.
-        if last_t is not None:
-            dt = ts - last_t
+        # very short time AND confidence is borderline, emit a
+        # center-anchor fallback instead of inheriting the
+        # likely-wrong position.
+        if last_real_t is not None:
+            dt = ts - last_real_t
             if 0 < dt < 0.1 and conf < confidence_floor + 0.1:
                 dist = math.hypot(raw_x - smoothed_x, raw_y - smoothed_y)
                 if dist > JITTER_REJECT_PCT_PER_100MS:
-                    last_t = ts
+                    _emit_fallback(ts)
                     continue
 
+        consecutive_drops = 0
         if not saw_any:
             smoothed_x = raw_x
             smoothed_y = raw_y
             saw_any = True
         else:
-            dt = ts - last_t if last_t is not None else 0.033
+            dt = ts - last_real_t if last_real_t is not None else 0.033
             dt = max(dt, 1e-6)
             alpha = 1.0 - math.exp(-dt / max(ema_tau_sec, 1e-6))
             smoothed_x = smoothed_x + alpha * (raw_x - smoothed_x)
@@ -350,7 +413,7 @@ def track_crosshair_path(
             y_pct=float(smoothed_y),
             confidence=float(conf),
         ))
-        last_t = ts
+        last_real_t = ts
 
     return out
 
@@ -361,15 +424,22 @@ def crosshair_persistence_score(path: list[CrosshairFrame]) -> float:
     Returns the fraction of frames in ``path`` where the smoothed
     centroid stayed within 8 % of frame width of the cluster center.
     Used by the legacy classifier code that wants a 0-1 score.
+
+    Only high-confidence entries (``confidence >= 0.4``) contribute
+    to the score; the Phase 1 fallback-center breadcrumbs emitted
+    for low-confidence frames are excluded so a clip with no
+    detectable crosshair doesn't score as "perfectly persistent at
+    (50, 50)."
     """
-    if len(path) < 3:
+    real = [p for p in path if p.confidence >= 0.4]
+    if len(real) < 3:
         return 0.0
-    xs = [p.x_pct for p in path]
-    ys = [p.y_pct for p in path]
+    xs = [p.x_pct for p in real]
+    ys = [p.y_pct for p in real]
     cx = sum(xs) / len(xs)
     cy = sum(ys) / len(ys)
     n_close = sum(
         1 for x, y in zip(xs, ys)
         if math.hypot(x - cx, y - cy) <= 8.0
     )
-    return n_close / len(path)
+    return n_close / len(real)

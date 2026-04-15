@@ -1,12 +1,18 @@
 """Phase 6 — synthetic gaming reframe fixtures.
 
-Five fixtures matching the spec test set:
+Six fixtures matching the spec test set:
 
   - ``valorant_clip``     — FPS, fixed crosshair, 1 kill event
   - ``apex_clip``         — FPS, fast aim swing, 2 kill events
   - ``lol_clip``          — MOBA, lane fight (long segment)
   - ``elden_ring_clip``   — TPS, action-center anchor at (50, 45)
   - ``rocket_league_clip``— Racing, fast horizontal motion
+  - ``tf2_clip``          — FPS **center-bias regression fixture**:
+    cartoon-style Team Fortress 2 content with no detectable
+    crosshair. Before the Phase 1 hard-center fallback branch
+    landed, the face-pipeline cluster centers would pull the
+    crop to x≈20-32 on this clip. After the fix every frame
+    resolves to x=50 with 0-conf breadcrumbs.
 
 Each fixture exposes:
 
@@ -48,6 +54,14 @@ class GamingFixture:
     # Optional builder callable that produces extra inputs the
     # measurement script needs (e.g. mock frame-paths list).
     build: Optional[Callable[[], dict]] = None
+    # Phase 1 center-bias regression fixtures (e.g. TF2) have no
+    # crosshair truth — instead they assert that the tracker
+    # returned the hard (50, 50) fallback on every frame. When
+    # True, the measurement harness substitutes an all-fallback
+    # synthetic tracked path and scores the ``center_lock_pct``
+    # metric against a strict 100 % target instead of the usual
+    # crosshair-error SLA.
+    center_bias_regression: bool = False
 
 
 # ────────────────────────────────────────────────────────
@@ -92,6 +106,20 @@ def _rocket_league_build() -> dict:
     return {
         "frame_paths": [(t / 30.0, "/tmp/r.png") for t in range(120)],
         "audio_envelope": [(t / 10.0, 0.3) for t in range(120)],
+    }
+
+
+def _tf2_clip_build() -> dict:
+    """Washed-Up-Tuber TF2 clip — cartoon FPS, no detectable
+    crosshair. Synthetic stand-in: 3 s worth of frame stubs
+    with a flat (low-energy) audio envelope so no gaming events
+    fire. The important property is the absence of a crosshair
+    path — the fixture's ``crosshair_truth`` is None and the
+    harness substitutes an all-fallback (50, 50, 0.0) tracker
+    output to verify the center-lock guarantee."""
+    return {
+        "frame_paths": [(t / 30.0, "/tmp/tf2.png") for t in range(90)],
+        "audio_envelope": [(t / 10.0, 0.2) for t in range(90)],
     }
 
 
@@ -164,6 +192,25 @@ GAMING_FIXTURES: dict[str, GamingFixture] = {
         # threshold (30) so the chooser picks fullscreen.
         motion_profile=25.0,
         build=_rocket_league_build,
+    ),
+    "tf2_clip": GamingFixture(
+        name="tf2_clip",
+        genre="fps",
+        game_key="team_fortress_2",
+        video_duration=3.0,
+        description=(
+            "Washed-Up-Tuber TF2 regression: cartoon FPS, no "
+            "detectable crosshair, bright character models "
+            "off-axis. Asserts center_lock_pct == 100%."
+        ),
+        # No crosshair truth — fixture is a center-lock regression.
+        crosshair_truth=None,
+        # No labeled events — a flat audio envelope produces none.
+        event_truth=[],
+        layout_target={"fullscreen": 0.80},
+        motion_profile=5.0,
+        build=_tf2_clip_build,
+        center_bias_regression=True,
     ),
 }
 
