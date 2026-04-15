@@ -21,7 +21,7 @@ function parseDuration(str) {
   return null;
 }
 
-export default function ClipCard({ clip, jobId, isBest, onPreview, onExport, onDelete, onTimesChanged, selected, onSelect, exportQuality = '1080p', scenes }) {
+export default function ClipCard({ clip, jobId, isBest, onPreview, onExport, onDelete, onTimesChanged, onFindMoreLikeThis, selected, onSelect, exportQuality = '1080p', scenes }) {
   const [exporting, setExporting] = useState(false);
   const [qualityMenuOpen, setQualityMenuOpen] = useState(false);
   const [deleting, setDeleting] = useState(false);
@@ -32,6 +32,44 @@ export default function ClipCard({ clip, jobId, isBest, onPreview, onExport, onD
   const [editingTitle, setEditingTitle] = useState(false);
   const [titleText, setTitleText] = useState('');
   const [savingTitle, setSavingTitle] = useState(false);
+  // Score Breakdown panel (Enhancement 1) — collapsed by default.
+  const [breakdownOpen, setBreakdownOpen] = useState(false);
+
+  // In focus mode the LLM puts relevance in viral_score and the
+  // backend moves the composite virality to viral_score_composite.
+  // The big number rendered in the score pill follows this rule so the
+  // UI matches the mode's contract (see Bug 3 in the clip-focus audit).
+  const isFocusClip = !!clip.clip_focus;
+  const primaryScore = isFocusClip
+    ? (clip.focus_relevance != null ? clip.focus_relevance : clip.viral_score)
+    : clip.viral_score;
+  const compositeScore = clip.viral_score_composite != null ? clip.viral_score_composite : clip.viral_score;
+  const diag = clip.score_diagnostics || {};
+  const axisScores = diag.axis_scores || {
+    hook: clip.hook_score || 0,
+    flow: clip.flow_score || 0,
+    value: clip.value_score || 0,
+    trend: clip.trend_score || 0,
+  };
+  const axisReasons = diag.axis_reasons || {
+    hook: clip.hook_reason,
+    flow: clip.flow_reason,
+    value: clip.value_reason,
+    trend: clip.trend_reason,
+  };
+  const weights = diag.weights || { hook: 0.3, flow: 0.25, value: 0.3, trend: 0.15 };
+  const contentType = diag.content_type || null;
+  const legacyFill = !!diag.legacy_fill;
+  const hasAnyAxis = Object.values(axisScores).some((v) => (v || 0) > 0);
+
+  // Focus tier color (ported from ViralClips.jsx 1576-1584 per Bug 5)
+  const tier = clip.focus_tier;
+  const tierColor = tier === 'strong' ? 'var(--success)'
+    : tier === 'moderate' ? 'var(--accent-amber)'
+    : 'var(--text-secondary)';
+  const tierBg = tier === 'strong' ? 'rgba(52,199,89,0.15)'
+    : tier === 'moderate' ? 'rgba(255,214,0,0.15)'
+    : 'rgba(142,142,147,0.15)';
 
   // Find the most important scene description within this clip's time range
   const clipSubject = React.useMemo(() => {
@@ -45,9 +83,9 @@ export default function ClipCard({ clip, jobId, isBest, onPreview, onExport, onD
     return best.description;
   }, [scenes, clip.start_time, clip.end_time]);
 
-  const scoreColor = clip.viral_score >= 80
+  const scoreColor = primaryScore >= 80
     ? 'var(--accent-amber)'
-    : clip.viral_score >= 50
+    : primaryScore >= 50
       ? 'var(--accent-cyan)'
       : 'var(--text-secondary)';
 
@@ -150,12 +188,20 @@ export default function ClipCard({ clip, jobId, isBest, onPreview, onExport, onD
         </div>
         <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8 }}>
           <div style={{ textAlign: 'right' }}>
-            <div style={{ fontFamily: 'var(--font-mono)', fontSize: 20, fontWeight: 700, color: clip.clip_focus ? 'var(--success)' : scoreColor }}>
-              {typeof clip.viral_score === 'number' ? clip.viral_score : String(clip.viral_score ?? '')}
+            <div style={{ fontFamily: 'var(--font-mono)', fontSize: 20, fontWeight: 700, color: isFocusClip ? 'var(--success)' : scoreColor }}>
+              {typeof primaryScore === 'number' ? primaryScore : String(primaryScore ?? '')}
             </div>
-            <div style={{ fontSize: 10, color: clip.clip_focus ? 'var(--success)' : 'var(--text-secondary)', textTransform: 'uppercase' }}>
-              {clip.clip_focus ? 'FOCUS' : '/100'}
+            <div style={{ fontSize: 10, color: isFocusClip ? 'var(--success)' : 'var(--text-secondary)', textTransform: 'uppercase' }}>
+              {isFocusClip ? (tier ? `${tier} MATCH` : 'RELEVANCE') : '/100'}
             </div>
+            {isFocusClip && compositeScore != null && compositeScore !== primaryScore && (
+              <div
+                title="Composite virality score (genre-weighted 4-axis)"
+                style={{ fontSize: 9, color: 'var(--text-muted)', fontFamily: 'var(--font-mono)', marginTop: 2 }}
+              >
+                virality: {compositeScore}
+              </div>
+            )}
           </div>
           {onDelete && (
             <button
@@ -333,6 +379,16 @@ export default function ClipCard({ clip, jobId, isBest, onPreview, onExport, onD
                 Focus: {String(clip.clip_focus || '')}
               </span>
             )}
+            {/* Focus tier badge — ported from ViralClips.jsx per Bug 5 */}
+            {clip.focus_relevance != null && (
+              <span className="badge" style={{
+                background: tierBg,
+                color: tierColor,
+                border: `1px solid ${tierColor}`,
+              }}>
+                Relevance: {clip.focus_relevance}/100
+              </span>
+            )}
           </>
         )}
       </div>
@@ -365,6 +421,99 @@ export default function ClipCard({ clip, jobId, isBest, onPreview, onExport, onD
           </div>
         )}
       </div>
+
+      {/* Score Breakdown panel (Enhancement 1 + Bug 5 in the clip-focus audit) */}
+      {hasAnyAxis && (
+        <div style={{ marginTop: 8, marginBottom: 8 }}>
+          <button
+            type="button"
+            onClick={() => setBreakdownOpen((v) => !v)}
+            aria-expanded={breakdownOpen}
+            aria-controls={`clip-breakdown-${clip.id}`}
+            style={{
+              fontSize: 10, color: 'var(--text-muted)',
+              background: 'transparent', border: 'none', padding: 0,
+              cursor: 'pointer', textTransform: 'uppercase', letterSpacing: '0.05em',
+              fontFamily: 'var(--font-mono)',
+            }}
+          >
+            {breakdownOpen ? '▼' : '▶'} Score Breakdown
+            {legacyFill && (
+              <span style={{ marginLeft: 6, color: 'var(--accent-amber)' }} title="Axis scores estimated from legacy composite">
+                (legacy)
+              </span>
+            )}
+          </button>
+          {breakdownOpen && (
+            <div id={`clip-breakdown-${clip.id}`} style={{
+              marginTop: 8, padding: 10,
+              background: 'var(--bg-elevated)',
+              borderRadius: 'var(--radius-sm)',
+              border: '1px solid var(--border)',
+            }}>
+              {isFocusClip && clip.focus_relevance != null && (
+                <div style={{ marginBottom: 10 }}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, marginBottom: 3, color: 'var(--success)' }}>
+                    <span style={{ fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em' }}>Relevance</span>
+                    <span style={{ fontFamily: 'var(--font-mono)' }}>{clip.focus_relevance}/100</span>
+                  </div>
+                  <div style={{ height: 6, background: 'rgba(52,199,89,0.15)', borderRadius: 3, overflow: 'hidden' }}>
+                    <div style={{
+                      width: `${Math.max(0, Math.min(100, clip.focus_relevance))}%`,
+                      height: '100%', background: 'var(--success)',
+                    }} />
+                  </div>
+                </div>
+              )}
+              {['hook', 'flow', 'value', 'trend'].map((axis) => {
+                const score = axisScores[axis] || 0;
+                const weight = weights[axis] || 0;
+                const contribution = Math.round(score * weight * 10) / 10;
+                const reason = axisReasons[axis];
+                return (
+                  <div key={axis} style={{ marginBottom: 8, opacity: legacyFill ? 0.55 : 1 }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 10, marginBottom: 3, color: 'var(--text-secondary)' }}>
+                      <span style={{ fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
+                        {axis}
+                        <span style={{ color: 'var(--text-muted)', marginLeft: 4, fontWeight: 400 }}>
+                          ({Math.round(weight * 100)}%)
+                        </span>
+                      </span>
+                      <span style={{ fontFamily: 'var(--font-mono)' }}>
+                        {score} <span style={{ color: 'var(--text-muted)' }}>= {contribution}</span>
+                      </span>
+                    </div>
+                    <div style={{
+                      height: 6,
+                      background: 'var(--bg-panel)',
+                      borderRadius: 3,
+                      overflow: 'hidden',
+                      backgroundImage: legacyFill ? 'repeating-linear-gradient(45deg, var(--bg-panel), var(--bg-panel) 4px, var(--border) 4px, var(--border) 8px)' : undefined,
+                    }}>
+                      <div style={{
+                        width: `${Math.max(0, Math.min(100, score))}%`,
+                        height: '100%',
+                        background: 'var(--accent-cyan)',
+                      }} />
+                    </div>
+                    {reason && (
+                      <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 3, lineHeight: 1.4 }}>
+                        {String(reason).slice(0, 140)}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+              <div style={{ fontSize: 9, color: 'var(--text-muted)', marginTop: 6, fontFamily: 'var(--font-mono)' }}>
+                Composite via {contentType || 'generic'} weights
+                {legacyFill && ' (legacy fill)'}
+                {!isFocusClip && compositeScore != null && ` = ${compositeScore}`}
+                {isFocusClip && compositeScore != null && ` (virality: ${compositeScore})`}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
 
       <div style={{ display: 'flex', gap: 6, alignItems: 'stretch', marginTop: 12 }}>
         <button
@@ -453,6 +602,24 @@ export default function ClipCard({ clip, jobId, isBest, onPreview, onExport, onD
           )}
         </div>
       </div>
+      {/* "Find more like this" per-clip action (Enhancement 7) */}
+      {onFindMoreLikeThis && (
+        <div style={{ marginTop: 6 }}>
+          <button
+            onClick={() => onFindMoreLikeThis(clip)}
+            title="Run a new focus search using this clip's subject/focus as the query"
+            style={{
+              padding: '4px 10px', fontSize: 10, fontWeight: 600,
+              background: 'transparent',
+              color: 'var(--text-secondary)',
+              border: '1px dashed var(--border)',
+              borderRadius: 'var(--radius-sm)', cursor: 'pointer',
+            }}
+          >
+            ✨ Find more like this
+          </button>
+        </div>
+      )}
     </div>
   );
 }

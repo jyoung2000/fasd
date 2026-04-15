@@ -17,7 +17,7 @@ import useEncodingManager from '../hooks/useEncodingManager';
 import { computeClipSubjectX } from '../utils/subjectTracking';
 import useTimelineStore from '../stores/timelineStore';
 import { buildOverlayPayload, buildVideoEffectsPayload, mapSubtitleSettings } from '../utils/buildExportPayload';
-import { DEFAULT_CLIP_SETTINGS } from '../utils/defaultSettings';
+import { DEFAULT_CLIP_SETTINGS, DEFAULT_GEN_SETTINGS } from '../utils/defaultSettings';
 
 // Speaker color palette (must match SubtitleOverlay / ClipSettingsPanel / VideoEditor)
 const DEFAULT_SPEAKER_PALETTE = [
@@ -58,13 +58,30 @@ function parseDuration(str) {
 }
 
 const GEN_STORAGE_KEY = 'clipai_generation_settings';
-const DEFAULT_GEN = { clipCount: 12, minDuration: 15, maxDuration: 600, viralScoreMin: 0, viralScoreMax: 100 };
 
 function loadGenSettings() {
   try {
     const saved = JSON.parse(localStorage.getItem(GEN_STORAGE_KEY));
-    return { ...DEFAULT_GEN, ...saved };
-  } catch { return { ...DEFAULT_GEN }; }
+    return { ...DEFAULT_GEN_SETTINGS, ...saved };
+  } catch { return { ...DEFAULT_GEN_SETTINGS }; }
+}
+
+// Example chips shown below the focus textarea when it's empty.
+// Clicking one fills the textarea (see ClipFocus panel below).
+const FOCUS_EXAMPLE_CHIPS = [
+  'funny moments',
+  'emotional reveals',
+  'arguments',
+  'advice and insights',
+  'biggest mistakes',
+  'hot takes',
+];
+
+function pushFocusHistory(current, query) {
+  const q = (query || '').trim();
+  if (!q) return current || [];
+  const existing = (current || []).filter((h) => h !== q);
+  return [q, ...existing].slice(0, 10);
 }
 
 const TABS = ['Summary', 'Key Scenes', 'Transcript', 'Viral Clips'];
@@ -487,8 +504,22 @@ export default function Analysis() {
   const [stuckSeconds, setStuckSeconds] = useState(0);
   const lastProgressRef = useRef({ message: '', time: Date.now() });
   const [genSettings, setGenSettings] = useState(loadGenSettings);
-  const [clipFocusEnabled, setClipFocusEnabled] = useState(false);
-  const [clipFocusText, setClipFocusText] = useState('');
+  const [clipFocusEnabled, setClipFocusEnabled] = useState(() => !!loadGenSettings().clipFocusEnabled);
+  const [clipFocusText, setClipFocusText] = useState(() => loadGenSettings().clipFocusText || '');
+  // Sync focus state to genSettings persistence (Bug 13) so a page
+  // refresh mid-search doesn't lose the user's query.
+  React.useEffect(() => {
+    setGenSettings((prev) => {
+      if (prev.clipFocusEnabled === clipFocusEnabled && prev.clipFocusText === clipFocusText) return prev;
+      return { ...prev, clipFocusEnabled, clipFocusText };
+    });
+  }, [clipFocusEnabled, clipFocusText]);
+  // Recent focus query history + dropdown state
+  const [focusHistoryOpen, setFocusHistoryOpen] = useState(false);
+  // "Why these clips?" diagnostics drawer
+  const [diagOpen, setDiagOpen] = useState(false);
+  const [diagData, setDiagData] = useState(null);
+  const [diagLoading, setDiagLoading] = useState(false);
   const [minText, setMinText] = useState(() => formatDurationInput(loadGenSettings().minDuration));
   const [maxText, setMaxText] = useState(() => formatDurationInput(loadGenSettings().maxDuration));
   const { isMobile } = useResponsive();
@@ -747,7 +778,25 @@ export default function Analysis() {
             // trigger a second download here to avoid duplicate file saves.
           } else if (msg.type === 'clips_generated') {
             pushLog('success', String(msg.message || `Generated ${msg.count} clips`));
-            showToast(String(msg.message || `Found ${msg.count} clip candidates`), 'success');
+            // Bug 7 — when the filter chain wipes everything out, show a
+            // targeted toast with remediation instead of a generic
+            // "0 clips" success message. The backend now sends a
+            // filter_state block so we know exactly what to suggest.
+            const fs = msg.filter_state || {};
+            if (msg.count === 0 && (fs.focus_enabled || fs.viral_score_min > 0 || fs.viral_score_max < 100 || fs.min_relevance > 0)) {
+              const parts = [];
+              if (fs.focus_enabled && fs.focus_query) parts.push(`matching "${fs.focus_query}"`);
+              const rangeActive = fs.viral_score_min > 0 || fs.viral_score_max < 100;
+              if (rangeActive) parts.push(`within viral score ${fs.viral_score_min}-${fs.viral_score_max}`);
+              if (fs.min_relevance > 0) parts.push(`with relevance >= ${fs.min_relevance}`);
+              const suffix = parts.length ? ` ${parts.join(' ')}` : '';
+              showToast(
+                `Found 0 clips${suffix}. Try lowering thresholds, broadening your query, or clicking "Relax filters".`,
+                'warning',
+              );
+            } else {
+              showToast(String(msg.message || `Found ${msg.count} clip candidates`), 'success');
+            }
             setIsGeneratingClips((prev) => prev ? false : prev);
             fetchJob();
             // Re-run QA validation after new clips are generated
@@ -1206,21 +1255,34 @@ export default function Analysis() {
     }
   }, [job?.status, job?.clips?.length, runQaValidation, qaResult]);
 
-  const handleGenerateClips = async () => {
+  const handleGenerateClips = async (opts = {}) => {
     setIsGeneratingClips(true);
     try {
       const body = {
         min_duration: genSettings.minDuration,
         max_duration: genSettings.maxDuration,
         clip_count: genSettings.clipCount || null,
+        append: opts.append !== undefined ? opts.append : true,
       };
-      if (clipFocusEnabled && clipFocusText.trim()) {
+      // Bug 9 — allow focus mode AND viral score range to BOTH apply
+      const focusActive = clipFocusEnabled && clipFocusText.trim();
+      if (focusActive) {
         body.clip_focus = clipFocusText.trim();
+        if (genSettings.minRelevance > 0) body.min_relevance = genSettings.minRelevance;
+        // Push the query into history (Enhancement 3)
+        setGenSettings((prev) => ({
+          ...prev,
+          focusHistory: pushFocusHistory(prev.focusHistory, clipFocusText.trim()),
+        }));
       }
-      // Only pass viral score range when clip focus is off and range is non-default
-      if (!clipFocusEnabled) {
-        if (genSettings.viralScoreMin > 0) body.viral_score_min = genSettings.viralScoreMin;
-        if (genSettings.viralScoreMax < 100) body.viral_score_max = genSettings.viralScoreMax;
+      if (genSettings.viralScoreMin > 0) body.viral_score_min = genSettings.viralScoreMin;
+      if (genSettings.viralScoreMax < 100) body.viral_score_max = genSettings.viralScoreMax;
+      if (opts.scope_start != null && opts.scope_end != null) {
+        body.scope_start = opts.scope_start;
+        body.scope_end = opts.scope_end;
+      }
+      if (opts.clip_focus) {
+        body.clip_focus = opts.clip_focus;
       }
       const res = await fetch(`/api/jobs/${jobId}/generate-clips`, {
         method: 'POST',
@@ -1228,8 +1290,8 @@ export default function Analysis() {
         body: JSON.stringify(body),
       });
       if (res.ok) {
-        if (clipFocusEnabled && clipFocusText.trim()) {
-          showToast(`AI is searching for "${clipFocusText.trim()}" in your video...`, 'info');
+        if (body.clip_focus) {
+          showToast(`AI is searching for "${body.clip_focus}" in your video...`, 'info');
         } else {
           showToast('AI is analyzing your video for viral moments...', 'info');
         }
@@ -1243,6 +1305,46 @@ export default function Analysis() {
       setIsGeneratingClips(false);
     }
   };
+
+  // Cancel button — POSTs to the cancel endpoint added in phase 2.
+  // The cooperative cancel_event on the server turns the running task
+  // into a no-op within a few seconds.
+  const handleCancelGenerate = async () => {
+    try {
+      const res = await fetch(`/api/jobs/${jobId}/cancel-generate`, { method: 'POST' });
+      if (res.ok) {
+        showToast('Cancelling clip generation...', 'info');
+        // Optimistically clear local spinner after a short delay so the
+        // Cancel button goes away even if the cancelled event is slow.
+        setTimeout(() => setIsGeneratingClips(false), 1500);
+      }
+    } catch { /* ignore */ }
+  };
+
+  // "Why these clips?" diagnostics drawer loader
+  const loadDiagnostics = useCallback(async () => {
+    setDiagLoading(true);
+    try {
+      const res = await fetch(`/api/jobs/${jobId}/clip-diagnostics`);
+      if (res.ok) {
+        setDiagData(await res.json());
+      }
+    } catch { /* ignore */ } finally {
+      setDiagLoading(false);
+    }
+  }, [jobId]);
+
+  // Expand Search — re-runs generate with relaxed filters
+  const handleRelaxFilters = useCallback(() => {
+    setGenSettings((prev) => ({
+      ...prev,
+      viralScoreMin: 0,
+      viralScoreMax: 100,
+      minRelevance: Math.max(20, Math.min(30, prev.minRelevance || 50)),
+    }));
+    setTimeout(() => handleGenerateClips(), 100);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const updateGen = (key, value) => {
     setGenSettings((prev) => ({ ...prev, [key]: value }));
@@ -3143,10 +3245,16 @@ export default function Analysis() {
                     />
                   </label>
                 </div>
-                {/* Viral Score Range — only when clip focus is off */}
-                {!clipFocusEnabled && (
-                  <div style={{ display: 'flex', gap: 16, alignItems: 'center', flexWrap: 'wrap', marginTop: 8 }}>
-                    <span style={{ fontSize: 12, color: 'var(--text-secondary)', whiteSpace: 'nowrap' }}>Viral Score</span>
+                {/* Viral Score Range — Bug 1 + 9 in the clip-focus audit: always
+                    visible, even in focus mode. The label swaps to "Virality"
+                    when focus is on so the user understands this is the
+                    virality score (not relevance). */}
+                {true && (
+                  <div style={{ display: 'flex', gap: 16, alignItems: 'center', flexWrap: 'wrap', marginTop: 8 }}
+                       role="group" aria-label="Viral score range filter">
+                    <span style={{ fontSize: 12, color: 'var(--text-secondary)', whiteSpace: 'nowrap' }}>
+                      {clipFocusEnabled ? 'Virality Score' : 'Viral Score'}
+                    </span>
                     <label style={{ display: 'flex', alignItems: 'center', gap: 4, fontSize: 12, color: 'var(--text-secondary)' }}>
                       Min
                       <input
@@ -3227,13 +3335,49 @@ export default function Analysis() {
                         Only clips scoring {genSettings.viralScoreMin}-{genSettings.viralScoreMax} will be kept
                       </span>
                     )}
+                    {/* Score-range presets (Enhancement 8) */}
+                    <div style={{ display: 'flex', gap: 4, marginLeft: 'auto' }}>
+                      {[
+                        { label: 'Top 10%', min: 90, max: 100 },
+                        { label: 'Strong', min: 70, max: 100 },
+                        { label: 'All', min: 0, max: 100 },
+                      ].map((p) => {
+                        const active = genSettings.viralScoreMin === p.min && genSettings.viralScoreMax === p.max;
+                        return (
+                          <button
+                            key={p.label}
+                            onClick={() => setGenSettings((prev) => ({ ...prev, viralScoreMin: p.min, viralScoreMax: p.max }))}
+                            disabled={isGeneratingClips}
+                            style={{
+                              padding: '2px 8px', fontSize: 10, fontWeight: 600,
+                              background: active ? 'var(--accent-cyan)' : 'transparent',
+                              color: active ? 'var(--bg-base)' : 'var(--text-secondary)',
+                              border: `1px solid ${active ? 'var(--accent-cyan)' : 'var(--border)'}`,
+                              borderRadius: 'var(--radius-sm)',
+                              cursor: isGeneratingClips ? 'not-allowed' : 'pointer',
+                            }}
+                          >
+                            {p.label}
+                          </button>
+                        );
+                      })}
+                    </div>
                   </div>
                 )}
-                {/* Clip Focus toggle */}
+                {/* Clip Focus toggle — Enhancement 12: role=switch a11y */}
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 10, width: '100%' }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                    <span style={{ fontSize: 12, color: 'var(--text-secondary)' }}>Clip Focus</span>
+                    <label
+                      htmlFor="clip-focus-switch"
+                      style={{ fontSize: 12, color: 'var(--text-secondary)' }}
+                    >
+                      Clip Focus
+                    </label>
                     <button
+                      id="clip-focus-switch"
+                      role="switch"
+                      aria-checked={clipFocusEnabled}
+                      aria-label="Enable clip focus mode"
                       onClick={() => { if (!isGeneratingClips) setClipFocusEnabled(!clipFocusEnabled); }}
                       disabled={isGeneratingClips}
                       style={{
@@ -3254,34 +3398,158 @@ export default function Analysis() {
                     </button>
                   </div>
                   {clipFocusEnabled && (
-                    <textarea
-                      placeholder={isMobile ? 'e.g. "funny cooking moments"' : "Try compound queries for best results:\n• \"funny cooking moments\"\n• \"emotional reveals\"\n• \"fighting scenes\""}
-                      value={clipFocusText}
-                      onChange={(e) => setClipFocusText(e.target.value)}
-                      rows={isMobile ? 2 : 3}
-                      disabled={isGeneratingClips}
-                      style={{
-                        width: '100%', padding: '8px 10px', fontSize: 13,
-                        background: 'var(--bg-elevated)',
-                        color: isGeneratingClips ? 'var(--text-muted)' : 'var(--text-primary)',
-                        border: `1px solid ${isGeneratingClips ? 'var(--border)' : 'var(--success)'}`,
-                        borderRadius: 'var(--radius-md)', outline: 'none',
-                        resize: 'none', minHeight: isMobile ? 44 : 60, lineHeight: 1.4,
-                        opacity: isGeneratingClips ? 0.5 : 1,
-                      }}
-                    />
+                    <div style={{ position: 'relative', width: '100%' }}>
+                      <textarea
+                        placeholder={isMobile ? 'e.g. "funny cooking moments"' : "Try compound queries for best results:\n• \"funny cooking moments\"\n• \"emotional reveals\"\n• comma or newline-separated multi-query: \"origin story, biggest mistake\""}
+                        value={clipFocusText}
+                        onChange={(e) => setClipFocusText(e.target.value)}
+                        onFocus={() => { if ((genSettings.focusHistory || []).length > 0 && !clipFocusText) setFocusHistoryOpen(true); }}
+                        onBlur={() => setTimeout(() => setFocusHistoryOpen(false), 150)}
+                        onKeyDown={(e) => {
+                          // Enhancement 3 — Cmd/Ctrl+Enter submits
+                          if ((e.metaKey || e.ctrlKey) && e.key === 'Enter' && clipFocusText.trim() && !isGeneratingClips) {
+                            e.preventDefault();
+                            handleGenerateClips();
+                          }
+                        }}
+                        rows={isMobile ? 2 : 3}
+                        disabled={isGeneratingClips}
+                        aria-label="Clip focus query"
+                        aria-describedby="clip-focus-helper"
+                        maxLength={300}
+                        style={{
+                          width: '100%', padding: '8px 10px', fontSize: 13,
+                          background: 'var(--bg-elevated)',
+                          color: isGeneratingClips ? 'var(--text-muted)' : 'var(--text-primary)',
+                          border: `1px solid ${isGeneratingClips ? 'var(--border)' : 'var(--success)'}`,
+                          borderRadius: 'var(--radius-md)', outline: 'none',
+                          resize: 'none', minHeight: isMobile ? 44 : 60, lineHeight: 1.4,
+                          opacity: isGeneratingClips ? 0.5 : 1,
+                        }}
+                      />
+                      {/* Character counter */}
+                      {clipFocusText.length > 0 && (
+                        <span style={{
+                          position: 'absolute', right: 8, bottom: 4,
+                          fontSize: 9, color: clipFocusText.length > 250 ? 'var(--accent-amber)' : 'var(--text-muted)',
+                          pointerEvents: 'none', fontFamily: 'var(--font-mono)',
+                        }}>
+                          {clipFocusText.length}/300
+                        </span>
+                      )}
+                      {/* History dropdown (Enhancement 3) */}
+                      {focusHistoryOpen && (genSettings.focusHistory || []).length > 0 && (
+                        <div style={{
+                          position: 'absolute', top: '100%', left: 0, right: 0, marginTop: 4,
+                          background: 'var(--bg-elevated)',
+                          border: '1px solid var(--border)',
+                          borderRadius: 'var(--radius-md)',
+                          boxShadow: 'var(--shadow-md)',
+                          zIndex: 40, maxHeight: 200, overflowY: 'auto',
+                        }}>
+                          <div style={{ padding: '4px 10px', fontSize: 9, color: 'var(--text-muted)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Recent queries</div>
+                          {(genSettings.focusHistory || []).map((h, i) => (
+                            <div
+                              key={i}
+                              onMouseDown={(e) => { e.preventDefault(); setClipFocusText(h); setFocusHistoryOpen(false); }}
+                              style={{
+                                padding: '6px 10px', fontSize: 12, cursor: 'pointer',
+                                borderTop: '1px solid var(--border-subtle, rgba(255,255,255,0.04))',
+                                color: 'var(--text-primary)',
+                              }}
+                              onMouseEnter={(e) => { e.currentTarget.style.background = 'var(--bg-panel)'; }}
+                              onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
+                            >
+                              {h}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                  {/* Example chips — shown when the textarea is empty (Enhancement 3) */}
+                  {clipFocusEnabled && !clipFocusText.trim() && (
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+                      {FOCUS_EXAMPLE_CHIPS.map((chip) => (
+                        <button
+                          key={chip}
+                          onClick={() => setClipFocusText(chip)}
+                          disabled={isGeneratingClips}
+                          style={{
+                            padding: '3px 10px', fontSize: 10,
+                            background: 'var(--bg-elevated)',
+                            color: 'var(--text-secondary)',
+                            border: '1px solid var(--border)',
+                            borderRadius: 999,
+                            cursor: isGeneratingClips ? 'not-allowed' : 'pointer',
+                          }}
+                        >
+                          {chip}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                  {/* Min Relevance slider + presets (Bug 1 + Enhancement 8) */}
+                  {clipFocusEnabled && (
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap', marginTop: 4 }}
+                         role="group" aria-label="Minimum focus relevance filter">
+                      <span style={{ fontSize: 11, color: 'var(--text-secondary)', whiteSpace: 'nowrap' }}>Min Relevance</span>
+                      <input
+                        type="range"
+                        min="0"
+                        max="100"
+                        value={genSettings.minRelevance ?? 50}
+                        aria-valuemin={0}
+                        aria-valuemax={100}
+                        aria-valuenow={genSettings.minRelevance ?? 50}
+                        aria-valuetext={`minimum relevance ${genSettings.minRelevance ?? 50}`}
+                        onChange={(e) => setGenSettings((prev) => ({ ...prev, minRelevance: parseInt(e.target.value) }))}
+                        disabled={isGeneratingClips}
+                        style={{ width: 120, accentColor: 'var(--success)' }}
+                      />
+                      <span style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--success)', minWidth: 28, textAlign: 'center' }}>
+                        {genSettings.minRelevance ?? 50}
+                      </span>
+                      <div style={{ display: 'flex', gap: 4 }}>
+                        {[
+                          { label: 'Strong', v: 80 },
+                          { label: 'Strong+Mod', v: 50 },
+                          { label: 'All', v: 0 },
+                        ].map((p) => {
+                          const active = (genSettings.minRelevance ?? 50) === p.v;
+                          return (
+                            <button
+                              key={p.label}
+                              onClick={() => setGenSettings((prev) => ({ ...prev, minRelevance: p.v }))}
+                              disabled={isGeneratingClips}
+                              style={{
+                                padding: '2px 8px', fontSize: 10, fontWeight: 600,
+                                background: active ? 'var(--success)' : 'transparent',
+                                color: active ? 'var(--bg-base)' : 'var(--text-secondary)',
+                                border: `1px solid ${active ? 'var(--success)' : 'var(--border)'}`,
+                                borderRadius: 'var(--radius-sm)',
+                                cursor: isGeneratingClips ? 'not-allowed' : 'pointer',
+                              }}
+                            >
+                              {p.label}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
                   )}
                   {clipFocusEnabled && !isMobile && (
-                    <span style={{ fontSize: 10, color: 'var(--text-muted)', lineHeight: 1.3 }}>
+                    <span id="clip-focus-helper" style={{ fontSize: 10, color: 'var(--text-muted)', lineHeight: 1.3 }}>
                       AI finds clips matching your topic with semantic expansion and relevance scoring.
+                      Use commas or newlines for multi-query OR mode. <kbd style={{ fontFamily: 'var(--font-mono)' }}>Cmd/Ctrl+Enter</kbd> to submit.
                     </span>
                   )}
                 </div>
-                {/* Generate button + algorithm link */}
-                <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginTop: 12, width: '100%' }}>
+                {/* Generate / Cancel row + live filter preview (Enhancement 2) */}
+                <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginTop: 12, width: '100%', flexWrap: 'wrap' }}>
                   <button
-                    onClick={handleGenerateClips}
-                    disabled={isGeneratingClips}
+                    onClick={() => handleGenerateClips()}
+                    disabled={isGeneratingClips || (clipFocusEnabled && !clipFocusText.trim())}
                     style={{
                       padding: '8px 20px',
                       background: isGeneratingClips ? 'var(--accent-amber)' : clipFocusEnabled ? 'var(--success)' : 'var(--accent-cyan)',
@@ -3292,10 +3560,48 @@ export default function Analysis() {
                       fontWeight: 700,
                       cursor: isGeneratingClips ? 'wait' : 'pointer',
                       whiteSpace: 'nowrap',
+                      opacity: (clipFocusEnabled && !clipFocusText.trim()) ? 0.5 : 1,
                     }}
                   >
                     {isGeneratingClips ? 'Generating...' : clipFocusEnabled ? 'Find Focused Clips' : 'Generate Clips'}
                   </button>
+                  {isGeneratingClips && (
+                    <button
+                      onClick={handleCancelGenerate}
+                      aria-label="Cancel clip generation"
+                      style={{
+                        padding: '8px 16px',
+                        background: 'transparent',
+                        color: 'var(--danger, #ff3b30)',
+                        border: '1px solid var(--danger, #ff3b30)',
+                        borderRadius: 'var(--radius-sm)',
+                        fontSize: 12, fontWeight: 600, cursor: 'pointer',
+                      }}
+                    >
+                      Cancel
+                    </button>
+                  )}
+                  {/* Live filter preview (Enhancement 2) — recompute from existing job.clips */}
+                  {!isGeneratingClips && job?.clips && job.clips.length > 0 && (() => {
+                    const srcClips = job.clips || [];
+                    const minR = clipFocusEnabled ? (genSettings.minRelevance ?? 0) : 0;
+                    const vmin = genSettings.viralScoreMin ?? 0;
+                    const vmax = genSettings.viralScoreMax ?? 100;
+                    const matching = srcClips.filter((c) => {
+                      const virality = (clipFocusEnabled && c.viral_score_composite != null) ? c.viral_score_composite : c.viral_score;
+                      const relevance = c.focus_relevance != null ? c.focus_relevance : c.viral_score;
+                      if (virality < vmin || virality > vmax) return false;
+                      if (clipFocusEnabled && minR > 0 && relevance < minR) return false;
+                      return true;
+                    });
+                    const changed = matching.length !== srcClips.length;
+                    if (!changed) return null;
+                    return (
+                      <span style={{ fontSize: 10, color: 'var(--text-muted)', fontFamily: 'var(--font-mono)' }}>
+                        Of {srcClips.length} existing: {matching.length} would pass
+                      </span>
+                    );
+                  })()}
                   <span
                     onClick={() => navigate('/settings?tab=prompts&section=viral-algorithm')}
                     style={{
@@ -3304,6 +3610,7 @@ export default function Analysis() {
                       cursor: 'pointer',
                       textDecoration: 'underline',
                       textDecorationStyle: 'dashed',
+                      marginLeft: 'auto',
                     }}
                     title="Customize the AI prompt that controls how viral clips are detected and scored"
                   >
@@ -3793,6 +4100,21 @@ export default function Analysis() {
                     onExport={handleExportClip}
                     onDelete={handleDeleteClip}
                     onTimesChanged={fetchJob}
+                    onFindMoreLikeThis={(c) => {
+                      // Re-run focus mode with this clip's focus/title as the query,
+                      // scoped to a ±60s window around the source clip. Enhancement 7.
+                      const query = (c.clip_focus || c.title || '').trim();
+                      if (!query) { showToast('No focus query available on this clip', 'warning'); return; }
+                      setClipFocusEnabled(true);
+                      setClipFocusText(query);
+                      const pad = 60;
+                      handleGenerateClips({
+                        clip_focus: query,
+                        scope_start: Math.max(0, c.start_time - pad),
+                        scope_end: Math.min(job?.duration || c.end_time + pad, c.end_time + pad),
+                        append: true,
+                      });
+                    }}
                     selected={selectedClips.has(clip.id)}
                     onSelect={handleSelectClip}
                     exportQuality={clipSettings?.exportQuality || '1080p'}
@@ -3803,6 +4125,105 @@ export default function Analysis() {
               {(!job.clips || job.clips.length === 0) && (
                 <div style={{ textAlign: 'center', padding: 48, color: 'var(--text-muted)' }}>
                   {isProcessing ? 'Detecting viral moments...' : 'No clips detected. Adjust the settings above and click Generate Clips.'}
+                  {!isProcessing && (clipFocusEnabled || (genSettings.viralScoreMin > 0 || genSettings.viralScoreMax < 100)) && (
+                    <div style={{ marginTop: 16 }}>
+                      <button
+                        onClick={handleRelaxFilters}
+                        style={{
+                          padding: '8px 16px', fontSize: 12, fontWeight: 600,
+                          background: 'var(--accent-cyan)', color: 'var(--bg-base)',
+                          border: 'none', borderRadius: 'var(--radius-sm)', cursor: 'pointer',
+                        }}
+                      >
+                        Relax filters &amp; retry
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
+              {/* "Why these clips?" diagnostics drawer (Enhancement 6) */}
+              {job.clips?.length > 0 && (
+                <div style={{ marginTop: 16 }}>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setDiagOpen((v) => {
+                        const next = !v;
+                        if (next && !diagData) loadDiagnostics();
+                        return next;
+                      });
+                    }}
+                    aria-expanded={diagOpen}
+                    style={{
+                      fontSize: 11, color: 'var(--text-muted)',
+                      background: 'transparent', border: 'none', cursor: 'pointer',
+                      fontFamily: 'var(--font-mono)', textTransform: 'uppercase',
+                      letterSpacing: '0.05em', padding: 0,
+                    }}
+                  >
+                    {diagOpen ? '▼' : '▶'} Why these clips?
+                  </button>
+                  {diagOpen && (
+                    <div style={{
+                      marginTop: 8, padding: 12,
+                      background: 'var(--bg-panel)',
+                      border: '1px solid var(--border)',
+                      borderRadius: 'var(--radius-md)',
+                      fontSize: 11, color: 'var(--text-secondary)',
+                    }}>
+                      {diagLoading && <div>Loading diagnostics...</div>}
+                      {!diagLoading && diagData && (
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                          <div>
+                            <strong>Provider:</strong>{' '}
+                            <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--accent-cyan)' }}>
+                              {String(diagData.provider_used?.clips || 'unknown')}
+                            </span>
+                          </div>
+                          <div>
+                            <strong>Content type:</strong>{' '}
+                            <span style={{ fontFamily: 'var(--font-mono)' }}>
+                              {String(diagData.clip_content_type || 'generic')}
+                            </span>
+                          </div>
+                          <div>
+                            <strong>4-axis scoring:</strong>{' '}
+                            {diagData.four_axis_enabled ? 'enabled' : 'disabled'}
+                            {diagData.legacy_fill_count > 0 && (
+                              <span style={{ color: 'var(--accent-amber)', marginLeft: 6 }}>
+                                ({diagData.legacy_fill_count} clips using legacy fill)
+                              </span>
+                            )}
+                          </div>
+                          <div>
+                            <strong>Axis population</strong> (out of {diagData.axis_population?.total ?? 0}):{' '}
+                            <span style={{ fontFamily: 'var(--font-mono)' }}>
+                              hook {diagData.axis_population?.hook ?? 0} ·
+                              flow {diagData.axis_population?.flow ?? 0} ·
+                              value {diagData.axis_population?.value ?? 0} ·
+                              trend {diagData.axis_population?.trend ?? 0}
+                            </span>
+                          </div>
+                          <div>
+                            <strong>Hot zones:</strong>{' '}
+                            {(diagData.hot_zones || []).length} persisted
+                          </div>
+                          <div>
+                            <strong>Chapters:</strong>{' '}
+                            {(diagData.chapters || []).length} persisted
+                          </div>
+                          <div>
+                            <strong>Trend context:</strong>{' '}
+                            {diagData.trend_context ? `${String(diagData.trend_context).length} chars` : 'none'}
+                          </div>
+                          <div>
+                            <strong>Sentiment timeline:</strong>{' '}
+                            {diagData.sentiment_timeline ? `${String(diagData.sentiment_timeline).length} chars` : 'none'}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
               )}
               {job.clips?.length > 0 && filteredClips.length === 0 && (

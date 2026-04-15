@@ -5,8 +5,8 @@
  */
 export const DEFAULT_CLIP_SETTINGS = {
   clipCount: 12,
-  minDuration: 30,
-  maxDuration: 300,
+  minDuration: 15,
+  maxDuration: 600,
   aspectRatio: null,
   subtitlesEnabled: true,  // Subtitles ON by default when transcript exists
   subtitleFont: 'DM Sans',
@@ -36,4 +36,24 @@ export const DEFAULT_CLIP_SETTINGS = {
   exportQuality: '1080p',
   playbackVolume: 100,
   playbackSpeed: 1.0,
+};
+
+/**
+ * Clip-generation panel defaults (Analysis page "Generate Clips" controls).
+ * Persisted in localStorage under GEN_STORAGE_KEY by Analysis.jsx. Bug 6
+ * in the clip-focus audit: keep minDuration/maxDuration matching
+ * DEFAULT_CLIP_SETTINGS above so first-run users see one canonical value.
+ */
+export const DEFAULT_GEN_SETTINGS = {
+  clipCount: 12,
+  minDuration: 15,
+  maxDuration: 600,
+  viralScoreMin: 0,
+  viralScoreMax: 100,
+  // Focus mode — persisted so a refresh doesn't wipe the user's query
+  clipFocusEnabled: false,
+  clipFocusText: '',
+  minRelevance: 50,
+  // Focus query history — last 10 unique queries, MRU order
+  focusHistory: [],
 };
