@@ -42,23 +42,82 @@ export default function VideoPlayer({ src, clipStart, clipEnd, onTimeUpdate, asp
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
-    const onTime = () => {
-      // Call the parent callback without triggering a re-render
-      onTimeUpdateRef.current?.(video.currentTime);
+
+    // Time reporting uses a rAF loop during playback so consumers
+    // (``SubtitleOverlay``, ``TranscriptViewer``) see a ~60 Hz clock
+    // instead of the browser's ~4 Hz ``timeupdate`` event. Without this,
+    // ``videoCurrentTime`` lags real audio by 0–250 ms and the active
+    // transcript line / burned-in subtitles appear to trail the speaker.
+    //
+    // Guards:
+    //  - ``lastReportedT`` dedupes identical values so a paused (or
+    //    off-screen) player doesn't spam ``setVideoCurrentTime`` at
+    //    60 Hz with the same number — same pattern as ``VideoEditor``'s
+    //    tick (commit 1ad9593). Any second writer racing on the same
+    //    parent state is a bug we don't want to re-enable.
+    //  - ``timeupdate`` is kept as a fallback heartbeat for background
+    //    tabs: browsers throttle rAF to ~1 Hz when the tab isn't
+    //    visible, but ``timeupdate`` still fires, so consumers don't
+    //    freeze when the user comes back.
+    //  - ``seeked`` and the initial mount each fire an immediate report
+    //    so the overlay / highlight snaps to the correct spot after a
+    //    scrub instead of waiting for the next natural tick.
+    let rafId = null;
+    let lastReportedT = -1;
+
+    const report = (t) => {
+      if (t === lastReportedT) return;
+      lastReportedT = t;
+      onTimeUpdateRef.current?.(t);
+    };
+
+    const tick = () => {
+      const t = video.currentTime;
+      report(t);
       // Auto-stop at clip end in preview mode
-      if (clipEnd && video.currentTime >= clipEnd) {
+      if (clipEnd && t >= clipEnd) {
         video.pause();
         setPlaying(false);
-        setDisplayTime(video.currentTime);
+        setDisplayTime(t);
+        rafId = null;
         return;
       }
-      // Throttle display updates to ~4x/sec (every 250ms)
+      // Throttled display update (~4 Hz) — the HUD clock doesn't need
+      // 60 fps precision and re-rendering VideoPlayer that often is
+      // wasteful.
       const now = performance.now();
       if (now - lastDisplayUpdateRef.current > 250) {
         lastDisplayUpdateRef.current = now;
-        setDisplayTime(video.currentTime);
+        setDisplayTime(t);
       }
+      rafId = requestAnimationFrame(tick);
     };
+
+    const startRaf = () => {
+      if (rafId == null) rafId = requestAnimationFrame(tick);
+    };
+    const stopRaf = () => {
+      if (rafId != null) {
+        cancelAnimationFrame(rafId);
+        rafId = null;
+      }
+      // One final sample so consumers land exactly on the paused /
+      // ended position instead of whatever the last rAF frame saw.
+      report(video.currentTime);
+      setDisplayTime(video.currentTime);
+    };
+
+    // Fallback heartbeat — fires even if rAF is throttled in background
+    // tabs. When the rAF loop is active we let it drive reports; when
+    // it's not (paused, or the tab is backgrounded and rAF has been
+    // choked), ``timeupdate`` still delivers fresh values.
+    const onTime = () => {
+      if (rafId == null) report(video.currentTime);
+    };
+    const onPlay = () => startRaf();
+    const onPause = () => stopRaf();
+    const onEnded = () => stopRaf();
+    const onSeeked = () => report(video.currentTime);
     const onDur = () => setDuration(video.duration);
     const onError = () => {
       // Retry once on load error (handles transient partial content failures)
@@ -67,11 +126,31 @@ export default function VideoPlayer({ src, clipStart, clipEnd, onTimeUpdate, asp
         video.load();
       }
     };
+
     video.addEventListener('timeupdate', onTime);
+    video.addEventListener('play', onPlay);
+    video.addEventListener('pause', onPause);
+    video.addEventListener('ended', onEnded);
+    video.addEventListener('seeked', onSeeked);
     video.addEventListener('loadedmetadata', onDur);
     video.addEventListener('error', onError);
+
+    // Initial push so the overlay / transcript highlight has a value on
+    // mount (otherwise they stay at the default ``currentTime=0`` until
+    // the user presses play).
+    report(video.currentTime);
+    if (!video.paused) startRaf();
+
     return () => {
+      if (rafId != null) {
+        cancelAnimationFrame(rafId);
+        rafId = null;
+      }
       video.removeEventListener('timeupdate', onTime);
+      video.removeEventListener('play', onPlay);
+      video.removeEventListener('pause', onPause);
+      video.removeEventListener('ended', onEnded);
+      video.removeEventListener('seeked', onSeeked);
       video.removeEventListener('loadedmetadata', onDur);
       video.removeEventListener('error', onError);
     };
