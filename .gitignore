@@ -2,3 +2,8 @@ __pycache__/
 node_modules/
 frontend/dist/
 data/
+
+# Runtime-downloaded models (face_detector pulls the YuNet ONNX
+# from cv2's data/ dir or the OpenCV Zoo on first use). Generated
+# artifacts — not source.
+backend/models/
