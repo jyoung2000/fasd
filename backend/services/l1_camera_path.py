@@ -158,6 +158,108 @@ CENTER_BIAS_GENRES = frozenset({
 })
 
 
+def apply_glance_deviation_clamp(
+    solved_path: list[tuple[float, float]],
+    *,
+    source_width: int,
+    crop_width: float,
+    max_glance_deviation_pct: float = 0.65,
+) -> list[tuple[float, float]]:
+    """Hard-clamp a solved L1 camera path to the gaming mode's
+    maximum horizontal glance deviation.
+
+    Phase 4 — gaming mode adds a mandatory asymmetric clamp on
+    top of whatever pan the solver produces: no frame's crop
+    center may deviate from the horizontal source center by
+    more than ``max_glance_deviation_pct * max_pan``, where
+    ``max_pan = (source_width - crop_width) / 2``. Keeps at
+    least part of the actual gameplay visible during HUD
+    glances — without the clamp, a kill-feed glance on a 16:9
+    source could slide the 9:16 crop fully off the action.
+
+    The clamp is applied after the TV / LP solve so it
+    composes with the existing ``compute_hard_bounds`` soft
+    box-constraint machinery rather than fighting it. Callers
+    that want a hard constraint baked into the solve itself
+    can alternatively plumb ``max_glance_deviation_pct`` into
+    the ``lo_bounds`` / ``hi_bounds`` arguments of
+    :func:`solve_camera_path`.
+
+    Args:
+        solved_path: List of ``(timestamp, x_pixel)`` pairs
+            from :func:`solve_camera_path` / its shot variant.
+        source_width: Source frame width in pixels.
+        crop_width: Target crop width in pixels (e.g. for
+            9:16 from 1920×1080 this is 607.5).
+        max_glance_deviation_pct: Fraction of the available
+            pan range that a glance may traverse. Must be in
+            ``[0, 1]``. Default 0.65 matches the spec.
+
+    Returns:
+        A new path with the same timestamps, where each x
+        value is clamped into
+        ``[center - pct*max_pan, center + pct*max_pan]``.
+    """
+    if not solved_path:
+        return []
+    if not 0.0 <= max_glance_deviation_pct <= 1.0:
+        raise ValueError(
+            f"max_glance_deviation_pct must be in [0, 1]; got "
+            f"{max_glance_deviation_pct}"
+        )
+    src_w = float(source_width)
+    crop_w = float(crop_width)
+    if crop_w >= src_w:
+        # Nothing to clamp — crop already covers the whole width.
+        return list(solved_path)
+    center = src_w / 2.0
+    max_pan = (src_w - crop_w) / 2.0
+    max_dev = float(max_glance_deviation_pct) * max_pan
+    lo = center - max_dev
+    hi = center + max_dev
+    out: list[tuple[float, float]] = []
+    for t, x in solved_path:
+        xc = float(x)
+        if xc < lo:
+            xc = lo
+        elif xc > hi:
+            xc = hi
+        out.append((float(t), xc))
+    return out
+
+
+def center_distance_cost(
+    path: list[tuple[float, float]],
+    *,
+    source_width: int,
+    crop_width: float,
+    lambda_center: float = 0.4,
+) -> float:
+    """Compute the asymmetric center-distance cost for a path.
+
+    Phase 4 term: ``Σ_t lambda_center * ((x_t - x_center) /
+    max_pan)^2``. Used in tests to verify that a centered
+    solution has strictly lower cost than an off-center one
+    for the same set of saliency targets. Production callers
+    fold the term into the L1 objective via the center-anchor
+    unary — this helper exists so the tunable can be
+    evaluated as a standalone scalar.
+    """
+    if not path:
+        return 0.0
+    src_w = float(source_width)
+    crop_w = float(crop_width)
+    if crop_w >= src_w:
+        return 0.0
+    center = src_w / 2.0
+    max_pan = (src_w - crop_w) / 2.0
+    total = 0.0
+    for _t, x in path:
+        delta = (float(x) - center) / max(max_pan, 1e-6)
+        total += lambda_center * delta * delta
+    return float(total)
+
+
 def build_face_anchor_targets(
     dense_faces: list,
     slot_id: Optional[int],
