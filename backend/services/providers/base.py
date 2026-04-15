@@ -540,6 +540,235 @@ def parse_clip_dict(
         return None, f"malformed: {err}"
 
 
+# ── VLM upgrade Phase 1 — grounded subject schema + parser ─────────
+# The new DEFAULT_SUBJECT_TRACKING_PROMPT asks for a normalized bbox
+# instead of a 0-100 percentage estimate. ``SCENE_JSON_SCHEMA_GROUNDED``
+# is the schema string we append to every vision request; each
+# provider's analyze_frames wires it in once we're ready to flip over.
+# ``parse_scene_dict`` is the back-compat-safe parser: if the LLM
+# returns the new grounded fields, we use them; if it only returns the
+# legacy ``subject_x`` (free-tier models, Ollama, fine-tunes), we
+# synthesize a box from the percentage and mark confidence at 0.5.
+
+SCENE_JSON_SCHEMA_GROUNDED = (
+    '[{"timestamp": <float>, "description": "<text>", '
+    '"importance_score": <1-10>, '
+    '"subject_box": [<x1>, <y1>, <x2>, <y2>] or null, '
+    '"subject_confidence": <0.0-1.0>, '
+    '"secondary_subjects": ['
+    '{"box": [<x1>, <y1>, <x2>, <y2>], "confidence": <0.0-1.0>, '
+    '"label": "person|speaker|object|text"}], '
+    '"no_subject_reason": '
+    '"empty_frame|abstract|transition|occluded" or null, '
+    '"active_face": <1-based index or 0>}]'
+)
+
+
+def _clamp_box(
+    box,
+) -> "tuple[list[float] | None, bool]":
+    """Coerce and clamp a bbox to [0.0, 1.0] in (x1, y1, x2, y2) order.
+
+    Returns ``(clamped_box, was_modified)``. A return of ``(None, False)``
+    means the input was not a usable box (not a 4-element sequence or
+    non-numeric). A return of ``(None, True)`` is never produced.
+
+    Auto-fixes:
+      - numeric coercion from strings
+      - swaps x1/x2 and y1/y2 when out of order
+      - clamps each coordinate to [0.0, 1.0]
+      - rejects degenerate boxes (zero-area after clamp)
+    """
+    if not isinstance(box, (list, tuple)) or len(box) != 4:
+        return None, False
+    try:
+        coords = [float(v) for v in box]
+    except (TypeError, ValueError):
+        return None, False
+    original = tuple(coords)
+    x1, y1, x2, y2 = coords
+    if x1 > x2:
+        x1, x2 = x2, x1
+    if y1 > y2:
+        y1, y2 = y2, y1
+    x1 = max(0.0, min(1.0, x1))
+    y1 = max(0.0, min(1.0, y1))
+    x2 = max(0.0, min(1.0, x2))
+    y2 = max(0.0, min(1.0, y2))
+    # Degenerate (zero-area) after clamp → treat as missing.
+    if x2 - x1 < 1e-6 or y2 - y1 < 1e-6:
+        return None, True
+    modified = tuple([x1, y1, x2, y2]) != original
+    return [x1, y1, x2, y2], modified
+
+
+def _coerce_confidence(raw, default: float = 0.0) -> float:
+    """Coerce an LLM confidence field to a float in [0.0, 1.0]."""
+    if raw is None:
+        return default
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return default
+    if v > 1.0 and v <= 100.0:
+        # Some models return percentages instead of 0-1. Accept silently.
+        v = v / 100.0
+    return max(0.0, min(1.0, v))
+
+
+def fill_box_from_legacy(
+    subject_x: int | float,
+) -> list[float]:
+    """Synthesize a centered vertical strip from a legacy ``subject_x``.
+
+    The legacy prompt asked for a 0-100 horizontal center; downstream
+    code treats that as a face/head location. We derive a 10%-wide
+    vertical strip centered on the given x and spanning the full frame
+    height. The resulting box is deliberately tall — the downstream
+    pipeline only uses the x-center for cropping, and Phase 5 crop QA
+    re-scores the actual rendered frame so a loose box here has no
+    downstream cost.
+    """
+    try:
+        sx_frac = float(subject_x) / 100.0
+    except (TypeError, ValueError):
+        sx_frac = 0.5
+    sx_frac = max(0.0, min(1.0, sx_frac))
+    half_width = 0.05  # 10% total
+    x1 = max(0.0, sx_frac - half_width)
+    x2 = min(1.0, sx_frac + half_width)
+    return [x1, 0.0, x2, 1.0]
+
+
+def _box_center_x(box: list[float]) -> float:
+    return (box[0] + box[2]) / 2.0
+
+
+def _box_center_y(box: list[float]) -> float:
+    return (box[1] + box[3]) / 2.0
+
+
+def parse_scene_dict(d: dict, frame_timestamp: float | None = None) -> dict:
+    """Parse one LLM-returned scene dict into a SceneDescription-ready kwargs dict.
+
+    Back-compat contract:
+    - When ``d`` contains a valid ``subject_box``, we parse the grounded
+      fields and also derive the legacy ``subject_x`` / ``precise_x``
+      so every existing pipeline consumer works unchanged.
+    - When ``d`` only contains the legacy ``subject_x`` (older / weaker
+      / offline models), we synthesize a box from the percentage and
+      mark ``vlm_confidence = 0.5`` (legacy uncertainty default).
+    - When neither is present we emit the safety-center defaults.
+
+    Returns a dict with keys:
+      timestamp, description, importance_score, subject_x, precise_x,
+      precise_y, subject_box, vlm_confidence, secondary_subjects,
+      no_subject_reason, active_speaker_x.
+
+    The caller is responsible for merging face detection data,
+    thumbnail_path, etc. and constructing the SceneDescription.
+    """
+    out: dict = {}
+
+    # Timestamp (fall back to caller-provided frame timestamp).
+    ts = d.get("timestamp")
+    try:
+        out["timestamp"] = float(ts) if ts is not None else float(frame_timestamp or 0.0)
+    except (TypeError, ValueError):
+        out["timestamp"] = float(frame_timestamp or 0.0)
+
+    # Description / importance.
+    out["description"] = str(d.get("description", "")) or ""
+    try:
+        imp = int(float(d.get("importance_score", 5)))
+    except (TypeError, ValueError):
+        imp = 5
+    out["importance_score"] = max(1, min(10, imp))
+
+    # Grounded fields.
+    raw_box = d.get("subject_box")
+    box, box_was_clamped = _clamp_box(raw_box)
+    if box_was_clamped:
+        _mixin_logger.warning(
+            "parse_scene_dict: subject_box %s out of [0,1] bounds — clamped to %s",
+            raw_box, box,
+        )
+
+    no_reason_raw = d.get("no_subject_reason")
+    allowed_reasons = {"empty_frame", "abstract", "transition", "occluded"}
+    no_reason = str(no_reason_raw) if no_reason_raw in allowed_reasons else None
+
+    if box is not None:
+        # Grounded path — model returned a bbox.
+        vlm_conf = _coerce_confidence(
+            d.get("subject_confidence"), default=0.0,
+        )
+        out["subject_box"] = box
+        out["vlm_confidence"] = vlm_conf
+        out["no_subject_reason"] = None  # box wins over a stale reason
+
+        cx = _box_center_x(box) * 100.0
+        cy = _box_center_y(box) * 100.0
+        out["precise_x"] = cx
+        out["precise_y"] = cy
+        out["subject_x"] = int(round(cx))
+    elif d.get("subject_x") is not None:
+        # Legacy path — older model returned only 0-100 percent.
+        raw_sx = d.get("subject_x")
+        try:
+            sx_val = float(str(raw_sx).strip().rstrip("%"))
+            if sx_val > 100:  # some models return pixel coords
+                sx_val = (sx_val / 1024.0) * 100.0
+            sx_val = max(0.0, min(100.0, sx_val))
+        except (TypeError, ValueError):
+            sx_val = 50.0
+        out["subject_box"] = fill_box_from_legacy(sx_val)
+        out["vlm_confidence"] = 0.5  # legacy uncertainty default
+        out["precise_x"] = sx_val
+        out["precise_y"] = None
+        out["subject_x"] = int(round(sx_val))
+        out["no_subject_reason"] = no_reason
+    else:
+        # No usable subject signal at all.
+        out["subject_box"] = None
+        out["vlm_confidence"] = 0.0
+        out["subject_x"] = 50
+        out["precise_x"] = None
+        out["precise_y"] = None
+        out["no_subject_reason"] = no_reason or "empty_frame"
+
+    # Secondary subjects (cap to top 3 by confidence).
+    secs_raw = d.get("secondary_subjects") or []
+    parsed_secs: list[dict] = []
+    if isinstance(secs_raw, list):
+        for s in secs_raw:
+            if not isinstance(s, dict):
+                continue
+            sb, _ = _clamp_box(s.get("box"))
+            if sb is None:
+                continue
+            parsed_secs.append({
+                "box": sb,
+                "confidence": _coerce_confidence(s.get("confidence"), 0.0),
+                "label": str(s.get("label", "person"))[:32],
+            })
+    parsed_secs.sort(key=lambda s: s.get("confidence", 0.0), reverse=True)
+    out["secondary_subjects"] = parsed_secs[:3]
+
+    # active_speaker_x (0-100) — unchanged from legacy parser, kept here
+    # so every provider gets it for free.
+    asx_raw = d.get("active_speaker_x")
+    if asx_raw is not None:
+        try:
+            out["active_speaker_x"] = max(0, min(100, int(float(str(asx_raw).strip()))))
+        except (TypeError, ValueError):
+            out["active_speaker_x"] = None
+    else:
+        out["active_speaker_x"] = None
+
+    return out
+
+
 class ProviderError(Exception):
     pass
 

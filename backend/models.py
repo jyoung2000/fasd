@@ -51,6 +51,19 @@ class SceneDescription(BaseModel):
     precise_y: Optional[float] = None      # Actual face nose_y (0-100), for vertical centering
     primary_object_x: Optional[int] = None # Non-face object tracking position (0-100)
     primary_object_type: Optional[str] = None  # "ball", "product", "hand", "text", etc.
+    # ── VLM upgrade Phase 1 — grounding-output fields ──
+    # New VLM prompts ask for a normalized bbox instead of a 0-100 subject_x
+    # estimate. ``subject_box`` is [x1, y1, x2, y2] in 0.0-1.0 image coords;
+    # ``subject_x`` / ``precise_x`` are still derived so every legacy
+    # consumer keeps working unchanged. See parse_scene_dict() in
+    # backend.services.providers.base for the derivation rules.
+    subject_box: Optional[list[float]] = None       # [x1, y1, x2, y2] normalized 0-1, primary subject
+    subject_confidence: float = 0.0                 # 0.0-1.0, merged confidence after Phase 3 fusion
+    vlm_confidence: float = 0.0                     # 0.0-1.0, raw VLM-reported confidence (Phase 3 diagnostic)
+    face_confidence: float = 0.0                    # 0.0-1.0, raw face-detector confidence (Phase 3 diagnostic)
+    fusion_source: Optional[str] = None             # "face_high_conf" | "blended" | "vlm_only" | "fallback_center" | None
+    secondary_subjects: list[dict] = []             # [{box, confidence, label}]
+    no_subject_reason: Optional[str] = None         # "empty_frame"|"abstract"|"transition"|"occluded"|None
 
     @model_validator(mode='before')
     @classmethod
