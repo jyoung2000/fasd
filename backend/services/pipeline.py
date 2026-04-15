@@ -2229,9 +2229,16 @@ async def _run_analysis_inner(job_id: str):
                 JobStatus.ANALYZING_SCENES,
                 f"Analyzing frame {frames_done}/{frames_total} via {provider_name} ({pct}%)")
 
+        # Phase 2 — content-type-aware vision routing. We pass the
+        # user's explicit ``content_type_override`` (normalized) if
+        # set; the OpenRouter provider uses that to swap in Qwen3-VL
+        # for ANIME / GAMEPLAY and leave every other type on the
+        # preset default. Jobs without an explicit override route
+        # through the preset default unchanged.
         try:
             scenes_result, provider = await orchestrator.analyze_frames(
                 frames, job_id, progress_callback=_scene_progress,
+                content_type=_normalized_override or None,
             )
         except CancelledError:
             raise

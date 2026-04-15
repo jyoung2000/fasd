@@ -182,23 +182,33 @@ def _load_model_capabilities() -> dict[str, dict]:
 # OpenRouter rotates free models. The app dynamically discovers
 # available models via /api/providers/models/recommended and the
 # user can refresh the list from the Settings UI.
+# VLM upgrade Phase 2 — PRESETS refresh.
+#
+# Rationale:
+#   - qwen2.5-vl-72b:free is stale; Qwen3-VL lands grounding output
+#     in the same prompt the new DEFAULT_SUBJECT_TRACKING_PROMPT asks
+#     for and is strictly better on non-photo content.
+#   - Gemini 2.5 Flash/Pro defaults get refreshed to the Gemini 3
+#     preview tier with the 2.5 line retained as first fallback so
+#     unavailability on a given OpenRouter key degrades gracefully.
+#   - Content-type routing (ANIME, GAMEPLAY → Qwen3-VL; everything
+#     else → preset default) is applied AFTER preset selection via
+#     select_vision_model_for_content() below.
+#
+# NOTE: OpenRouter model identifiers evolve — if a preview model is
+# retired, _call_with_fallback walks the _fallbacks list. We always
+# keep a last-resort stable model (Gemini 2.5 line) so no path dead-ends.
 PRESETS = {
     "free": {
-        # openrouter/free auto-routes to whatever free model is currently available
         "vision": "openrouter/free",
         "summary": "openrouter/free",
         "text": "openrouter/free",
-        # Ordered by reliability + vision quality for free models.
-        # Google Gemini models are included as final fallbacks because
-        # :free models often return 401 "User not found" for API keys
-        # that don't have free-tier access.  Gemini models use Google's
-        # own auth path via OpenRouter and work with most API keys.
         "vision_fallbacks": [
+            "qwen/qwen3-vl-30b-a3b-instruct:free",
+            "qwen/qwen3-vl-8b-thinking:free",
             "qwen/qwen2.5-vl-72b-instruct:free",
-            "qwen/qwen2.5-vl-32b-instruct:free",
             "google/gemma-3-27b-it:free",
             "meta-llama/llama-3.2-11b-vision-instruct:free",
-            "mistralai/mistral-small-3.1-24b-instruct:free",
             "google/gemini-2.5-flash",
         ],
         "summary_fallbacks": [
@@ -217,10 +227,16 @@ PRESETS = {
         ],
     },
     "efficient": {
-        "vision": "google/gemini-2.5-flash",
+        # Qwen3-VL-235B is price-competitive with Gemini 2.5 Flash on
+        # OpenRouter and lands grounding output natively. Gemini Flash
+        # stays as first fallback.
+        "vision": "qwen/qwen3-vl-235b-a22b-instruct",
         "summary": "google/gemini-2.5-flash",
         "text": "google/gemini-2.5-flash",
         "vision_fallbacks": [
+            "qwen/qwen3-vl-30b-a3b-instruct",
+            "google/gemini-3.1-flash-lite-preview",
+            "google/gemini-2.5-flash",
             "google/gemini-2.5-flash-lite",
         ],
         "summary_fallbacks": [
@@ -231,10 +247,12 @@ PRESETS = {
         ],
     },
     "balanced": {
-        "vision": "google/gemini-2.5-flash",
+        "vision": "google/gemini-3-flash-preview",
         "summary": "google/gemini-2.5-flash",
         "text": "google/gemini-2.5-pro",
         "vision_fallbacks": [
+            "qwen/qwen3-vl-235b-a22b-instruct",
+            "google/gemini-2.5-flash",
             "google/gemini-2.5-flash-lite",
         ],
         "summary_fallbacks": [
@@ -247,10 +265,13 @@ PRESETS = {
         ],
     },
     "premium": {
-        "vision": "google/gemini-2.5-pro",
+        "vision": "google/gemini-3-pro-preview",
         "summary": "google/gemini-2.5-flash",
         "text": "anthropic/claude-sonnet-4",
         "vision_fallbacks": [
+            "google/gemini-3.1-pro-preview",
+            "google/gemini-3-flash-preview",
+            "google/gemini-2.5-pro",
             "google/gemini-2.5-flash",
         ],
         "summary_fallbacks": [
@@ -263,6 +284,57 @@ PRESETS = {
         ],
     },
 }
+
+
+# VLM upgrade Phase 2 — content-type override.
+#
+# Applied AFTER preset selection. Qwen3-VL's grounding training is
+# noticeably stronger on non-photorealistic content (anime) and
+# GUI-dense content (gameplay HUDs, menus, text). Live-action clips
+# (music videos, talking heads, narrative, sports) stay on the preset
+# default where Gemini 2.5/3 tends to win on face detection.
+#
+# The returned model must be reachable from the preset's fallback
+# chain so cost telemetry and rate limiting stay consistent — any
+# unreachable override falls through via _call_with_fallback.
+_QWEN3_VL_TARGET = "qwen/qwen3-vl-235b-a22b-instruct"
+
+_CONTENT_TYPE_VISION_OVERRIDES = {
+    # anime family
+    "anime": _QWEN3_VL_TARGET,
+    "animation": _QWEN3_VL_TARGET,
+    "anime_dialogue": _QWEN3_VL_TARGET,
+    "animation_dialogue": _QWEN3_VL_TARGET,
+    "cartoon": _QWEN3_VL_TARGET,
+    # gameplay family
+    "gameplay": _QWEN3_VL_TARGET,
+    "gameplay_fps": _QWEN3_VL_TARGET,
+    "gameplay_moba": _QWEN3_VL_TARGET,
+    "gameplay_tps": _QWEN3_VL_TARGET,
+    "gameplay_racing": _QWEN3_VL_TARGET,
+    "stream": _QWEN3_VL_TARGET,
+}
+
+
+def select_vision_model_for_content(content_type, preset_default: str) -> str:
+    """Return the vision model id to use for a given content type.
+
+    ``content_type`` accepts a ClipContentType enum, its ``.value``
+    string, or a raw string / None. Unknown types always return the
+    preset default — we never guess.
+
+    The returned model id is NOT verified to be reachable here;
+    OpenRouter's _call_with_fallback handles unavailability by walking
+    the preset's vision_fallbacks list. Callers should log when the
+    override target differs from the preset default so the job report
+    shows which model actually ran.
+    """
+    if content_type is None:
+        return preset_default
+    key = getattr(content_type, "value", None) or str(content_type)
+    key = key.lower()
+    override = _CONTENT_TYPE_VISION_OVERRIDES.get(key)
+    return override or preset_default
 
 
 class _RateLimiter:
@@ -475,6 +547,10 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
             return [single] if single else (list(default) if default else [])
 
         self._vision_fallbacks = _to_list("vision_fallbacks", "vision_fallback")
+        # Preserve the original preset-resolved vision model so we can
+        # reset it after a content-type-specific override. Phase 2.
+        self._base_vision_model = self._vision_model
+        self._active_vision_model_override = None  # content-type key last applied
         self._text_fallbacks = _to_list("text_fallbacks", "text_fallback")
         self._summary_fallbacks = _to_list(
             "summary_fallbacks", "summary_fallback", self._text_fallbacks,
@@ -537,6 +613,52 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
         """Set the WebSocket broadcast function and job ID for frontend notifications."""
         self._ws_broadcast = ws_broadcast
         self._job_id = job_id
+
+    def apply_vision_model_override(self, content_type) -> str:
+        """Swap the active vision model based on ``content_type``.
+
+        Phase 2 — content-type routing. ANIME and GAMEPLAY content
+        routes to Qwen3-VL regardless of preset; everything else
+        reverts to the preset-resolved ``_base_vision_model`` captured
+        in ``__init__``. Returns the model id that will be used for
+        the next analyze_frames call.
+
+        The override is idempotent and safe to call repeatedly with
+        the same content_type. If the routed model is not available
+        at the API (retired, 401, rate-limited), ``_call_with_fallback``
+        walks ``self._vision_fallbacks`` so the override never
+        hard-fails. We prepend the original preset default to the
+        fallback list when we apply an override, guaranteeing the
+        original model is always reachable from the new primary.
+        """
+        resolved = select_vision_model_for_content(
+            content_type, self._base_vision_model,
+        )
+        previous = self._vision_model
+        if resolved == previous:
+            logger.info(
+                "Using vision model for %s: %s (preset default)",
+                getattr(content_type, "value", content_type) or "unknown",
+                resolved,
+            )
+            return resolved
+
+        # Apply override. Preserve the original fallbacks and inject
+        # the preset default at the front so a routed model that 401s
+        # falls through to whatever the user originally selected.
+        self._vision_model = resolved
+        self._active_vision_model_override = getattr(
+            content_type, "value", content_type,
+        )
+        # Only modify the fallback chain the first time we override.
+        if self._base_vision_model not in self._vision_fallbacks:
+            self._vision_fallbacks = [self._base_vision_model] + list(self._vision_fallbacks)
+        logger.info(
+            "Using vision model for %s: %s (overrode preset default %s)",
+            self._active_vision_model_override,
+            resolved, self._base_vision_model,
+        )
+        return resolved
 
     async def _ws_notify(self, msg_type: str, **kwargs):
         """Send a WebSocket message to the frontend if broadcast is available."""

@@ -333,9 +333,17 @@ class AIOrchestrator:
     async def analyze_frames(
         self, frames: list[FrameData], job_id: str,
         progress_callback=None,
+        content_type=None,
     ) -> tuple[list[SceneDescription], str]:
         """Returns (results, provider_name_used).
-        progress_callback(frames_done, total_frames, provider_name) is called per batch."""
+        progress_callback(frames_done, total_frames, provider_name) is called per batch.
+
+        ``content_type`` is an optional ``ClipContentType`` (or
+        string / None). When provided, the OpenRouter provider uses
+        it to route ANIME / GAMEPLAY jobs to Qwen3-VL and leaves
+        every other content type on the preset default. See
+        ``select_vision_model_for_content`` in openrouter_provider.py.
+        """
         self._wire_ws_to_providers(job_id)
         frame_prompt = self._custom_prompts.frame_analysis if self._custom_prompts else None
         # Append subject tracking instructions when enabled
@@ -353,6 +361,16 @@ class AIOrchestrator:
                 async def _provider_progress(done, total):
                     if progress_callback:
                         await progress_callback(done, total, provider.provider_name)
+
+                # Phase 2 — content-type-aware vision routing. Only
+                # OpenRouter ships the preset system, so this is a
+                # targeted call; other providers ignore the kwarg.
+                _routing_ct = content_type
+                try:
+                    if hasattr(provider, "apply_vision_model_override"):
+                        provider.apply_vision_model_override(_routing_ct)
+                except Exception as err:
+                    logger.debug("Vision model override skipped: %s", err)
 
                 t0 = time.monotonic()
                 result = await provider.analyze_frames(
