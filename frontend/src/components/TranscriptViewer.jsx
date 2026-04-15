@@ -110,21 +110,75 @@ export default function TranscriptViewer({ transcript, onSeek, jobId, onSpeakerR
     return timeFiltered.filter((seg) => seg.text.toLowerCase().includes(q) || seg.speaker.toLowerCase().includes(q));
   }, [timeFiltered, search]);
 
-  // Determine which segment is currently playing (by original transcript index)
+  // Determine which segment is currently playing (by original transcript index).
+  //
+  // Whisper transcripts almost always have small gaps between segments —
+  // during normal playback `currentTime` lands inside one of those gaps
+  // most of the time. The legacy implementation iterated ``filtered`` and
+  // returned -1 in any gap, which dropped the blue highlight and stopped
+  // the auto-scroll for the majority of playback.
+  //
+  // Fix: iterate over the full ``transcript`` (so search/time-range
+  // filters can't accidentally suppress the lookup), and when
+  // ``currentTime`` lands in a gap keep the most recently spoken segment
+  // "active" for up to 5 s. Beyond 5 s of silence we drop the highlight —
+  // at that point nothing is actually being spoken.
   const activeOriginalIdx = useMemo(() => {
-    if (currentTime == null || !filtered.length) return -1;
-    for (const seg of filtered) {
+    if (currentTime == null || !transcript.length) return -1;
+    const GAP_HOLD_SEC = 5.0;
+    let lastEndedIdx = -1;
+    let lastEndedTime = -Infinity;
+    for (let i = 0; i < transcript.length; i++) {
+      const seg = transcript[i];
       if (seg.start <= currentTime && currentTime < seg.end) {
-        return transcript.indexOf(seg);
+        return i;
+      }
+      if (seg.end <= currentTime && seg.end > lastEndedTime) {
+        lastEndedTime = seg.end;
+        lastEndedIdx = i;
       }
     }
+    if (lastEndedIdx >= 0 && currentTime - lastEndedTime <= GAP_HOLD_SEC) {
+      return lastEndedIdx;
+    }
     return -1;
-  }, [currentTime, filtered, transcript]);
+  }, [currentTime, transcript]);
 
   // Auto-scroll to keep the active segment centered in the transcript view.
   // Uses per-frame lerp (exponential ease-out) instead of CSS smooth scroll
   // to avoid choppiness when segments change rapidly during playback.
+  //
+  // Scroll math: we compute the delta via ``getBoundingClientRect()`` so
+  // the result is independent of which ancestor happens to be
+  // ``position: relative`` (the legacy code used ``offsetTop`` which
+  // reports distance to the nearest *positioned* ancestor — on this page
+  // that's ``<body>``, not the scroll container, so the target
+  // ``scrollTop`` had nothing to do with the actual row position inside
+  // the container). The resulting ``targetTop`` is clamped to
+  // ``[0, scrollHeight - clientHeight]`` so we never request an
+  // impossible position.
+  //
+  // Manual-scroll override: after any wheel / touchmove / keydown on the
+  // container we pause auto-scroll for 2.5 s so the user's scroll doesn't
+  // get yanked back. The next segment boundary resumes it.
   const scrollAnimRef = useRef(null);
+  const lastUserScrollRef = useRef(0);
+  useEffect(() => {
+    const container = scrollContainerRef.current;
+    if (!container) return;
+    const onUserScroll = () => {
+      lastUserScrollRef.current = performance.now();
+    };
+    container.addEventListener('wheel', onUserScroll, { passive: true });
+    container.addEventListener('touchmove', onUserScroll, { passive: true });
+    container.addEventListener('keydown', onUserScroll);
+    return () => {
+      container.removeEventListener('wheel', onUserScroll);
+      container.removeEventListener('touchmove', onUserScroll);
+      container.removeEventListener('keydown', onUserScroll);
+    };
+  }, []);
+
   useEffect(() => {
     if (activeOriginalIdx < 0) return;
     const el = activeSegRef.current;
@@ -137,8 +191,25 @@ export default function TranscriptViewer({ transcript, onSeek, jobId, onSpeakerR
       scrollAnimRef.current = null;
     }
 
-    // Target: center the active segment in the container
-    const targetTop = el.offsetTop - container.clientHeight / 2 + el.offsetHeight / 2;
+    // Manual-scroll override: user wheel/touch/key within the last
+    // 2.5 s pauses auto-centering. The next active-segment change will
+    // resume it.
+    const MANUAL_OVERRIDE_MS = 2500;
+    if (performance.now() - lastUserScrollRef.current < MANUAL_OVERRIDE_MS) {
+      return;
+    }
+
+    // Target: center the active row in the container. Use bounding
+    // rects so the math is ``offsetParent``-independent, then clamp
+    // to the valid scroll range.
+    const rowRect = el.getBoundingClientRect();
+    const contRect = container.getBoundingClientRect();
+    const rowCenterInContainer =
+      (rowRect.top - contRect.top) + container.scrollTop + rowRect.height / 2;
+    let targetTop = rowCenterInContainer - container.clientHeight / 2;
+    const maxScroll = Math.max(0, container.scrollHeight - container.clientHeight);
+    if (targetTop < 0) targetTop = 0;
+    if (targetTop > maxScroll) targetTop = maxScroll;
 
     const animate = () => {
       const diff = targetTop - container.scrollTop;
@@ -883,7 +954,15 @@ export default function TranscriptViewer({ transcript, onSeek, jobId, onSpeakerR
       )}
 
       {/* Segments */}
-      <div ref={scrollContainerRef} style={{ maxHeight: maxHeight || 500, overflow: 'auto' }}>
+      <div
+        ref={scrollContainerRef}
+        style={{
+          maxHeight: maxHeight || 500,
+          overflow: 'auto',
+          position: 'relative',
+          scrollbarGutter: 'stable',
+        }}
+      >
         {filtered.map((seg, i) => {
           const color = speakerColor(seg.speaker);
           const originalIdx = transcript.indexOf(seg);
@@ -898,21 +977,37 @@ export default function TranscriptViewer({ transcript, onSeek, jobId, onSpeakerR
 
           const isSelected = selectedIndices.has(originalIdx);
 
+          // Callback ref so the ref explicitly CLEARS when a row stops
+          // being active (the legacy `ref={isActive ? activeSegRef : undefined}`
+          // left `activeSegRef.current` pointing at a stale DOM node after
+          // the row lost its active state, so the scroll effect
+          // occasionally targeted a detached element during search-filter
+          // changes).
+          const setActiveRef = (node) => {
+            if (isActiveSeg) {
+              activeSegRef.current = node;
+            } else if (activeSegRef.current && activeSegRef.current === node) {
+              activeSegRef.current = null;
+            }
+          };
+
           return (
             <React.Fragment key={`seg-${originalIdx}`}>
               <div
-                ref={isActiveSeg ? activeSegRef : undefined}
+                ref={setActiveRef}
+                data-active={isActiveSeg ? 'true' : undefined}
                 style={{
                   display: 'flex',
                   gap: isMobile ? 8 : 12,
                   padding: '8px 4px',
                   alignItems: 'flex-start',
                   borderRadius: 'var(--radius-sm)',
-                  transition: 'background 0.2s, border-color 0.2s',
+                  transition: 'background 0.2s, border-color 0.2s, box-shadow 0.2s',
                   ...(isActiveSeg && !isSelected ? {
-                    background: 'var(--accent-cyan-dim, rgba(0,217,255,0.08))',
-                    borderLeft: '2px solid var(--accent-cyan)',
-                    paddingLeft: 6,
+                    background: 'rgba(10,132,255,0.18)',
+                    borderLeft: '3px solid var(--accent-cyan)',
+                    boxShadow: 'inset 0 0 0 1px rgba(10,132,255,0.35)',
+                    paddingLeft: 5,
                   } : isSelected ? {
                     background: 'var(--accent-cyan-dim, rgba(0,217,255,0.12))',
                     borderLeft: '2px solid var(--accent-cyan)',
