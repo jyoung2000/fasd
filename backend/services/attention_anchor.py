@@ -132,12 +132,23 @@ def _person_body_anchor(
         return None
     # Largest bbox wins (closest to camera).
     best = max(eligible, key=lambda p: float(p.width) * float(p.height))
-    biased_cy = float(best.cy) - PERSON_HEAD_CY_BIAS * float(best.height)
-    biased_cy = max(0.0, min(1.0, biased_cy))
+    # Phase B: prefer the pose-derived head anchor when available
+    # (CLIPAI_PERSON_USE_POSE=true). It lands on the actual nose /
+    # shoulder midpoint instead of a torso-biased bbox center, which is
+    # critical for back-turned, profile, and far-subject frames.
+    anchor_cx = getattr(best, "anchor_x", None)
+    anchor_cy = getattr(best, "anchor_y", None)
+    if anchor_cx is not None and anchor_cy is not None:
+        cx = float(anchor_cx)
+        cy = float(anchor_cy)
+    else:
+        cx = float(best.cx)
+        cy = float(best.cy) - PERSON_HEAD_CY_BIAS * float(best.height)
+        cy = max(0.0, min(1.0, cy))
     return AttentionAnchor(
         timestamp=timestamp,
-        cx=float(best.cx),
-        cy=biased_cy,
+        cx=cx,
+        cy=cy,
         half_width=float(best.width) / 2.0,
         half_height=float(best.height) / 2.0,
         confidence=PERSON_BODY_CONFIDENCE,

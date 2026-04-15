@@ -29,6 +29,22 @@ anime face detector no-ops without it — `detect_anime_faces()`
 returns `AnimeDetectionResult(skipped_reason="cascade not found: ...")`
 when the XML is missing. Do **not** delete it.
 
+### `yolo11n.pt` and `yolo11n-pose.pt` (Phase B)
+
+- **Auto-downloaded:** by `ultralytics` on first use when
+  `CLIPAI_OBJECT_DETECTOR=yolo11n` and/or
+  `CLIPAI_PERSON_USE_POSE=true` are set. We don't commit the weights;
+  the lazy loaders fetch them to `backend/models/` (or `/data/models/`)
+  on demand.
+- **Used by:** `backend/services/object_detector.py` (yolo11n.pt) and
+  `backend/services/person_detector.py` (yolo11n-pose.pt for the
+  head-anchor extraction).
+- **Why:** YOLO11n has ~22% fewer params than YOLOv8m at better small
+  -object mAP; the pose variant gives 17 COCO keypoints per person so
+  back-turned / profile / far-subject frames get a real head anchor
+  instead of a torso-biased bbox center.
+- **CPU-only.** Both flags default OFF.
+
 ### `insightface/models/buffalo_s/` (ArcFace 512-d)
 
 - **Size:** ~16 MB (recognition pack only; full buffalo_s is ~25 MB)

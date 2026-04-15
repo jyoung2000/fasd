@@ -62,6 +62,44 @@ class ObjectDetector:
         self._model = None
         self._init_errors: list = []  # kept for diagnostics
 
+        # ── Try YOLO11n first if requested ──
+        # CLIPAI_OBJECT_DETECTOR=yolo11n switches to the newer Ultralytics
+        # release (~22% fewer params than YOLOv8m, better small-object mAP
+        # at the nano scale). Falls back to yolov8n on any failure so the
+        # default still ships when the flag is off.
+        preferred = os.environ.get("CLIPAI_OBJECT_DETECTOR", "yolov8n").lower()
+        if preferred == "yolo11n":
+            try:
+                from ultralytics import YOLO as _YOLO11
+                model_path = os.path.join(model_dir, "yolo11n.pt")
+                if not os.path.exists(model_path):
+                    logger.info(
+                        "[ObjectDetector] YOLO11n weights not at %s; "
+                        "using ultralytics auto-download cache",
+                        model_path,
+                    )
+                    model_path = "yolo11n.pt"
+                self._model = _YOLO11(model_path)
+                self.backend_name = "ultralytics-yolo11n"
+                logger.info(
+                    "[ObjectDetector] backend=yolo11n, model_path=%s, "
+                    "classes=%d",
+                    model_path, len(getattr(self._model, "names", {}) or {}),
+                )
+                return
+            except ImportError as e:
+                logger.warning(
+                    "[ObjectDetector] ultralytics import failed for yolo11n: "
+                    "%s — falling back to yolov8n", e,
+                )
+                self._init_errors.append(("yolo11n_import", str(e)))
+            except Exception as e:
+                logger.warning(
+                    "[ObjectDetector] yolo11n load failed: %s — falling "
+                    "back to yolov8n", e,
+                )
+                self._init_errors.append(("yolo11n_load", str(e)))
+
         # ── Try ultralytics YOLOv8n ──
         # v4.1: promote the init errors from DEBUG to WARNING and tag
         # them so the log tells us the actual cause. Before the hotfix,
@@ -140,7 +178,7 @@ class ObjectDetector:
 
         h, w = frame_bgr.shape[:2]
 
-        if self.backend_name == "ultralytics-yolov8n":
+        if self.backend_name in ("ultralytics-yolov8n", "ultralytics-yolo11n"):
             try:
                 results = self._model(frame_bgr, verbose=False, device="cpu",
                                       conf=self.conf_threshold)
