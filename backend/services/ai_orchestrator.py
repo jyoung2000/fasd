@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 import time
 from typing import Optional
 
@@ -616,49 +617,90 @@ class AIOrchestrator:
             ct_label = content_type.value if hasattr(content_type, "value") else (content_type or "generic")
             logger.info("Using genre prompt: %s", ct_label)
         # If clip_focus is provided, build an augmented focus prompt that
-        # BUILDS ON the viral detection infrastructure rather than replacing it
+        # BUILDS ON the viral detection infrastructure rather than replacing it.
+        # Enhancement 4 — the focus field accepts a comma- or newline-separated
+        # list of queries which the LLM is instructed to treat as OR; each
+        # returned clip's clip_focus field names the matching sub-query.
         if clip_focus and clip_focus.strip():
             focus_text = clip_focus.strip()
-            clip_prompt = (
-                f"You are finding clips in a video that focus on a specific user-requested topic.\n\n"
-                f"USER'S FOCUS QUERY: \"{focus_text}\"\n\n"
-                f"SEMANTIC EXPANSION — Before searching, expand this query into related concepts:\n"
-                f"Think about synonyms, related terms, sub-topics, and adjacent concepts that someone "
-                f"searching for \"{focus_text}\" would also want to see. For example, if the focus is "
-                f"'fighting', also look for: combat, battle, argument, confrontation, sparring, conflict, "
-                f"physical altercation, self-defense, martial arts, etc.\n\n"
-                f"RELEVANCE TIERS:\n"
-                f"  Tier 1 (STRONG — score 80-100): The segment IS ABOUT '{focus_text}'. "
-                f"The topic is the main subject of discussion or the primary visual action.\n"
-                f"  Tier 2 (MODERATE — score 50-79): The segment discusses '{focus_text}' as a "
-                f"significant part of a broader conversation. Multiple sentences or visual moments relate to it.\n"
-                f"  Tier 3 (WEAK — score 20-49): The topic is mentioned briefly or tangentially. "
-                f"Only include Tier 3 clips if fewer than 3 Tier 1/2 clips exist.\n"
-                f"  EXCLUDE: Segments that merely mention a word related to '{focus_text}' in passing, "
-                f"negations ('I don't like {focus_text}'), or purely metaphorical usage.\n\n"
-                f"COMPOUND QUERIES: If the focus contains both a topic and a mood/quality "
-                f"(e.g., 'funny cooking moments'), prioritize segments matching BOTH aspects. "
-                f"Score clips higher when they combine the topic with the specified mood.\n\n"
-                f"SCORING: Use 'viral_score' to represent RELEVANCE to '{focus_text}' (not virality). "
-                f"A clip with 90 relevance means the segment is deeply, directly about the focus topic. "
-                f"In 'viral_score_reasoning', explain WHY this clip matches the focus query and which "
-                f"relevance tier it falls into.\n\n"
-                f"Additionally include 'focus_relevance' (1-100) and 'focus_tier' (\"strong\", \"moderate\", "
-                f"or \"weak\") in each clip's JSON.\n\n"
-                f"SCENE & SUBJECT COHERENCE (CRITICAL):\n"
-                f"- The main subject MUST stay in focus throughout the entire clip\n"
-                f"- NEVER cut across unrelated scenes or topics — the clip must feel like ONE moment\n"
-                f"- If a clip covers a conversation, keep it within the same exchange\n"
-                f"- The visual setting should remain consistent — don't span across location changes\n"
-                f"- Prefer segments where the camera stays on the main action without jarring cuts\n"
-                f"- If scene descriptions show different settings at different timestamps, do NOT combine them into one clip\n\n"
-                f"BOUNDARY RULES:\n"
-                f"- Start at natural speech boundaries — beginning of a sentence, after a pause, at a speaker change\n"
-                f"- End at natural conclusions — even if focus content extends further, find a clean exit point\n"
-                f"- Must work standalone without context from the full video\n"
-                f"- Prefer clips where the focus topic is introduced within the first 5 seconds"
-            )
-            logger.info("Clip focus mode active for job %s: '%s'", job_id, focus_text)
+            focus_sub_queries = [
+                q.strip() for q in re.split(r"[,\n]+", focus_text)
+                if q.strip()
+            ]
+            is_multi_query = len(focus_sub_queries) > 1
+            if is_multi_query:
+                sub_bullets = "\n".join(f"  {i+1}. \"{q}\"" for i, q in enumerate(focus_sub_queries))
+                clip_prompt = (
+                    f"You are finding clips in a video that match ANY of several user-requested topics.\n\n"
+                    f"USER'S FOCUS QUERIES (OR):\n{sub_bullets}\n\n"
+                    f"For each clip, set clip_focus to the EXACT sub-query string it matched "
+                    f"(one of the options above). If a clip strongly matches multiple sub-queries, "
+                    f"pick the best match and note the overlap in viral_score_reasoning.\n\n"
+                    f"SEMANTIC EXPANSION — expand each sub-query into synonyms and related concepts "
+                    f"before searching. For example, \"fighting\" also covers combat, battle, "
+                    f"argument, confrontation, sparring.\n\n"
+                    f"RELEVANCE TIERS (apply per sub-query the clip matched):\n"
+                    f"  Tier 1 (STRONG — score 80-100): the matched sub-query is the main subject.\n"
+                    f"  Tier 2 (MODERATE — score 50-79): the matched sub-query is a significant part.\n"
+                    f"  Tier 3 (WEAK — score 20-49): passing mention only (include only if <3 stronger).\n"
+                    f"  EXCLUDE: mere keyword hits in passing or negations.\n\n"
+                    f"SCORING: Put RELEVANCE (1-100) in 'viral_score' — do NOT use virality here. "
+                    f"Also include 'focus_relevance' (1-100) and 'focus_tier' "
+                    f"(\"strong\", \"moderate\", or \"weak\").\n\n"
+                    f"SCENE & SUBJECT COHERENCE (CRITICAL):\n"
+                    f"- The main subject MUST stay in focus throughout each clip\n"
+                    f"- Keep the clip within ONE scene / exchange\n"
+                    f"- Prefer natural speech boundaries for start/end\n\n"
+                    f"BOUNDARY RULES:\n"
+                    f"- Start at the beginning of a sentence\n"
+                    f"- End at a clean exit point\n"
+                    f"- Clips must work standalone without the rest of the video"
+                )
+                logger.info(
+                    "Clip focus MULTI-QUERY mode for job %s: %d sub-queries",
+                    job_id, len(focus_sub_queries),
+                )
+            else:
+                clip_prompt = (
+                    f"You are finding clips in a video that focus on a specific user-requested topic.\n\n"
+                    f"USER'S FOCUS QUERY: \"{focus_text}\"\n\n"
+                    f"SEMANTIC EXPANSION — Before searching, expand this query into related concepts:\n"
+                    f"Think about synonyms, related terms, sub-topics, and adjacent concepts that someone "
+                    f"searching for \"{focus_text}\" would also want to see. For example, if the focus is "
+                    f"'fighting', also look for: combat, battle, argument, confrontation, sparring, conflict, "
+                    f"physical altercation, self-defense, martial arts, etc.\n\n"
+                    f"RELEVANCE TIERS:\n"
+                    f"  Tier 1 (STRONG — score 80-100): The segment IS ABOUT '{focus_text}'. "
+                    f"The topic is the main subject of discussion or the primary visual action.\n"
+                    f"  Tier 2 (MODERATE — score 50-79): The segment discusses '{focus_text}' as a "
+                    f"significant part of a broader conversation. Multiple sentences or visual moments relate to it.\n"
+                    f"  Tier 3 (WEAK — score 20-49): The topic is mentioned briefly or tangentially. "
+                    f"Only include Tier 3 clips if fewer than 3 Tier 1/2 clips exist.\n"
+                    f"  EXCLUDE: Segments that merely mention a word related to '{focus_text}' in passing, "
+                    f"negations ('I don't like {focus_text}'), or purely metaphorical usage.\n\n"
+                    f"COMPOUND QUERIES: If the focus contains both a topic and a mood/quality "
+                    f"(e.g., 'funny cooking moments'), prioritize segments matching BOTH aspects. "
+                    f"Score clips higher when they combine the topic with the specified mood.\n\n"
+                    f"SCORING: Use 'viral_score' to represent RELEVANCE to '{focus_text}' (not virality). "
+                    f"A clip with 90 relevance means the segment is deeply, directly about the focus topic. "
+                    f"In 'viral_score_reasoning', explain WHY this clip matches the focus query and which "
+                    f"relevance tier it falls into.\n\n"
+                    f"Additionally include 'focus_relevance' (1-100) and 'focus_tier' (\"strong\", \"moderate\", "
+                    f"or \"weak\") in each clip's JSON.\n\n"
+                    f"SCENE & SUBJECT COHERENCE (CRITICAL):\n"
+                    f"- The main subject MUST stay in focus throughout the entire clip\n"
+                    f"- NEVER cut across unrelated scenes or topics — the clip must feel like ONE moment\n"
+                    f"- If a clip covers a conversation, keep it within the same exchange\n"
+                    f"- The visual setting should remain consistent — don't span across location changes\n"
+                    f"- Prefer segments where the camera stays on the main action without jarring cuts\n"
+                    f"- If scene descriptions show different settings at different timestamps, do NOT combine them into one clip\n\n"
+                    f"BOUNDARY RULES:\n"
+                    f"- Start at natural speech boundaries — beginning of a sentence, after a pause, at a speaker change\n"
+                    f"- End at natural conclusions — even if focus content extends further, find a clean exit point\n"
+                    f"- Must work standalone without context from the full video\n"
+                    f"- Prefer clips where the focus topic is introduced within the first 5 seconds"
+                )
+                logger.info("Clip focus mode active for job %s: '%s'", job_id, focus_text)
 
         # Bug 2 (clip-focus audit): inject score range and min-relevance
         # as *prompt* constraints so the LLM doesn't waste tokens
