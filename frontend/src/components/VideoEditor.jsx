@@ -1426,12 +1426,35 @@ export default function VideoEditor({
     const video = videoRef.current;
     if (!video) return;
     let rafId;
+    // Tracks the last ``video.currentTime`` value we actually propagated
+    // out via ``syncTime``. Used to short-circuit the rAF tick so a
+    // paused (or off-screen) ``VideoEditor`` doesn't hammer the parent's
+    // time state at ~60 Hz with the same value over and over.
+    //
+    // This matters on the Analysis page's Transcript tab: the sticky
+    // ``VideoEditor`` there is hidden behind ``display: none`` but still
+    // mounted, so its tick keeps running. Without this guard it spams
+    // ``onTimeUpdate(0)`` 60× per second and stomps on the visible
+    // transcript-tab ``VideoPlayer``'s real time updates — the active
+    // transcript line ends up pinned to segment 0 no matter where the
+    // visible player actually is.
+    let lastReportedT = -1;
 
     // Simple hash of segment settings to detect property changes
     const segHash = (seg) => seg ? `${seg.id}_${seg.muted}_${seg.volume}_${seg.speed}` : null;
 
     const tick = () => {
       const t = video.currentTime;
+      // Short-circuit when time hasn't advanced: nothing downstream in
+      // this tick cares about an unchanged ``t`` (segment lookups,
+      // auto-stop-at-trim-end, volume/speed application are all pure
+      // functions of ``t``), so we can skip straight to scheduling the
+      // next frame.
+      if (t === lastReportedT) {
+        rafId = requestAnimationFrame(tick);
+        return;
+      }
+      lastReportedT = t;
       syncTime(t);
       // Auto-stop at trimmed end
       if (trimmedEnd && t >= trimmedEnd) {
@@ -1502,8 +1525,14 @@ export default function VideoEditor({
     rafId = requestAnimationFrame(tick);
 
     // Fallback: native timeupdate + seeked ensure accuracy on mobile
-    // where rAF may be throttled or skipped.
-    const onNativeTime = () => syncTime(video.currentTime);
+    // where rAF may be throttled or skipped. Shares ``lastReportedT``
+    // with the rAF tick so both paths dedupe against each other.
+    const onNativeTime = () => {
+      const t = video.currentTime;
+      if (t === lastReportedT) return;
+      lastReportedT = t;
+      syncTime(t);
+    };
     video.addEventListener('timeupdate', onNativeTime);
     video.addEventListener('seeked', onNativeTime);
 
