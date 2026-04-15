@@ -113,6 +113,10 @@ class ClipCandidate(BaseModel):
     end_time: float
     duration: float
     viral_score: int  # 1-100 — composite computed from the four axes below
+    # In focus mode we preserve the LLM-reported relevance in ``viral_score``
+    # and stash the genre-weighted virality composite here so the UI can
+    # show both numbers. In non-focus mode this field is unused.
+    viral_score_composite: Optional[int] = None
     viral_score_reasoning: str
     clip_type: str
     platform: str  # tiktok | youtube_shorts | both
@@ -236,6 +240,23 @@ class JobResult(BaseModel):
     # Stored as a raw dict (not a nested model) so schema evolution in
     # Phase 2 / Phase 3 doesn't require migrations on historical jobs.
     coverage_report: Optional[dict] = None
+    # ── Clip-detection context (persisted so the regenerate route can
+    #    reuse the same inputs the initial run used). See
+    #    backend/services/pipeline.py where these are populated. All
+    #    default to empty so legacy jobs load unchanged.
+    #
+    #    hot_zones: list of HotZone-shaped dicts — {start,end,composite_score,
+    #      audio_score,transcript_score,scene_score,speaker_score,signals}.
+    #    chapters: list of Chapter-shaped dicts — {start,end,title,topic_keywords,
+    #      speaker_turns,scene_cuts}.
+    #    trend_context: pre-formatted prompt block.
+    #    sentiment_timeline: pre-formatted prompt block.
+    #    clip_content_type: ClipContentType.value used at detection time.
+    hot_zones: list[dict] = []
+    chapters: list[dict] = []
+    trend_context: Optional[str] = None
+    sentiment_timeline: Optional[str] = None
+    clip_content_type: str = ""
 
 
 class ClipSEO(BaseModel):
@@ -452,6 +473,19 @@ class GenerateClipsRequest(BaseModel):
     clip_focus: Optional[str] = None  # Optional focus topic (e.g. "fighting", "cooking tips")
     viral_score_min: int = 0  # Minimum viral score (0-100), clips below are filtered out
     viral_score_max: int = 100  # Maximum viral score (0-100), clips above are filtered out
+    # Focus-mode only: keep clips whose LLM-reported focus_relevance (or
+    # viral_score in focus mode) is at or above this floor. 0 = disabled.
+    min_relevance: int = 0
+    # When true, append new clips to the existing set; when false, replace
+    # all existing clips. Default True preserves the historical regenerate
+    # behavior (the original /generate-clips route always merged). The
+    # per-clip "Find more like this" action sends append=True; a
+    # "regenerate from scratch" action can pass False.
+    append: bool = True
+    # If set, narrow the detection window to this [start, end] range in
+    # seconds. Used by the "Find more like this" per-clip action.
+    scope_start: Optional[float] = None
+    scope_end: Optional[float] = None
 
 
 class SettingsUpdate(BaseModel):

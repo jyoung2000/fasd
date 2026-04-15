@@ -5072,6 +5072,40 @@ async def _run_analysis_inner(job_id: str):
         except Exception as e:
             logger.warning("[%s] Emphasis keyword detection failed (non-fatal): %s", job_id, e)
 
+    # Persist the clip-detection context so the regenerate route
+    # (POST /api/jobs/{job_id}/generate-clips) can reuse the same inputs
+    # the initial run used. See Bug 4 in the clip-focus audit.
+    _persisted_hot_zones: list[dict] = []
+    try:
+        for z in (hot_zones or []):
+            _persisted_hot_zones.append({
+                "start": float(getattr(z, "start", 0)),
+                "end": float(getattr(z, "end", 0)),
+                "composite_score": float(getattr(z, "composite_score", 0)),
+                "audio_score": float(getattr(z, "audio_score", 0)),
+                "transcript_score": float(getattr(z, "transcript_score", 0)),
+                "scene_score": float(getattr(z, "scene_score", 0)),
+                "speaker_score": float(getattr(z, "speaker_score", 0)),
+                "signals": list(getattr(z, "signals", []) or []),
+            })
+    except Exception:
+        _persisted_hot_zones = []
+    _persisted_chapters: list[dict] = []
+    try:
+        for ch in (_chapters or []):
+            if hasattr(ch, "to_dict"):
+                _persisted_chapters.append(ch.to_dict())
+            else:
+                _persisted_chapters.append(dict(ch) if isinstance(ch, dict) else {})
+    except Exception:
+        _persisted_chapters = []
+    _ct_value = ""
+    try:
+        if _job_content_type is not None:
+            _ct_value = _job_content_type.value if hasattr(_job_content_type, "value") else str(_job_content_type)
+    except Exception:
+        _ct_value = ""
+
     await database.update_job_status(
         job_id,
         summary=summary,
@@ -5079,6 +5113,11 @@ async def _run_analysis_inner(job_id: str):
         provider_used=provider_used,
         filler_events=filler_events,
         emphasis_keywords=emphasis_keywords,
+        hot_zones=_persisted_hot_zones,
+        chapters=_persisted_chapters,
+        trend_context=_trend_context_text,
+        sentiment_timeline=_sentiment_timeline_text,
+        clip_content_type=_ct_value,
     )
     await _update_progress(
         job_id, JobStatus.DETECTING_CLIPS, 95,

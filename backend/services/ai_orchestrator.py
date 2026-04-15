@@ -583,6 +583,9 @@ class AIOrchestrator:
         chapters=None,
         trend_context: Optional[str] = None,
         sentiment_timeline: Optional[str] = None,
+        viral_score_min: int = 0,
+        viral_score_max: int = 100,
+        min_relevance: int = 0,
     ) -> tuple[list[ClipCandidate], str]:
         """Returns (clips, provider_name_used).
 
@@ -656,6 +659,31 @@ class AIOrchestrator:
                 f"- Prefer clips where the focus topic is introduced within the first 5 seconds"
             )
             logger.info("Clip focus mode active for job %s: '%s'", job_id, focus_text)
+
+        # Bug 2 (clip-focus audit): inject score range and min-relevance
+        # as *prompt* constraints so the LLM doesn't waste tokens
+        # generating candidates we'll throw away. The post-hoc filter in
+        # backend/routers/clips.py still runs as a safety net.
+        is_focus_mode = bool(clip_focus and clip_focus.strip())
+        try:
+            viral_score_min = max(0, min(100, int(viral_score_min)))
+            viral_score_max = max(0, min(100, int(viral_score_max)))
+            min_relevance = max(0, min(100, int(min_relevance)))
+        except (TypeError, ValueError):
+            viral_score_min, viral_score_max, min_relevance = 0, 100, 0
+        if viral_score_min > 0 or viral_score_max < 100:
+            clip_prompt = clip_prompt + (
+                f"\n\nSCORE RANGE HARD CONSTRAINT: only return clips whose composite "
+                f"virality score falls inside [{viral_score_min}, {viral_score_max}]. "
+                f"If you would score a clip below {viral_score_min} or above {viral_score_max}, "
+                f"skip it entirely — DO NOT pad the clip count with borderline or off-target clips."
+            )
+        if is_focus_mode and min_relevance > 0:
+            clip_prompt = clip_prompt + (
+                f"\n\nRELEVANCE FLOOR: only return clips whose focus_relevance is "
+                f">= {min_relevance}. If fewer than the requested count qualify, return "
+                f"fewer clips — do not include off-topic filler."
+            )
 
         # Phase 3 / 5 / 6 — append optional context blocks the LLM should
         # use for the four-axis scoring. Each block is fenced so the LLM
@@ -742,7 +770,7 @@ class AIOrchestrator:
                 # using the genre-aware weights. No-op when the four
                 # axes are all zero (legacy clip path).
                 if four_axis_scoring_enabled():
-                    finalize_clip_scores(result, content_type)
+                    finalize_clip_scores(result, content_type, focus_mode=is_focus_mode)
                 return result, self._get_task_model(provider, "clips")
             except asyncio.TimeoutError:
                 elapsed = time.monotonic() - t0
@@ -757,7 +785,7 @@ class AIOrchestrator:
                         pname, timeout, len(deduped),
                     )
                     if four_axis_scoring_enabled():
-                        finalize_clip_scores(deduped, content_type)
+                        finalize_clip_scores(deduped, content_type, focus_mode=is_focus_mode)
                     return deduped, f"{self._get_task_model(provider, 'clips')} (partial)"
                 logger.warning("Clip detection via %s timed out after %ds", pname, timeout)
                 self._circuit_breaker.record_failure(pname)
@@ -774,7 +802,7 @@ class AIOrchestrator:
                 "All providers failed but recovered %d partial clips", len(_partial_clips),
             )
             if four_axis_scoring_enabled():
-                finalize_clip_scores(_partial_clips, content_type)
+                finalize_clip_scores(_partial_clips, content_type, focus_mode=is_focus_mode)
             return _partial_clips, "partial"
         raise AllProvidersFailedError("All providers failed for viral clip detection")
 

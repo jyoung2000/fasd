@@ -764,6 +764,18 @@ async def generate_clips_endpoint(
     scenes = job.scenes
     duration = job.duration
 
+    # Optional scope — narrow analysis to [scope_start, scope_end] for
+    # "Find more like this" style per-clip regeneration. The clip window
+    # still reports absolute times so downstream timestamps remain stable.
+    if req.scope_start is not None and req.scope_end is not None and req.scope_end > req.scope_start:
+        _s, _e = float(req.scope_start), float(req.scope_end)
+        transcript = [t for t in transcript if t.end > _s and t.start < _e]
+        scenes = [sc for sc in scenes if _s <= sc.timestamp <= _e]
+        logger.info(
+            "generate-clips: scope narrowed to [%.0f,%.0f] (%d segs, %d scenes)",
+            _s, _e, len(transcript), len(scenes),
+        )
+
     # Build a summary string for the AI to understand overall video context
     summary_text = None
     if job.summary:
@@ -786,10 +798,51 @@ async def generate_clips_endpoint(
             for c in job.clips
         )
 
+    # ── Load persisted clip-detection context (Bug 4 in the clip-focus
+    #    audit) — the initial pipeline run persists these on the job so
+    #    every regenerate-mode call gets the same context the LLM had
+    #    the first time. Legacy jobs that pre-date the persistence
+    #    fields fall back to empty values and the route still works.
+    from backend.services.hot_zone_scorer import HotZone
+    from backend.services.content_classifier import ClipContentType
+    _loaded_hot_zones: list = []
+    try:
+        for z in (job.hot_zones or []):
+            _loaded_hot_zones.append(HotZone(
+                start=float(z.get("start", 0)),
+                end=float(z.get("end", 0)),
+                composite_score=float(z.get("composite_score", 0)),
+                audio_score=float(z.get("audio_score", 0)),
+                transcript_score=float(z.get("transcript_score", 0)),
+                scene_score=float(z.get("scene_score", 0)),
+                speaker_score=float(z.get("speaker_score", 0)),
+                signals=list(z.get("signals", []) or []),
+            ))
+    except Exception as _hz_err:
+        logger.warning("Failed to reconstruct hot_zones for %s: %s", job_id, _hz_err)
+        _loaded_hot_zones = []
+    _loaded_chapters: list = []
+    try:
+        # Chapters accepted as plain dicts by ai_orchestrator (uses getattr
+        # with defaults), so no dataclass reconstruction is needed.
+        _loaded_chapters = list(job.chapters or [])
+    except Exception:
+        _loaded_chapters = []
+    _loaded_trend_context = job.trend_context or None
+    _loaded_sentiment_timeline = job.sentiment_timeline or None
+    _loaded_content_type = None
+    try:
+        ct_str = (job.clip_content_type or "").strip()
+        if ct_str:
+            _loaded_content_type = ClipContentType(ct_str)
+    except Exception:
+        _loaded_content_type = None
+
     async def _do_generate():
         try:
             from backend.services.ai_orchestrator import AIOrchestrator
             from backend.services.prompts import load_prompts
+            from backend.services.clip_scoring import deduplicate_overlapping_clips
 
             start_time = time.monotonic()
 
@@ -859,11 +912,20 @@ async def generate_clips_endpoint(
                         "Finalizing clip boundaries and scores...",
                     ]
 
-                # Estimate total time based on data size
+                # Estimate total time based on data size. Bug 11 in the
+                # clip-focus audit: the old cap at 300s under-estimated
+                # Ollama runs badly. Now we scale with the same heuristic
+                # ai_orchestrator.detect_viral_clips uses for timeouts
+                # when the primary provider is Ollama.
                 seg_count = len(transcript)
                 scene_count = len(scenes)
-                # Heuristic: ~1s per 3 segments + ~1s per 2 scenes, minimum 30s, maximum 300s
-                estimated_total = max(30, min(300, seg_count / 3 + scene_count / 2 + 20))
+                existing_provider = (job.provider_used or {}).get("clips", "")
+                is_ollama = "ollama" in (existing_provider or "").lower() or os.environ.get("AI_PROVIDER", "").lower() == "ollama"
+                if is_ollama and duration:
+                    est_windows = max(1, int(duration / 300))
+                    estimated_total = max(420, est_windows * 300 + 120)
+                else:
+                    estimated_total = max(30, min(600, seg_count / 3 + scene_count / 2 + 20))
 
                 await asyncio.sleep(8)
                 while True:
@@ -902,6 +964,14 @@ async def generate_clips_endpoint(
                         clip_focus=req.clip_focus,
                         video_summary=summary_text,
                         existing_clips=existing_clips_info,
+                        hot_zones=_loaded_hot_zones or None,
+                        chapters=_loaded_chapters or None,
+                        trend_context=_loaded_trend_context,
+                        sentiment_timeline=_loaded_sentiment_timeline,
+                        content_type=_loaded_content_type,
+                        viral_score_min=req.viral_score_min,
+                        viral_score_max=req.viral_score_max,
+                        min_relevance=req.min_relevance,
                     ),
                     timeout=_CLIP_DETECTION_TIMEOUT,
                 )
@@ -963,26 +1033,57 @@ async def generate_clips_endpoint(
 
             filter_note = f" ({skipped} outside {int(req.min_duration)}-{int(req.max_duration)}s range)" if skipped else ""
 
-            # Filter by viral score range if specified
+            # Filter by viral score range if specified. In focus mode
+            # viral_score carries RELEVANCE (see Bug 3 in the audit), so
+            # we gate on viral_score_composite if it exists, else fall
+            # back to viral_score.
             if req.viral_score_min > 0 or req.viral_score_max < 100:
+                def _virality(c):
+                    if is_focus_mode and c.viral_score_composite is not None:
+                        return c.viral_score_composite
+                    return c.viral_score
                 score_filtered = [
                     c for c in filtered
-                    if req.viral_score_min <= c.viral_score <= req.viral_score_max
+                    if req.viral_score_min <= _virality(c) <= req.viral_score_max
                 ]
                 score_skipped = len(filtered) - len(score_filtered)
                 if score_skipped > 0:
                     filter_note += f" ({score_skipped} outside {req.viral_score_min}-{req.viral_score_max} viral score range)"
                 filtered = score_filtered
 
+            # Focus-mode relevance floor (applied after the LLM returns
+            # even though the prompt also asks for it — belt-and-braces).
+            if is_focus_mode and req.min_relevance > 0:
+                before = len(filtered)
+                filtered = [
+                    c for c in filtered
+                    if (c.focus_relevance if c.focus_relevance is not None else c.viral_score)
+                    >= req.min_relevance
+                ]
+                rel_skipped = before - len(filtered)
+                if rel_skipped > 0:
+                    filter_note += f" ({rel_skipped} below relevance floor {req.min_relevance})"
+
+            # Bug 10 — dedupe near-identical clips by time IoU. Without
+            # this the post-filter could keep two Tier-1 matches of the
+            # same "fighting scene" that overlap 90%.
+            before_dedup = len(filtered)
+            filtered, dropped = deduplicate_overlapping_clips(filtered, iou_threshold=0.6)
+            if dropped:
+                filter_note += f" ({dropped} overlapping duplicates removed)"
+
             j = await database.load_job(job_id)
             if j:
-                existing_clips = j.clips or []
-                # Start IDs after the highest existing ID to avoid conflicts
-                max_existing_id = max((c.id for c in existing_clips), default=0)
-                for idx, clip in enumerate(filtered, start=max_existing_id + 1):
-                    clip.id = idx
-
-                merged_clips = existing_clips + list(filtered)
+                if req.append:
+                    existing_clips = j.clips or []
+                    max_existing_id = max((c.id for c in existing_clips), default=0)
+                    for idx, clip in enumerate(filtered, start=max_existing_id + 1):
+                        clip.id = idx
+                    merged_clips = existing_clips + list(filtered)
+                else:
+                    for idx, clip in enumerate(filtered, start=1):
+                        clip.id = idx
+                    merged_clips = list(filtered)
                 provider_used = j.provider_used or {}
                 provider_used["clips"] = clips_provider
                 focus_label = f" for \"{focus_topic}\"" if is_focus_mode else ""
@@ -996,10 +1097,22 @@ async def generate_clips_endpoint(
                 )
 
             focus_label = f" for \"{focus_topic}\"" if is_focus_mode else ""
+            # Structured filter metadata lets the UI render targeted
+            # empty-state remediation (Bug 7 in the clip-focus audit)
+            # instead of a generic "0 clips" toast.
+            filter_state = {
+                "focus_enabled": is_focus_mode,
+                "focus_query": focus_topic or None,
+                "min_relevance": int(req.min_relevance or 0),
+                "viral_score_min": int(req.viral_score_min or 0),
+                "viral_score_max": int(req.viral_score_max or 100),
+            }
             await broadcast_ws(job_id, {
                 "type": "clips_generated",
                 "count": len(filtered),
                 "total": len(merged_clips),
+                "provider": clips_provider,
+                "filter_state": filter_state,
                 "message": f"Found {len(filtered)} new clips{focus_label} via {clips_provider} in {elapsed}s{filter_note} ({len(merged_clips)} total)",
             })
         except asyncio.CancelledError:
@@ -1037,6 +1150,90 @@ async def _cancel_existing_generation(job_id: str):
         logger.info(f"Cancelled previous clip generation for {job_id}")
 
     _clip_cancel_events.pop(job_id, None)
+
+
+@router.post("/jobs/{job_id}/cancel-generate")
+async def cancel_generate_clips(job_id: str):
+    """Cancel an in-progress clip generation for this job.
+
+    Invoked by the Analysis page Cancel button (Enhancement 9 in the
+    clip-focus audit). Returns immediately after signalling cancel; the
+    cooperative cancel_event is checked at every phase boundary inside
+    the generate task so the UI returns to a clean state within seconds.
+    """
+    running = job_id in _clip_cancel_events or job_id in _active_clip_tasks
+    await _cancel_existing_generation(job_id)
+    if running:
+        try:
+            await broadcast_ws(job_id, {
+                "type": "cancelled",
+                "message": "Clip generation cancelled by user",
+            })
+        except Exception:
+            pass
+        return {"status": "cancelled", "was_running": True}
+    return {"status": "noop", "was_running": False}
+
+
+@router.get("/jobs/{job_id}/clip-diagnostics")
+async def clip_diagnostics(job_id: str):
+    """Return every piece of context + per-clip scoring used by the
+    most recent clip detection. Powers the "Why these clips?" drawer
+    on the Analysis page (Enhancement 6 in the clip-focus audit) and
+    serves as a debug / regression fixture.
+
+    Safe to call on any job — fields default to empty when the job is
+    older than the persistence changes.
+    """
+    job = await database.load_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    clips_info = []
+    for c in (job.clips or []):
+        clips_info.append({
+            "id": c.id,
+            "title": c.title,
+            "start": c.start_time,
+            "end": c.end_time,
+            "viral_score": c.viral_score,
+            "viral_score_composite": c.viral_score_composite,
+            "focus_relevance": c.focus_relevance,
+            "focus_tier": c.focus_tier,
+            "clip_focus": c.clip_focus,
+            "hook_score": c.hook_score,
+            "flow_score": c.flow_score,
+            "value_score": c.value_score,
+            "trend_score": c.trend_score,
+            "score_diagnostics": c.score_diagnostics or {},
+        })
+
+    # Axis population stats let us see which providers are actually
+    # returning the four axes vs. falling back to legacy fill.
+    populated = {"hook": 0, "flow": 0, "value": 0, "trend": 0, "total": len(clips_info)}
+    legacy_fill_count = 0
+    for c in clips_info:
+        diag = c["score_diagnostics"] or {}
+        if diag.get("legacy_fill"):
+            legacy_fill_count += 1
+        axes = diag.get("axis_scores") or {}
+        for k in ("hook", "flow", "value", "trend"):
+            if axes.get(k, 0) > 0:
+                populated[k] += 1
+
+    return {
+        "job_id": job_id,
+        "clip_content_type": job.clip_content_type or None,
+        "provider_used": job.provider_used or {},
+        "hot_zones": job.hot_zones or [],
+        "chapters": job.chapters or [],
+        "trend_context": job.trend_context,
+        "sentiment_timeline": job.sentiment_timeline,
+        "clips": clips_info,
+        "axis_population": populated,
+        "legacy_fill_count": legacy_fill_count,
+        "four_axis_enabled": bool(os.environ.get("USE_FOUR_AXIS_SCORING", "1").lower() in {"1", "true", "yes", "on"}),
+    }
 
 
 @router.post("/jobs/{job_id}/translate-subtitles")

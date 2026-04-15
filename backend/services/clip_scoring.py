@@ -154,21 +154,41 @@ def composite_score(
 def finalize_clip_scores(
     clips: list[ClipCandidate],
     content_type: Optional[ClipContentType] = None,
+    focus_mode: bool = False,
 ) -> list[ClipCandidate]:
     """Compute composite viral_score for every clip in-place.
 
     Also populates ``clip.score_diagnostics`` with the weights used and
     the per-axis breakdown so the job result JSON can be inspected
     after the fact.
+
+    When ``focus_mode`` is True the LLM was instructed to put RELEVANCE
+    (not virality) in ``viral_score``; we still compute the genre-weighted
+    virality composite, but we store it in ``viral_score_composite`` and
+    leave ``viral_score`` = relevance untouched. This lets the UI show
+    both numbers without contradicting the focus-mode prompt (see
+    Bug 3 in the clip-focus audit).
     """
     if not four_axis_scoring_enabled():
         return clips
 
     weights = get_weights(content_type)
     for clip in clips:
+        # Detect the legacy-fill case so the UI can render axis bars
+        # desaturated and show a "estimated from legacy score" tooltip
+        # (Bug 12 in the clip-focus audit).
+        legacy_fill = all(
+            int(getattr(clip, f) or 0) == 0
+            for f in ("hook_score", "flow_score", "value_score", "trend_score")
+        )
         new_score = composite_score(clip, content_type)
         prev_score = clip.viral_score
-        clip.viral_score = new_score
+        if focus_mode:
+            # Preserve LLM-reported relevance in viral_score.
+            clip.viral_score_composite = new_score
+        else:
+            clip.viral_score = new_score
+            clip.viral_score_composite = new_score
         diag = dict(clip.score_diagnostics or {})
         diag.update({
             "axis_scores": {
@@ -187,9 +207,58 @@ def finalize_clip_scores(
             "content_type": content_type.value if content_type else None,
             "composite_before": int(prev_score),
             "composite_after": int(new_score),
+            "legacy_fill": bool(legacy_fill),
+            "focus_mode": bool(focus_mode),
         })
         clip.score_diagnostics = diag
     return clips
+
+
+def deduplicate_overlapping_clips(
+    clips: list[ClipCandidate],
+    iou_threshold: float = 0.6,
+) -> tuple[list[ClipCandidate], int]:
+    """Drop near-duplicate clips by time IoU.
+
+    For any two clips with time-IoU >= ``iou_threshold`` AND the same
+    ``clip_focus`` (None == None counts as same), keep the one with the
+    higher sort key (focus_relevance if set, else viral_score) and drop
+    the other. Returns (kept_clips, dropped_count).
+
+    Preserves the relative order of kept clips. The QA validator warns
+    about overlaps (see backend/routers/clips.py ~1717-1737) but never
+    acted on them — this helper is invoked from the regenerate path
+    after the score filter. See Bug 10 in the clip-focus audit.
+    """
+    if not clips:
+        return clips, 0
+
+    def _sort_key(c: ClipCandidate) -> int:
+        return int(c.focus_relevance if c.focus_relevance is not None else (c.viral_score or 0))
+
+    ordered = sorted(enumerate(clips), key=lambda ic: _sort_key(ic[1]), reverse=True)
+    kept_indices: set[int] = set()
+    for orig_idx, clip in ordered:
+        keep = True
+        for kept_idx in kept_indices:
+            other = clips[kept_idx]
+            if (clip.clip_focus or None) != (other.clip_focus or None):
+                continue
+            a_start, a_end = clip.start_time, clip.end_time
+            b_start, b_end = other.start_time, other.end_time
+            inter = max(0.0, min(a_end, b_end) - max(a_start, b_start))
+            if inter <= 0:
+                continue
+            union = max(a_end, b_end) - min(a_start, b_start)
+            iou = inter / union if union > 0 else 0.0
+            if iou >= iou_threshold:
+                keep = False
+                break
+        if keep:
+            kept_indices.add(orig_idx)
+
+    kept = [c for i, c in enumerate(clips) if i in kept_indices]
+    return kept, len(clips) - len(kept)
 
 
 def fill_axes_from_legacy(clip: ClipCandidate) -> None:
@@ -202,18 +271,27 @@ def fill_axes_from_legacy(clip: ClipCandidate) -> None:
     without overstating the signal.
     """
     score = max(1, min(100, int(clip.viral_score or 0)))
+    filled_any = False
     if clip.hook_score == 0:
         clip.hook_score = score
         clip.hook_reason = clip.hook_reason or "derived from legacy viral_score"
+        filled_any = True
     if clip.flow_score == 0:
         clip.flow_score = score
         clip.flow_reason = clip.flow_reason or "derived from legacy viral_score"
+        filled_any = True
     if clip.value_score == 0:
         clip.value_score = score
         clip.value_reason = clip.value_reason or "derived from legacy viral_score"
+        filled_any = True
     if clip.trend_score == 0:
         # Trend defaults to 50 (neutral) when no real signal exists,
         # not the legacy viral_score — overstating trend would let
         # neutral content beat genuinely on-trend clips.
         clip.trend_score = 50
         clip.trend_reason = clip.trend_reason or "no trend signal — neutral default"
+        filled_any = True
+    if filled_any:
+        diag = dict(clip.score_diagnostics or {})
+        diag["legacy_fill"] = True
+        clip.score_diagnostics = diag
