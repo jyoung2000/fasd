@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -563,6 +564,8 @@ async def transcribe_audio_subprocess(
         if task != "translate":
             raw_segments = _filter_hallucinations(raw_segments, task=task)
         raw_segments = _consolidate_segments(raw_segments, task=task)
+        raw_segments = _split_segments_at_sentence_boundaries(raw_segments, task=task)
+        raw_segments, _ = _dedupe_long_range(raw_segments)
         segments = []
         for seg in raw_segments:
             words = None
@@ -1286,6 +1289,8 @@ async def transcribe_audio(
                 )
                 partial = _filter_hallucinations(partial, task=task)
                 partial = _consolidate_segments(partial, task=task)
+                partial = _split_segments_at_sentence_boundaries(partial, task=task)
+                partial, _ = _dedupe_long_range(partial)
                 if partial:
                     result_segs = []
                     for seg in partial:
@@ -1934,6 +1939,8 @@ def _transcribe_sync(
     # Filter hallucinations and consolidate fragments before speaker assignment
     raw_segments = _filter_hallucinations(raw_segments, task=task)
     raw_segments = _consolidate_segments(raw_segments, task=task)
+    raw_segments = _split_segments_at_sentence_boundaries(raw_segments, task=task)
+    raw_segments, _dedup_removed = _dedupe_long_range(raw_segments)
     if not raw_segments:
         return []
 
@@ -2023,12 +2030,23 @@ async def extract_word_timestamps(
     )
 
 
-def _assign_speakers(raw_segments: list[dict]) -> list[TranscriptSegment]:
+def _assign_speakers(
+    raw_segments: list[dict],
+    removed_intervals: list[tuple[float, float]] | None = None,
+) -> list[TranscriptSegment]:
     """Assign speaker labels using enhanced pause-based turn detection.
 
     Caps speakers at MAX_HEURISTIC_SPEAKERS to avoid absurd counts (e.g. 34).
     Tracks speaker history and speech rate per speaker to make smarter toggle
     decisions for 3+ person conversations.
+
+    ``removed_intervals`` is an optional list of `(start, end)` tuples
+    for segments that ``_dedupe_long_range`` removed earlier in the
+    pipeline. We subtract the duration of any interval that falls
+    inside the gap between two surviving segments before checking the
+    NEW_SPEAKER_GAP threshold; this stops a removed verbatim repeat
+    from inflating a 1.5 s pause into a 9 s pause and triggering a
+    spurious speaker flip on the duplicate.
     """
     # Speaker cap: configurable via settings, defaults to 20 (effectively unlimited
     # for most content). The old default of 8 was too restrictive for panel shows,
@@ -2046,6 +2064,28 @@ def _assign_speakers(raw_segments: list[dict]) -> list[TranscriptSegment]:
 
     if not raw_segments:
         return []
+
+    # Pre-sort the removed-intervals list so we can compute "removed
+    # duration inside (gap_start, gap_end)" in O(log n) per segment.
+    # Most calls pass either None or a short list (a handful of
+    # removals on a long video), so the loop overhead is negligible.
+    sorted_removed: list[tuple[float, float]] = (
+        sorted(removed_intervals) if removed_intervals else []
+    )
+
+    def _removed_duration_in(gap_start: float, gap_end: float) -> float:
+        if not sorted_removed or gap_end <= gap_start:
+            return 0.0
+        total = 0.0
+        for r_start, r_end in sorted_removed:
+            if r_end <= gap_start:
+                continue
+            if r_start >= gap_end:
+                break
+            overlap = min(r_end, gap_end) - max(r_start, gap_start)
+            if overlap > 0:
+                total += overlap
+        return total
 
     transcript_segments = []
     current_speaker = 1
@@ -2082,7 +2122,16 @@ def _assign_speakers(raw_segments: list[dict]) -> list[TranscriptSegment]:
         seg_word_count = len(seg["text"].split()) if seg["text"] else 0
 
         if i > 0:
-            gap = seg["start"] - raw_segments[i - 1]["end"]
+            raw_gap_start = raw_segments[i - 1]["end"]
+            raw_gap_end = seg["start"]
+            gap = raw_gap_end - raw_gap_start
+            # Subtract any duration that ``_dedupe_long_range`` removed
+            # from inside this gap so a deleted duplicate doesn't fake
+            # a NEW_SPEAKER_GAP-sized silence.
+            if sorted_removed and gap > 0:
+                gap -= _removed_duration_in(raw_gap_start, raw_gap_end)
+                if gap < 0:
+                    gap = 0.0
             prev_duration = raw_segments[i - 1]["end"] - raw_segments[i - 1]["start"]
             prev_rate = _words_per_sec(raw_segments[i - 1])
 
@@ -2171,6 +2220,148 @@ _WHISPER_BOILERPLATE = {
     "subtitles by",
     "captions by",
 }
+
+
+# ── Long-range duplicate filter ─────────────────────────────────────────
+#
+# Whisper large-v3 with condition_on_previous_text=True occasionally
+# loops the same dialogue verbatim minutes later in the file. Every
+# pre-existing dedup check in this module caps its window at 30 s, so
+# repeats from 60 s up to ~10 min away slip through. This helper looks
+# at the WHOLE history (regardless of distance) and drops verbatim
+# repeats while protecting short legitimate repeats ("right.", "no no
+# no", translate-mode backchannels).
+
+# Punctuation stripped to build word fingerprints. We KEEP apostrophes
+# inside contractions so "don't" and "do not" don't false-positive
+# against each other.
+_FINGERPRINT_STRIP_RE = re.compile(r"[^\w\s'\u2019]+")
+
+
+def _fingerprint_text(text: str) -> tuple[frozenset, str, list[str]]:
+    """Return (token_set, normalized_text, token_list) for fuzzy compare."""
+    if not text:
+        return (frozenset(), "", [])
+    norm = _FINGERPRINT_STRIP_RE.sub(" ", text.lower())
+    tokens = norm.split()
+    return (frozenset(tokens), " ".join(tokens), tokens)
+
+
+def _dedupe_long_range(
+    segments: list[dict],
+    min_words: int = 5,
+    min_chars: int = 20,
+    jaccard_threshold: float = 0.88,
+    exact_threshold: float = 0.97,
+) -> tuple[list[dict], list[tuple[float, float]]]:
+    """Drop verbatim repeats anywhere in the segment stream.
+
+    Looks at every previously-kept segment regardless of time distance
+    (the fix for AoT S3E10 where the same line repeated 8 minutes
+    later) and drops any candidate whose word fingerprint matches by
+    Jaccard or whose normalized text matches by SequenceMatcher.
+
+    Short candidates (`< min_words` AND `< min_chars`) skip the check
+    entirely so legitimate repetition like "right.", "yeah.", "no no
+    no", and translate-mode backchannels stay intact. We also allow
+    up to two occurrences of any short fingerprint (< 8 tokens) to
+    cover host tics.
+
+    Returns:
+        (kept_segments, removed_intervals)
+
+    ``removed_intervals`` is a list of `(start, end)` tuples for each
+    dropped segment so the speaker assigner can subtract their
+    duration from gap calculations and avoid spurious speaker flips.
+    """
+    if not segments:
+        return segments, []
+
+    from difflib import SequenceMatcher
+
+    kept: list[dict] = []
+    removed_intervals: list[tuple[float, float]] = []
+    fingerprint_counts: dict[frozenset, int] = {}
+
+    # Keep parallel arrays so we don't recompute fingerprints on every loop.
+    kept_fps: list[tuple[frozenset, str, list[str]]] = []
+
+    for seg in segments:
+        text = (seg.get("text") or "").strip()
+        if not text:
+            kept.append(seg)
+            continue
+
+        fp_set, fp_norm, fp_tokens = _fingerprint_text(text)
+        token_count = len(fp_tokens)
+        char_count = len(fp_norm)
+
+        # Too short to risk a false positive — short repeats are
+        # legitimate conversational tics ("right.", "no no no", "yes.").
+        if token_count < min_words and char_count < min_chars:
+            kept.append(seg)
+            kept_fps.append((fp_set, fp_norm, fp_tokens))
+            continue
+
+        is_dup = False
+        match_at: float | None = None
+
+        for prev_seg, (prev_set, prev_norm, prev_tokens) in zip(kept, kept_fps):
+            if not prev_set:
+                continue
+            # Jaccard over token sets.
+            inter = len(fp_set & prev_set)
+            union = len(fp_set | prev_set)
+            jaccard = (inter / union) if union else 0.0
+            if jaccard >= jaccard_threshold:
+                is_dup = True
+                match_at = float(prev_seg.get("start", 0.0))
+                break
+            # Cheap pre-screen for SequenceMatcher: only run it when the
+            # token sets overlap heavily enough that ratio() COULD clear
+            # exact_threshold. SequenceMatcher.ratio() is O(n*m); skipping
+            # obviously-different texts keeps this pass cheap on long videos.
+            if jaccard >= 0.6:
+                ratio = SequenceMatcher(None, fp_norm, prev_norm).ratio()
+                if ratio >= exact_threshold:
+                    is_dup = True
+                    match_at = float(prev_seg.get("start", 0.0))
+                    break
+
+        # Allow up to 2 total occurrences of any short-ish fingerprint
+        # to protect "let's go, let's go" hosts. Short here = under 8
+        # tokens; the floor above already protected the truly tiny.
+        # ``count`` is the number of copies ALREADY kept; allowing one
+        # more gives a max of 2 in the output.
+        if is_dup and token_count < 8:
+            count = fingerprint_counts.get(fp_set, 0)
+            if count < 2:
+                is_dup = False
+
+        if is_dup:
+            logger.warning(
+                "Long-range dedup: removed verbatim repeat at %.1fs "
+                "(orig at %.1fs): %s",
+                float(seg.get("start", 0.0)),
+                float(match_at) if match_at is not None else -1.0,
+                text[:80],
+            )
+            removed_intervals.append((
+                float(seg.get("start", 0.0)),
+                float(seg.get("end", 0.0)),
+            ))
+            continue
+
+        kept.append(seg)
+        kept_fps.append((fp_set, fp_norm, fp_tokens))
+        fingerprint_counts[fp_set] = fingerprint_counts.get(fp_set, 0) + 1
+
+    if removed_intervals:
+        logger.info(
+            "Long-range dedup: %d → %d segments (removed %d verbatim repeats)",
+            len(segments), len(kept), len(removed_intervals),
+        )
+    return kept, removed_intervals
 
 
 def _filter_hallucinations(raw_segments: list[dict], task: str = "transcribe") -> list[dict]:
@@ -2374,7 +2565,11 @@ def _filter_hallucinations(raw_segments: list[dict], task: str = "transcribe") -
             for recent in filtered[-10:]:
                 recent_text = recent["text"].strip()
                 time_gap = abs(seg["start"] - recent["start"])
-                if time_gap > 30 or time_gap < 2:
+                # 180s ceiling (was 30s) catches close-range fuzzy repeats
+                # before they pollute the consolidate output. The real
+                # long-range fix is _dedupe_long_range; this is belt-and-
+                # braces inside _filter_hallucinations.
+                if time_gap > 180 or time_gap < 2:
                     continue
                 recent_words = set(recent_text.lower().split())
                 if text_words and recent_words:
@@ -2486,6 +2681,12 @@ def _consolidate_segments(segments: list[dict], max_gap: float = 2.0, task: str 
                         break
                     if len(next_text.split()) > 3 and len(combined_text.split()) > 3:
                         break
+                    # Don't merge across a sentence boundary already present
+                    # in combined_text. Stops "Hold on, Rod." from being glued
+                    # to "Don't shoot.": _split_segments_at_sentence_boundaries
+                    # would only have to undo that work later.
+                    if combined_text and combined_text.rstrip()[-1:] in ".!?":
+                        break
 
                     combined_text = combined_text + " " + next_text
                     combined_end = next_seg["end"]
@@ -2518,7 +2719,9 @@ def _consolidate_segments(segments: list[dict], max_gap: float = 2.0, task: str 
             for recent in deduped[-10:]:
                 recent_text = recent.get("text", "").strip().lower()
                 time_gap = abs(seg["start"] - recent["start"])
-                if time_gap > 30:
+                # 180s ceiling (was 30s); see _dedupe_long_range for the
+                # real fix that catches repeats > 3 minutes apart too.
+                if time_gap > 180:
                     continue
                 if len(text) > 10 and len(recent_text) > 10:
                     if text in recent_text or recent_text in text:
@@ -2541,6 +2744,405 @@ def _consolidate_segments(segments: list[dict], max_gap: float = 2.0, task: str 
     if removed > 0:
         logger.info("Segment consolidation: %d → %d segments (removed %d)", len(segments), len(deduped), removed)
     return deduped
+
+
+# ── Sentence-boundary splitter ──────────────────────────────────────────
+#
+# Whisper sometimes lumps 2-4 distinct utterances under a single segment
+# when its decoder backs up after a chunk boundary. The consolidate pass
+# above can also concatenate short fragments into a multi-sentence chunk.
+# This helper undoes both: it finds sentence boundaries inside `text`,
+# slices `words` (when present) so each output segment carries the right
+# per-word timing, and otherwise falls back to proportional time
+# splitting by character count. Sub-segments that would be too short
+# fold forward into their successor instead of fragmenting.
+
+# Latin sentence-ending punctuation followed by whitespace + uppercase.
+# Tolerates trailing quote / paren marks. Ellipses (... or …) are
+# matched as a single boundary by the standalone _ELLIPSIS_RE pre-pass
+# below; we don't want to split on the first '.' of "..." then create a
+# zero-length sub-segment for the next two.
+_LATIN_SENTENCE_END_RE = re.compile(
+    r"(?<=[.!?])[\"\u201d\u2019')\]]?\s+(?=[\"\u201c\u2018'(\[]?[A-Z])"
+)
+# Full-width sentence enders for CJK content. CJK doesn't gate on a
+# following uppercase letter (CJK has no case), so we just split after
+# the punctuation if there's any text following.
+_CJK_SENTENCE_END_RE = re.compile(r"(?<=[\u3002\uff01\uff1f])(?=\S)")
+# Collapse '...' and '…' into a sentinel before we run the splitter,
+# then restore them after, so they only count as a SINGLE boundary.
+_ELLIPSIS_RE = re.compile(r"\.{3,}|\u2026")
+_ELLIPSIS_SENTINEL = "\u0001ELLIPSIS\u0001"
+
+_SENTENCE_SPLIT_CJK_RANGES = (
+    ("\u4e00", "\u9fff"),   # CJK Unified Ideographs
+    ("\u3040", "\u309f"),   # Hiragana
+    ("\u30a0", "\u30ff"),   # Katakana
+    ("\uac00", "\ud7af"),   # Hangul Syllables
+)
+
+
+def _looks_cjk(text: str) -> bool:
+    """Return True if any of the first 50 chars fall in a CJK block."""
+    sample = text[:50]
+    return any(
+        any(lo <= ch <= hi for lo, hi in _SENTENCE_SPLIT_CJK_RANGES)
+        for ch in sample
+    )
+
+
+def _find_sentence_split_indices(text: str, cjk: bool) -> list[int]:
+    """Return character offsets at which to split `text` into sentences.
+
+    Each returned index is the START of the next sentence. The list does
+    NOT include 0 or len(text); callers handle the bounds. Ellipses are
+    counted as a single boundary, not three.
+    """
+    if not text or len(text) < 2:
+        return []
+    # Replace ellipses with a sentinel so the regex sees one '.' worth
+    # of boundary signal. We restore the original characters when we
+    # slice out the actual sub-text below.
+    masked = _ELLIPSIS_RE.sub(_ELLIPSIS_SENTINEL, text)
+
+    indices: list[int] = []
+    if cjk:
+        for m in _CJK_SENTENCE_END_RE.finditer(masked):
+            indices.append(m.start())
+    else:
+        for m in _LATIN_SENTENCE_END_RE.finditer(masked):
+            # Split start = end of the matched whitespace
+            indices.append(m.end())
+    return indices
+
+
+def _split_segments_at_sentence_boundaries(
+    segments: list[dict],
+    min_split_duration: float = 0.40,
+    min_split_chars: int = 4,
+    task: str = "transcribe",
+) -> list[dict]:
+    """Split multi-sentence segments into per-sentence sub-segments.
+
+    Whisper sometimes returns 2-4 distinct utterances spoken seconds
+    apart in the same segment, with only the start of the first
+    utterance recorded. This helper reverses that:
+
+    1. For each input segment, locate sentence boundaries inside `text`.
+    2. If the segment carries per-word timestamps, split at the
+       corresponding word index so each sub-segment has accurate
+       start/end timing.
+    3. Otherwise, split proportionally by character count using the
+       segment's existing start/end as bounds.
+    4. Sub-segments shorter than ``min_split_duration`` seconds OR
+       ``min_split_chars`` characters re-merge forward (preferred) or
+       backward to avoid over-fragmenting stutters like "I— I think".
+    5. Per-segment scores (confidence / avg_logprob / no_speech_prob)
+       carry through unchanged.
+
+    For CJK content, splits on full-width 。！？ instead of Latin
+    punctuation (mixed-script subtitles use '.' decoratively and would
+    otherwise be over-split).
+    """
+    if not segments:
+        return segments
+
+    out: list[dict] = []
+    changed = 0
+
+    for seg in segments:
+        text = (seg.get("text") or "").strip()
+        if not text:
+            out.append(seg)
+            continue
+
+        cjk = _looks_cjk(text)
+        boundaries = _sentence_boundary_offsets(text, cjk)
+        if len(boundaries) < 1:
+            out.append(seg)
+            continue
+
+        # Build sub-text spans from boundary offsets.
+        sub_texts: list[str] = []
+        prev = 0
+        for b in boundaries:
+            chunk = text[prev:b].strip()
+            if chunk:
+                sub_texts.append(chunk)
+            prev = b
+        tail = text[prev:].strip()
+        if tail:
+            sub_texts.append(tail)
+
+        if len(sub_texts) < 2:
+            out.append(seg)
+            continue
+
+        # ── Build sub-segments ──
+        sub_segments: list[dict] = []
+        seg_start = float(seg.get("start", 0.0))
+        seg_end = float(seg.get("end", seg_start))
+        carry_keys = ("confidence", "avg_logprob", "no_speech_prob")
+        carry = {k: seg.get(k) for k in carry_keys if k in seg}
+
+        words = seg.get("words")
+        if words:
+            sub_segments = _split_using_word_timestamps(
+                seg=seg, sub_texts=sub_texts, words=list(words),
+                seg_start=seg_start, seg_end=seg_end, carry=carry,
+            )
+        if not sub_segments:
+            # Either no words OR the word splitter couldn't align; fall
+            # back to proportional time splitting by character count.
+            sub_segments = _split_proportionally(
+                sub_texts=sub_texts,
+                seg_start=seg_start, seg_end=seg_end,
+                carry=carry,
+            )
+
+        # ── Re-merge under-floor sub-segments ──
+        sub_segments = _merge_undersized_subsegments(
+            sub_segments,
+            min_split_duration=min_split_duration,
+            min_split_chars=min_split_chars,
+        )
+
+        if len(sub_segments) <= 1:
+            # Folding ate every split — keep the original segment so we
+            # don't accidentally drop carry-over fields.
+            out.append(seg)
+            continue
+
+        out.extend(sub_segments)
+        changed += 1
+
+    if changed:
+        logger.info(
+            "Sentence splitter: %d → %d segments", len(segments), len(out),
+        )
+    return out
+
+
+def _sentence_boundary_offsets(text: str, cjk: bool) -> list[int]:
+    """Return a list of character offsets at which `text` should split.
+
+    Each offset is the START of the next sentence. Indices reference the
+    ORIGINAL `text` (not a masked copy). Ellipses ('...' / '…') count as
+    a single boundary, not three: we step the cursor past consecutive
+    dots after spotting the first one.
+    """
+    if not text:
+        return []
+    indices: list[int] = []
+    if cjk:
+        # CJK: split immediately after 。！？ if any non-space char follows.
+        for i, ch in enumerate(text):
+            if ch in "\u3002\uff01\uff1f":
+                j = i + 1
+                if j < len(text) and not text[j].isspace():
+                    indices.append(j)
+        return indices
+
+    # Latin: walk the string, find punctuation that's followed by
+    # whitespace + an uppercase next-sentence start. Skip ellipses.
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch in ".!?":
+            # Detect ellipsis: '...' or '…' (already a single char) or
+            # a dot followed by more dots. Treat as ONE boundary: walk
+            # past the run, then evaluate the trailing whitespace +
+            # next-sentence-start condition just once.
+            run_end = i + 1
+            if ch == ".":
+                while run_end < n and text[run_end] == ".":
+                    run_end += 1
+            if ch == "\u2026":
+                while run_end < n and text[run_end] == "\u2026":
+                    run_end += 1
+            # Skip optional close-quote / paren after the punctuation.
+            j = run_end
+            while j < n and text[j] in "\"\u201d\u2019')\u3009]":
+                j += 1
+            # Skip whitespace.
+            ws_start = j
+            while j < n and text[j].isspace():
+                j += 1
+            # Need at least one whitespace AND an uppercase / open-quote
+            # next character to call this a real sentence boundary.
+            if j > ws_start and j < n:
+                next_ch = text[j]
+                # Skip an opening quote/paren before checking the letter.
+                if next_ch in "\"\u201c\u2018'(\u3008[":
+                    if j + 1 < n:
+                        next_ch = text[j + 1]
+                if next_ch.isalpha() and next_ch.isupper():
+                    indices.append(j)
+            i = run_end
+            continue
+        i += 1
+    return indices
+
+
+def _split_using_word_timestamps(
+    seg: dict,
+    sub_texts: list[str],
+    words: list[dict],
+    seg_start: float,
+    seg_end: float,
+    carry: dict,
+) -> list[dict]:
+    """Split a segment's words across the given sub-texts by character count.
+
+    For each sub-text we walk the words list, accumulating until the
+    accumulated text length matches the sub-text length (up to the
+    last sub-text, which sweeps any remainder). Returns an empty list
+    if alignment fails so the caller can fall back to proportional
+    time splitting.
+    """
+    if not words or not sub_texts:
+        return []
+
+    sub_segments: list[dict] = []
+    word_idx = 0
+    total_words = len(words)
+
+    # Walk the parent text in lock-step with the words list. We count
+    # NON-SPACE chars on both sides so the comparison doesn't drift
+    # when Whisper puts leading spaces on word.word and the parent
+    # text encodes them as inter-word spaces. The check happens BEFORE
+    # consuming each candidate word so we don't over-count by one.
+    def _nonspace_len(s: str) -> int:
+        return sum(1 for ch in s if not ch.isspace())
+
+    for s_i, sub_text in enumerate(sub_texts):
+        is_last = (s_i == len(sub_texts) - 1)
+        target_len = _nonspace_len(sub_text)
+        accumulated_chars = 0
+        slice_start = word_idx
+        while word_idx < total_words:
+            if not is_last and accumulated_chars >= target_len:
+                break
+            w_text = words[word_idx].get("word") or ""
+            w_len = _nonspace_len(w_text)
+            if w_len == 0:
+                word_idx += 1
+                continue
+            accumulated_chars += w_len
+            word_idx += 1
+        slice_end = word_idx if not is_last else total_words
+        if slice_end <= slice_start:
+            return []
+        word_slice = words[slice_start:slice_end]
+        try:
+            sub_start = float(word_slice[0].get("start", seg_start))
+            sub_end = float(word_slice[-1].get("end", seg_end))
+        except (TypeError, ValueError):
+            return []
+        # Belt-and-braces: clamp to the parent segment's bounds.
+        sub_start = max(seg_start, min(seg_end, sub_start))
+        sub_end = max(sub_start, min(seg_end, sub_end))
+        sub: dict = {
+            "start": sub_start,
+            "end": sub_end,
+            "text": sub_text if sub_text.startswith(" ") or s_i == 0 else " " + sub_text,
+            "words": word_slice,
+        }
+        # Preserve original spacing: prefer the contiguous slice of
+        # the parent text rather than rebuilding from word.word fields
+        # (Whisper's leading-space handling is inconsistent).
+        sub["text"] = sub_text
+        sub.update(carry)
+        sub_segments.append(sub)
+    return sub_segments
+
+
+def _split_proportionally(
+    sub_texts: list[str],
+    seg_start: float,
+    seg_end: float,
+    carry: dict,
+) -> list[dict]:
+    """Length-weighted time split when no per-word timestamps are available."""
+    if not sub_texts:
+        return []
+    total_chars = sum(max(len(s), 1) for s in sub_texts)
+    if total_chars <= 0:
+        return []
+    duration = max(seg_end - seg_start, 1e-6)
+    out: list[dict] = []
+    cursor = seg_start
+    for i, sub_text in enumerate(sub_texts):
+        share = max(len(sub_text), 1) / total_chars
+        is_last = (i == len(sub_texts) - 1)
+        sub_dur = duration * share
+        sub_end = seg_end if is_last else cursor + sub_dur
+        sub: dict = {
+            "start": cursor,
+            "end": sub_end,
+            "text": sub_text,
+            "words": None,
+        }
+        sub.update(carry)
+        out.append(sub)
+        cursor = sub_end
+    return out
+
+
+def _merge_undersized_subsegments(
+    sub_segments: list[dict],
+    min_split_duration: float,
+    min_split_chars: int,
+) -> list[dict]:
+    """Fold sub-segments shorter than the floor into their neighbour.
+
+    Folding is forward-preferred (merge into the next sub-segment).
+    Falls back to backward folding for the trailing fragment.
+    """
+    if len(sub_segments) <= 1:
+        return sub_segments
+    merged: list[dict] = []
+    i = 0
+    n = len(sub_segments)
+    while i < n:
+        sub = sub_segments[i]
+        dur = float(sub.get("end", 0.0)) - float(sub.get("start", 0.0))
+        text_len = len((sub.get("text") or "").strip())
+        too_small = (dur < min_split_duration) or (text_len < min_split_chars)
+        if too_small and i + 1 < n:
+            nxt = sub_segments[i + 1]
+            nxt = dict(nxt)
+            nxt["start"] = sub["start"]
+            nxt["text"] = (
+                (sub.get("text") or "").rstrip()
+                + " "
+                + (nxt.get("text") or "").lstrip()
+            )
+            if sub.get("words") and nxt.get("words"):
+                nxt["words"] = list(sub["words"]) + list(nxt["words"])
+            elif sub.get("words"):
+                nxt["words"] = sub["words"]
+            sub_segments[i + 1] = nxt
+            i += 1
+            continue
+        if too_small and merged:
+            prev = merged[-1]
+            prev["end"] = sub["end"]
+            prev["text"] = (
+                (prev.get("text") or "").rstrip()
+                + " "
+                + (sub.get("text") or "").lstrip()
+            )
+            if prev.get("words") and sub.get("words"):
+                prev["words"] = list(prev["words"]) + list(sub["words"])
+            elif sub.get("words"):
+                prev["words"] = sub["words"]
+            i += 1
+            continue
+        merged.append(dict(sub))
+        i += 1
+    return merged
 
 
 # ── Speaker Diarization (pyannote) ─────────────────────────────────────
