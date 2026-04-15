@@ -34,7 +34,10 @@ console.log('spokenWindow — segment with no words');
   const seg = { start: 1.0, end: 2.5 };
   const w = spokenWindow(seg);
   check('returns segment-level start', approx(w.start, 1.0), w);
-  check('returns segment-level end', approx(w.end, 2.5), w);
+  // Fallback path now extends the end by WORD_TAIL_S so back-to-back
+  // non-word-timestamped segments overlap and first-match produces
+  // the late-bias transition.
+  check('extends end by WORD_TAIL_S in fallback', approx(w.end, 2.5 + WORD_TAIL_S), w);
 }
 
 console.log('spokenWindow — segment with valid words');
@@ -49,51 +52,80 @@ console.log('spokenWindow — segment with valid words');
     ],
   };
   const w = spokenWindow(seg);
-  // Expected: clamp(max(segStart - 0.02, ws - WORD_HEAD_S), ws - WORD_HEAD_S)
-  //   ws = 1.10, ws - WORD_HEAD_S = 1.06, segStart - 0.02 = 0.98
-  //   -> max(0.98, 1.06) = 1.06
+  // start = max(segStart - 0.02, ws - WORD_HEAD_S)
+  //       = max(0.98, 1.10 - 0.04) = max(0.98, 1.06) = 1.06
   check('start uses words[0].start - WORD_HEAD_S', approx(w.start, 1.10 - WORD_HEAD_S), w);
-  // we = 2.30, we + WORD_TAIL_S = 2.36, segEnd + 0.15 = 2.65
-  //   -> min(2.65, 2.36) = 2.36
-  check('end uses words[-1].end + WORD_TAIL_S', approx(w.end, 2.30 + WORD_TAIL_S), w);
+  // end = max(segEnd, we) + WORD_TAIL_S
+  //     = max(2.5, 2.30) + 0.20 = 2.5 + 0.20 = 2.70
+  check('end = max(segEnd, we) + WORD_TAIL_S (segEnd wins)', approx(w.end, 2.5 + WORD_TAIL_S), w);
+}
+
+console.log('spokenWindow — words extend past segEnd (we wins)');
+{
+  // Whisper sometimes places the final word's end past the segment
+  // boundary; the ``max`` branch should honor it.
+  const seg = {
+    start: 1.0,
+    end: 2.0,
+    words: [
+      { start: 1.10, end: 2.30 },
+    ],
+  };
+  const w = spokenWindow(seg);
+  // end = max(2.0, 2.30) + 0.20 = 2.30 + 0.20 = 2.50
+  check('end uses we when we > segEnd', approx(w.end, 2.30 + WORD_TAIL_S), w);
 }
 
 console.log('spokenWindow — segment with inverted/broken words');
 {
   const seg1 = { start: 1.0, end: 2.0, words: [{ start: 0, end: 0 }] };
   const w1 = spokenWindow(seg1);
-  check('zero-duration word falls back to seg', approx(w1.start, 1.0) && approx(w1.end, 2.0), w1);
+  // Broken words fall back to seg-level with the WORD_TAIL_S extension.
+  check(
+    'zero-duration word falls back to seg + tail',
+    approx(w1.start, 1.0) && approx(w1.end, 2.0 + WORD_TAIL_S),
+    w1,
+  );
 
   const seg2 = { start: 1.0, end: 2.0, words: [{ start: 1.5, end: 1.2 }] };
   const w2 = spokenWindow(seg2);
-  check('inverted word (end <= start) falls back to seg', approx(w2.start, 1.0) && approx(w2.end, 2.0), w2);
+  check(
+    'inverted word (end <= start) falls back to seg + tail',
+    approx(w2.start, 1.0) && approx(w2.end, 2.0 + WORD_TAIL_S),
+    w2,
+  );
 
   const seg3 = { start: 1.0, end: 2.0, words: [{ start: 'bad', end: 1.5 }] };
   const w3 = spokenWindow(seg3);
-  check('non-numeric word start falls back to seg', approx(w3.start, 1.0) && approx(w3.end, 2.0), w3);
+  check(
+    'non-numeric word start falls back to seg + tail',
+    approx(w3.start, 1.0) && approx(w3.end, 2.0 + WORD_TAIL_S),
+    w3,
+  );
 
   const seg4 = { start: 1.0, end: 2.0, words: [] };
   const w4 = spokenWindow(seg4);
-  check('empty word array falls back to seg', approx(w4.start, 1.0) && approx(w4.end, 2.0), w4);
+  check(
+    'empty word array falls back to seg + tail',
+    approx(w4.start, 1.0) && approx(w4.end, 2.0 + WORD_TAIL_S),
+    w4,
+  );
 }
 
-console.log('spokenWindow — clamp to segment bounds');
+console.log('spokenWindow — clamp to segStart on the start side');
 {
-  // Words that start way before or end way after segment bounds get
-  // clamped to segStart - 0.02 and segEnd + 0.15.
+  // Words earlier than segStart should be clamped up to
+  // ``segStart - 0.02`` so we can't overlap the previous segment.
   const seg = {
     start: 5.0,
     end: 6.0,
     words: [
       { start: 1.00, end: 1.20 }, // pathological early
-      { start: 9.00, end: 9.30 }, // pathological late
+      { start: 1.30, end: 1.50 },
     ],
   };
   const w = spokenWindow(seg);
-  // ws - WORD_HEAD_S = 0.96; segStart - 0.02 = 4.98 → max = 4.98
   check('start clamped to segStart - 0.02', approx(w.start, 4.98), w);
-  // we + WORD_TAIL_S = 9.36; segEnd + 0.15 = 6.15 → min = 6.15
-  check('end clamped to segEnd + 0.15', approx(w.end, 6.15), w);
 }
 
 console.log('isSpokenAt — boundary conditions');
@@ -107,7 +139,10 @@ console.log('isSpokenAt — boundary conditions');
     ],
   };
   const w = spokenWindow(seg);
-  // w.start = max(0.98, 0.98) = 0.98; w.end = min(2.15, 2.01) = 2.01
+  // w.start = max(0.98, 1.02 - 0.04) = max(0.98, 0.98) = 0.98
+  // w.end = max(2.0, 1.95) + 0.20 = 2.0 + 0.20 = 2.20
+  check('start = 0.98', approx(w.start, 0.98), w);
+  check('end = 2.20', approx(w.end, 2.20), w);
   check('inclusive at start', isSpokenAt(seg, w.start) === true, w);
   check('exclusive at end', isSpokenAt(seg, w.end) === false, w);
   check('1 ms inside is active', isSpokenAt(seg, w.start + 0.001) === true, w);
@@ -137,27 +172,92 @@ console.log('Integration — TranscriptViewer gap-hold math');
     return -1;
   };
 
-  // Segments with no word timestamps, so spokenWindow returns seg-level.
-  //   seg0: 0.0–1.0
+  // Segments with no word timestamps — spokenWindow returns
+  // [seg.start, seg.end + WORD_TAIL_S].
+  //   seg0: 0.0–1.0 → window 0.0–1.20
   //   (short gap: 0.3 s)
-  //   seg1: 1.3–2.0
+  //   seg1: 1.3–2.0 → window 1.3–2.20
   //   (long gap: 2.0 s)
-  //   seg2: 4.0–5.0
+  //   seg2: 4.0–5.0 → window 4.0–5.20
   const tr = [
     { start: 0.0, end: 1.0 },
     { start: 1.3, end: 2.0 },
     { start: 4.0, end: 5.0 },
   ];
   check('t=0.5 → seg0', activeIdx(tr, 0.5) === 0);
-  check('t=1.1 (in 0.3s gap, hold seg0)', activeIdx(tr, 1.1) === 0);
+  // With the tail extension, seg0 still has window [0, 1.20] so the
+  // small 0.3s gap is absorbed by the window, not by gap-hold.
+  check('t=1.1 (inside seg0 window) → seg0', activeIdx(tr, 1.1) === 0);
   check('t=1.5 → seg1', activeIdx(tr, 1.5) === 1);
-  // Right after seg1 ends, inside 0.75 s hold → still seg1
-  check('t=2.3 (in long gap but <=0.75s hold) → seg1', activeIdx(tr, 2.3) === 1);
-  // Past hold window → clear
-  check('t=2.9 (past 0.75s hold) → -1', activeIdx(tr, 2.9) === -1);
+  // Right after seg1's window ends (2.20), gap-hold keeps seg1
+  // active for up to 0.75 s.
+  check('t=2.3 (just past seg1 end, inside 0.75s hold) → seg1', activeIdx(tr, 2.3) === 1);
+  check('t=2.9 (0.70s past seg1 end, still inside hold) → seg1', activeIdx(tr, 2.9) === 1);
+  check('t=3.0 (exactly 0.80s past, past hold) → -1', activeIdx(tr, 3.0) === -1);
   check('t=3.5 (far past hold) → -1', activeIdx(tr, 3.5) === -1);
   check('t=4.1 → seg2', activeIdx(tr, 4.1) === 2);
   check('t=99 (past everything, past hold) → -1', activeIdx(tr, 99) === -1);
+}
+
+console.log('Regression — diarization split, back-to-back lines');
+{
+  // Scenario from the ClipSEO screenshot:
+  //   row A = "Please, before I die, I want to know what my father did..."
+  //           seg: [883, 890], words end at 889.5 (Whisper trimmed the
+  //           trailing silence out of the word timestamps).
+  //   row B = "Huh? I thought you'd know." seg: [890, 893], words at 890.3.
+  //
+  // Old code: A's window = min(seg.end+0.15, we+0.06) = min(890.15, 889.56)
+  //           = 889.56. At t=890 (when B's direct hit begins), the
+  //           loop matches B, highlight jumps to B even though the
+  //           audio is still saying A.
+  //
+  // New code: A's window end = max(seg.end, we) + WORD_TAIL_S
+  //           = max(890, 889.5) + 0.20 = 890.20. A stays active until
+  //           890.20. B's start = max(890 - 0.02, 890.3 - 0.04) = 890.26.
+  //           So at t=890.10 (inside A's tail), direct match on A wins.
+  //           At t=890.25, neither A nor B direct-matches, gap-hold
+  //           keeps A. At t=890.30 B wins via direct match.
+  const activeIdx = (transcript, currentTime, GAP_HOLD_SEC = 0.75) => {
+    let lastEndedIdx = -1;
+    let lastEndedTime = -Infinity;
+    for (let i = 0; i < transcript.length; i++) {
+      const w = spokenWindow(transcript[i]);
+      if (w.start <= currentTime && currentTime < w.end) return i;
+      if (w.end <= currentTime && w.end > lastEndedTime) {
+        lastEndedTime = w.end;
+        lastEndedIdx = i;
+      }
+    }
+    if (lastEndedIdx >= 0 && currentTime - lastEndedTime <= GAP_HOLD_SEC) {
+      return lastEndedIdx;
+    }
+    return -1;
+  };
+  const tr = [
+    {
+      start: 883.0,
+      end: 890.0,
+      words: [
+        { start: 883.1, end: 884.5 },
+        { start: 884.6, end: 889.5 },
+      ],
+    },
+    {
+      start: 890.0,
+      end: 893.0,
+      words: [
+        { start: 890.3, end: 893.0 },
+      ],
+    },
+  ];
+  check('t=886.0 → row A (mid-line)', activeIdx(tr, 886.0) === 0);
+  check('t=890.0 (exactly seg boundary) → row A still active', activeIdx(tr, 890.0) === 0);
+  check('t=890.10 (inside A tail) → row A', activeIdx(tr, 890.10) === 0);
+  check('t=890.19 (still inside A tail) → row A', activeIdx(tr, 890.19) === 0);
+  check('t=890.25 (past A tail, before B start, in gap-hold) → row A', activeIdx(tr, 890.25) === 0);
+  check('t=890.30 (B direct hit starts) → row B', activeIdx(tr, 890.30) === 1);
+  check('t=892.0 → row B', activeIdx(tr, 892.0) === 1);
 }
 
 console.log('');

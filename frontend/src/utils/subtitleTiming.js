@@ -1,34 +1,62 @@
 // Shared subtitle / transcript timing helpers.
 //
 // Both ``SubtitleOverlay`` (burned-in preview subtitles) and
-// ``TranscriptViewer`` (Analysis tab active-line highlight) need to answer
-// the same question: "at time ``t``, which transcript segment is actually
-// being spoken?" The honest answer isn't ``seg.start <= t < seg.end`` —
-// Whisper segment-level timestamps are boundary estimates that routinely
-// drift ±100–300 ms from real speech onset/offset. Whisper's *per-word*
-// timestamps (captured upstream in ``backend/services/transcription.py``
-// and already round-tripped through the frontend as ``seg.words``) are
-// much tighter.
+// ``TranscriptViewer`` (Analysis / ClipSEO active-line highlight) need
+// to answer the same question: "at time ``t``, which transcript segment
+// is actually being spoken?" The honest answer isn't
+// ``seg.start <= t < seg.end`` — Whisper segment-level timestamps are
+// boundary estimates that routinely drift ±100–300 ms from real speech
+// onset/offset, *and* diarization can split a single Whisper segment
+// into two rows with the same text and neighbouring time ranges, which
+// means a naive ``first contiguous match`` loop rushes the highlight to
+// the next row before the current one's audio has actually ended.
 //
-// ``spokenWindow(seg)`` returns a ``{ start, end }`` tuple that prefers
-// ``words[0].start`` / ``words[-1].end`` when a segment has per-word
-// timestamps, and falls back to the segment-level values when it doesn't
-// (or when the word list is broken/inverted). The small head/tail paddings
-// pull the window slightly earlier than the first word's phoneme onset
-// and slightly past the last word's release, so the visible highlight
-// lands *with* the first syllable and doesn't cut off the final phoneme —
-// tuned to fall inside one 30 fps video frame of the real audio.
+// ``spokenWindow(seg)`` returns a ``{ start, end }`` tuple that:
+//   1. Uses ``words[0].start`` (with a small head anticipation) for the
+//      window start when per-word timestamps are present and plausible,
+//      so the highlight lands *with* the first syllable instead of
+//      after it.
+//   2. Uses ``max(seg.end, words[-1].end) + WORD_TAIL_S`` for the
+//      window end — ``max``, not ``min``. This is the important fix
+//      for "the next line is highlighted while the current one is
+//      still being spoken": if Whisper's per-word timestamps end
+//      before ``seg.end`` (common when a line trails off into
+//      silence or when the speaker's last syllable is long), the old
+//      ``min`` clamp cut the segment short and let the next row win
+//      the direct-match race even though the current row's line was
+//      still audibly playing. Using ``max`` keeps the current row
+//      active through its full Whisper segment window *and* through
+//      any trailing words that extend past it.
+//   3. Falls back to ``[seg.start, seg.end + WORD_TAIL_S]`` when the
+//      word list is missing or broken. Extending ``seg.end`` by
+//      ``WORD_TAIL_S`` in the fallback path is what produces "late
+//      bias" on transitions between back-to-back non-word-timestamped
+//      segments: adjacent windows overlap, and the first-match loop in
+//      the consumers picks the earlier-started one so the highlight
+//      hangs on the previous line for ``WORD_TAIL_S`` extra seconds.
+//
+// ``WORD_TAIL_S`` is tuned larger than a frame time (0.20 s) because
+// the symptom we're fighting is not "the final phoneme is cut off" —
+// it's "Whisper's segment boundary landed a quarter second early
+// relative to what I'm hearing, and my eyes got dragged to the next
+// line." 200 ms of tail is enough to absorb the common Whisper
+// boundary drift without producing visibly stale highlighting on a
+// long real pause between speakers (the short 0.35 s /
+// 0.75 s gap-fill caps in the consumers still clip it from going
+// further).
 
-// Tail padding (s) after the last word's Whisper end — covers the decay /
-// release of the final phoneme without lingering. Tuned empirically to
-// land inside a single 30 fps video frame of the real audio.
-export const WORD_TAIL_S = 0.06;
+// Tail padding (s) added to every segment's effective end. Absorbs
+// Whisper's ±100–300 ms boundary drift and, via first-match loop
+// ordering in consumers, delays segment-to-segment transitions by this
+// much so the highlight doesn't jump to the next line while the
+// current line is still audibly playing.
+export const WORD_TAIL_S = 0.20;
 
-// Head padding (s) before the first word's Whisper start — Whisper word
-// ``start`` is usually placed at the phoneme onset, which is ~30–50 ms
-// late relative to the perceptual attack. Pulling the visible window
-// slightly earlier makes the subtitle appear *with* the first syllable,
-// not after it.
+// Head padding (s) before the first word's Whisper start — Whisper
+// word ``start`` is usually placed at the phoneme onset, which is
+// ~30–50 ms late relative to the perceptual attack. Pulling the
+// visible window slightly earlier makes the subtitle appear *with* the
+// first syllable, not after it.
 export const WORD_HEAD_S = 0.04;
 
 /**
@@ -36,8 +64,8 @@ export const WORD_HEAD_S = 0.04;
  * is actually being spoken. Prefers per-word timestamps when available
  * and plausible; falls back to segment-level timestamps otherwise.
  *
- * The returned shape matches ``{ start, end }`` so callers can treat the
- * output as a drop-in replacement for ``seg.start`` / ``seg.end``.
+ * The returned shape matches ``{ start, end }`` so callers can treat
+ * the output as a drop-in replacement for ``seg.start`` / ``seg.end``.
  */
 export function spokenWindow(seg) {
   if (!seg) return { start: 0, end: 0 };
@@ -45,31 +73,42 @@ export function spokenWindow(seg) {
   const segEnd = seg.end ?? segStart;
   const words = Array.isArray(seg.words) ? seg.words : null;
   if (!words || words.length === 0) {
-    return { start: segStart, end: segEnd };
+    // No per-word timestamps — extend the effective end by WORD_TAIL_S
+    // so adjacent back-to-back segments overlap and the first-match
+    // loop in the consumers picks the earlier-started one, producing
+    // the late-bias transition described at the top of this file.
+    return { start: segStart, end: segEnd + WORD_TAIL_S };
   }
   // Guard: the word list must bracket the segment plausibly. If word
-  // timestamps are broken (all zero, inverted, or missing numeric fields)
+  // timestamps are broken (zero-duration, inverted, or non-numeric)
   // fall back to segment-level.
   const first = words[0];
   const last = words[words.length - 1];
   const ws = first?.start ?? first?.startTime;
   const we = last?.end ?? last?.endTime;
   if (typeof ws !== 'number' || typeof we !== 'number' || we <= ws) {
-    return { start: segStart, end: segEnd };
+    return { start: segStart, end: segEnd + WORD_TAIL_S };
   }
-  // Clamp to segment bounds with a small bleed so we can't overlap
-  // neighbors. ``segStart - 0.02`` / ``segEnd + 0.15`` matches the
-  // tolerances the export pipeline uses for boundary nudging.
+  // Start: tight to the first word's onset with a small head
+  // anticipation, but never earlier than ``segStart - 0.02`` so we
+  // can't overlap the *previous* segment's end.
   const start = Math.max(segStart - 0.02, ws - WORD_HEAD_S);
-  const end = Math.min(segEnd + 0.15, we + WORD_TAIL_S);
-  if (end <= start) return { start: segStart, end: segEnd };
+  // End: take the LATER of ``segEnd`` and ``we`` and then add
+  // ``WORD_TAIL_S``. Using MAX (not MIN) is the fix for "the next line
+  // is highlighted while the current line is still being spoken" —
+  // the old ``min(segEnd + 0.15, we + WORD_TAIL_S)`` formula cut
+  // segments short whenever ``we`` landed before ``segEnd``, which is
+  // very common for lines that trail off into silence. Using ``max``
+  // keeps the current row active through whichever boundary is later.
+  const end = Math.max(segEnd, we) + WORD_TAIL_S;
+  if (end <= start) return { start: segStart, end: segEnd + WORD_TAIL_S };
   return { start, end };
 }
 
 /**
- * True iff ``t`` is inside the spoken window of ``seg``. Shared predicate
- * used by ``SubtitleOverlay`` and ``TranscriptViewer`` so their notion of
- * "active" stays consistent.
+ * True iff ``t`` is inside the spoken window of ``seg``. Shared
+ * predicate used by ``SubtitleOverlay`` and ``TranscriptViewer`` so
+ * their notion of "active" stays consistent.
  */
 export function isSpokenAt(seg, t) {
   const { start, end } = spokenWindow(seg);
