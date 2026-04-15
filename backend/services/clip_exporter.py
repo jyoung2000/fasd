@@ -3972,6 +3972,16 @@ def _build_screenshare_filter(
     )
 
 
+# Phase 4 (gaming): blur-fill + wide-zoom filter graph builders live
+# in ``backend.services.gameplay_filters`` so they're unit-testable
+# without the database / aiofiles import chain. Re-exported here so
+# existing callers can keep importing them from clip_exporter.
+from backend.services.gameplay_filters import (
+    build_gameplay_blurfill_filter as _build_gameplay_blurfill_filter,
+    build_gameplay_wide_zoom_filter as _build_gameplay_wide_zoom_filter,
+)
+
+
 def _build_gameplay_composite_filter(
     src_w: int,
     src_h: int,

@@ -96,6 +96,27 @@ FACE_ANCHOR_DENSITY_FLOOR = float(
     os.environ.get("CLIPAI_FACE_ANCHOR_DENSITY", "0.4")
 )
 
+# ── Phase 3 (gaming): pan-and-recenter knobs ──
+#
+# For a GamingEvent at time T with duration D and target_region
+# (x_pct, y_pct, w, h), we ramp the data-fidelity weight on the
+# target region for ``T - GAMING_PAN_RAMP_SEC`` to ``T``, hold it
+# for the event duration, then ramp back. The action anchor's
+# weight is scaled DOWN to ``GAMING_PAN_ACTION_HOLD_SCALE`` during
+# the hold so the pan target wins the L1 fight.
+GAMING_PAN_WEIGHT_RATIO = float(
+    os.environ.get("GAMING_PAN_WEIGHT_RATIO", "2.0"),
+)
+GAMING_PAN_HOLD_SEC = float(
+    os.environ.get("GAMING_PAN_HOLD_SEC", "0.8"),
+)
+GAMING_PAN_RAMP_SEC = float(
+    os.environ.get("GAMING_PAN_RAMP_SEC", "0.3"),
+)
+GAMING_PAN_ACTION_HOLD_SCALE = float(
+    os.environ.get("GAMING_PAN_ACTION_HOLD_SCALE", "0.3"),
+)
+
 
 def build_face_anchor_targets(
     dense_faces: list,
@@ -920,6 +941,129 @@ def _classify_segment_mode(
         "ease_in_ms": 0,
         "infeasible_frames": [],
     }
+
+
+def build_gaming_pan_targets(
+    *,
+    action_xy_pct: tuple[float, float],
+    events: list,
+    start: float,
+    end: float,
+    target_fps: float = 30.0,
+    pan_weight_ratio: float = GAMING_PAN_WEIGHT_RATIO,
+    pan_hold_sec: float = GAMING_PAN_HOLD_SEC,
+    pan_ramp_sec: float = GAMING_PAN_RAMP_SEC,
+    action_hold_scale: float = GAMING_PAN_ACTION_HOLD_SCALE,
+) -> tuple[list[tuple[float, float]], list[float]]:
+    """Build a per-frame target signal + weights for a gaming shot.
+
+    Phase 3 — for a gaming shot that has zero or more
+    :class:`gaming_event_detector.GamingEvent` markers, this helper
+    blends the action anchor (typically the crosshair x or the
+    per-genre action center) with each event's ``target_region``
+    using a triangular temporal weight:
+
+      - ``[T - ramp, T]``      → action weight ramps DOWN to
+                                  ``action_hold_scale``,
+                                  pan weight ramps UP from 0 to
+                                  ``pan_weight_ratio``.
+      - ``[T, T + duration]``  → pan weight held at full strength,
+                                  action weight at ``action_hold_scale``.
+      - ``[T + d, T + d + r]`` → both ramp back to baseline.
+
+    The L1 solver's existing total-variation smoothness term keeps
+    the transition smooth — no hand-rolled easing math required.
+
+    Args:
+        action_xy_pct: ``(x, y)`` baseline anchor in % of source.
+        events: List of GamingEvent (only those with
+            ``target_region != None`` produce a pan; ``None``
+            target regions are treated as zoom-outs and skipped
+            here — Phase 4's layout chooser handles those).
+        start, end: Shot time range (seconds).
+        target_fps: Output sample rate.
+        pan_weight_ratio: Peak weight on the target during the
+            hold, as a multiple of the baseline action weight (1.0).
+        pan_hold_sec / pan_ramp_sec: Window shape.
+        action_hold_scale: How much we attenuate the action
+            anchor while panning (0 = full kill, 1 = no scaling).
+
+    Returns:
+        ``(positions, weights)`` parallel lists at uniform target_fps.
+        ``positions`` is ``[(timestamp, x_pct), ...]`` and
+        ``weights`` is the data-fidelity weight per frame (1.0 =
+        baseline, > 1.0 means the solver is pulled harder onto
+        that point).
+    """
+    if end <= start:
+        return [], []
+
+    dt = 1.0 / target_fps
+    n_frames = max(1, int((end - start) * target_fps))
+
+    action_x = float(action_xy_pct[0])
+
+    # Pre-build a list of (event_t_start, event_t_end, target_x, peak_weight)
+    # for easy per-frame lookup.
+    pan_windows: list[tuple[float, float, float, float, float]] = []
+    for ev in events or []:
+        target_region = getattr(ev, "target_region", None)
+        if target_region is None:
+            continue
+        try:
+            tx = float(target_region[0]) + float(target_region[2]) / 2.0
+        except (TypeError, IndexError):
+            continue
+        ev_t = float(getattr(ev, "timestamp", 0.0))
+        ev_d = float(getattr(ev, "duration", pan_hold_sec))
+        win_start = ev_t - pan_ramp_sec
+        win_end = ev_t + ev_d + pan_ramp_sec
+        # Skip events fully outside the shot
+        if win_end < start or win_start > end:
+            continue
+        pan_windows.append((win_start, ev_t, ev_t + ev_d, win_end, tx))
+
+    positions: list[tuple[float, float]] = []
+    weights: list[float] = []
+
+    for i in range(n_frames):
+        t = start + i * dt
+        if t >= end:
+            break
+
+        # Find the active pan window (at most one — events should
+        # have been merged upstream when they overlap).
+        target_x = action_x
+        target_w = 1.0
+        for win_start, hold_start, hold_end, win_end, tx in pan_windows:
+            if win_start <= t <= win_end:
+                # Compute interpolation weight in [0, 1]
+                if t < hold_start:
+                    span = max(hold_start - win_start, 1e-6)
+                    interp = (t - win_start) / span
+                elif t <= hold_end:
+                    interp = 1.0
+                else:
+                    span = max(win_end - hold_end, 1e-6)
+                    interp = max(0.0, 1.0 - (t - hold_end) / span)
+
+                # Blend action and target positions by interp.
+                target_x = (1.0 - interp) * action_x + interp * tx
+                # Weight scales between baseline (1.0) and
+                # pan_weight_ratio at full hold; action gets
+                # attenuated to action_hold_scale at full hold.
+                pan_w = 1.0 + (pan_weight_ratio - 1.0) * interp
+                action_attn = 1.0 - (1.0 - action_hold_scale) * interp
+                # The blended weight is the convex combination of
+                # the two weights — pan weight when target_x = tx,
+                # attenuated action weight when target_x = action_x.
+                target_w = (1.0 - interp) * action_attn + interp * pan_w
+                break
+
+        positions.append((round(t, 6), float(target_x)))
+        weights.append(float(target_w))
+
+    return positions, weights
 
 
 def solve_camera_path_for_shot(

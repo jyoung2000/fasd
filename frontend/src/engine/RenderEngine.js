@@ -580,6 +580,19 @@ export default class RenderEngine {
       return;
     }
 
+    // ── Gaming layout modes (Phase 5) ──
+    // When a render plan op carries ``gaming_layout_mode`` (the
+    // chooser populated it for gameplay clips), draw using the
+    // matching mode. The pixel math mirrors
+    // ``backend/services/gameplay_geometry.py`` so the FFmpeg
+    // export and this Canvas preview agree to the pixel.
+    const gamingMode = clip.gamingLayoutMode || clip.gaming_layout_mode;
+    if (gamingMode === 'blurfill' || gamingMode === 'wide_zoom' || gamingMode === 'fullscreen') {
+      const camXPct = (clip.subjectX ?? settings.subjectX ?? 50);
+      this._renderGamingLayout(ctx, mediaEl, vw, vh, gamingMode, camXPct);
+      return;
+    }
+
     // Calculate crop region for aspect ratio
     const srcAR = vw / vh;
     const dstAR = width / height;
@@ -655,6 +668,67 @@ export default class RenderEngine {
         ctx.drawImage(mediaEl, sx, sy, sw, sh, 0, 0, width, height);
       }
     }
+  }
+
+  /**
+   * Phase 5 — gaming layout renderer.
+   *
+   * Mirrors the rect math in
+   * ``backend/services/gameplay_geometry.py`` so this Canvas
+   * preview and the FFmpeg export stay within ±2 px of each
+   * other for every gaming layout mode.
+   *
+   * Modes:
+   *   - "fullscreen": center crop with cam_x_pct
+   *   - "blurfill":   sharp 16:9 band over a blurred fill
+   *   - "wide_zoom":  wider crop showing more horizontal context
+   */
+  _renderGamingLayout(ctx, mediaEl, vw, vh, mode, camXPct) {
+    const { width: tw, height: th } = this;
+
+    const evenRound = (n) => {
+      const r = Math.round(n);
+      return r - (r % 2);
+    };
+
+    if (mode === 'blurfill') {
+      // Band is 16:9 source scaled to target_w
+      const bandW = tw;
+      const bandH = evenRound(tw * vh / Math.max(vw, 1));
+      let bandY = Math.floor((th - bandH) / 2);
+      bandY -= bandY % 2;
+
+      // Blur layer: scale source to FILL target_h, then crop center
+      // and apply CSS blur via offscreen canvas.
+      ctx.save();
+      const off = document.createElement('canvas');
+      off.width = tw;
+      off.height = th;
+      const offCtx = off.getContext('2d');
+      const fillScale = Math.max(tw / vw, th / vh);
+      const fillW = vw * fillScale;
+      const fillH = vh * fillScale;
+      const fillX = (tw - fillW) / 2;
+      const fillY = (th - fillH) / 2;
+      offCtx.drawImage(mediaEl, fillX, fillY, fillW, fillH);
+      ctx.filter = 'blur(20px)';
+      ctx.drawImage(off, 0, 0);
+      ctx.filter = 'none';
+      ctx.restore();
+
+      // Sharp band on top
+      ctx.drawImage(mediaEl, 0, 0, vw, vh, 0, bandY, bandW, bandH);
+      return;
+    }
+
+    // fullscreen + wide_zoom share the cropped-source path
+    const targetAspect = tw / Math.max(th, 1);
+    const cropScale = mode === 'wide_zoom' ? 1.25 : 1.0;
+    let cropW = evenRound(vh * targetAspect * cropScale);
+    cropW = Math.min(cropW, vw);
+    const camPx = vw * camXPct / 100;
+    let cropX = Math.max(0, Math.min(vw - cropW, Math.round(camPx - cropW / 2)));
+    ctx.drawImage(mediaEl, cropX, 0, cropW, vh, 0, 0, tw, th);
   }
 
   _renderImage(ctx, clip, mediaElements) {

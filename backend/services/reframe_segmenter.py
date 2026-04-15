@@ -164,6 +164,12 @@ class ReframeSegment:
     subject_source: str = ""  # which code path produced subject_x
     fallback_reason: Optional[str] = None  # why a fallback was applied
     confidence_breakdown: Optional[dict] = None  # {face_in_crop, speaker_agree, stability, transcript}
+    # ── Phase 4 (gaming): per-segment layout mode for gameplay clips ──
+    # One of "fullscreen" | "blurfill" | "composite" | "wide_zoom".
+    # Only populated when ``_content_profile.is_gaming`` is True; the
+    # render plan + clip exporter read this to pick the FFmpeg
+    # filter graph per segment instead of one mode per clip.
+    gaming_layout_mode: Optional[str] = None
 
 
 def build_reframe_segments(
@@ -1749,6 +1755,48 @@ def build_reframe_segments(
         logger.warning(
             "[%s] wide_master surround-mean rewrite failed: %s",
             job_id, _wmr,
+        )
+
+    # ── Stage 11 (gaming): per-segment layout mode chooser (Phase 4) ──
+    # Gated on content_profile having a gameplay_subtype. Picks one of
+    # fullscreen / blurfill / composite / wide_zoom per segment based on
+    # genre + segment activity (events + motion). Non-gaming segments
+    # are untouched. Caller-provided ``gaming_layout_mode`` overrides
+    # are preserved.
+    try:
+        _gp_subtype_for_layout = (
+            getattr(content_profile, "gameplay_subtype", None)
+            if content_profile else None
+        )
+        if _gp_subtype_for_layout:
+            from backend.services.gaming_layout_chooser import (
+                USE_GAMING_LAYOUT_CHOOSER,
+                assign_gaming_layouts,
+            )
+            if USE_GAMING_LAYOUT_CHOOSER:
+                # Optional gaming events list — passed via job_id /
+                # global state in production, plumbed through here as
+                # a no-op since the segmenter doesn't yet receive it.
+                _events_for_layout: list = []
+                # Optional per-segment motion magnitude. We don't yet
+                # have a clean dict here so leave it None — the
+                # chooser falls through to the genre default.
+                n_assigned = assign_gaming_layouts(
+                    raw_segments,
+                    events=_events_for_layout,
+                    motion_by_segment=None,
+                    profile=content_profile,
+                )
+                if n_assigned:
+                    _log(
+                        "Gaming layout chooser: assigned %d segments "
+                        "(%s genre)",
+                        n_assigned, _gp_subtype_for_layout,
+                    )
+    except Exception as e:
+        logger.warning(
+            "[%s] Gaming layout chooser failed (non-fatal): %s",
+            job_id, e,
         )
 
     # ── Summary logging ──

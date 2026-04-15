@@ -1336,6 +1336,8 @@ async def _run_analysis_inner(job_id: str):
         except Exception as e:
             logger.warning("[%s] Gameplay detection failed (non-fatal): %s", job_id, e)
 
+    # Default empty crosshair_path; populated below for FPS subtypes.
+    crosshair_path: list = []
     if _is_gameplay:
         # Set tracking mode to gameplay — skip face-based tracking entirely.
         # Scene subject_x values will be overridden to 50 later when scenes are available.
@@ -1345,6 +1347,45 @@ async def _run_analysis_inner(job_id: str):
             "Gameplay content detected — using center-crop tracking with HUD compositing",
         )
         logger.info("[%s] Gameplay mode: will set all scene subject_x=50 (crosshair-centered)", job_id)
+
+        # ── Phase 1: per-frame crosshair tracking for FPS subtypes ──
+        # For FPS / hero shooter / Valorant-style content, run the
+        # crosshair tracker so the reframe pipeline can use the
+        # actual per-frame crosshair x,y instead of a hard-coded
+        # (50, 50). Gated on the override matching an FPS-class
+        # subtype so MOBA / TPS / racing don't pay the cost.
+        try:
+            from backend.services.crosshair_tracker import (
+                USE_CROSSHAIR_TRACKER,
+                track_crosshair_path,
+            )
+            _is_fps_class = _content_override.lower() in (
+                "gameplay_fps", "fps", "hero_shooter", "gameplay",
+            )
+            if USE_CROSSHAIR_TRACKER and _is_fps_class and frames:
+                logger.info(
+                    "[%s] Crosshair tracker: scanning %d frames",
+                    job_id, len(frames),
+                )
+                _ch_inputs = [
+                    (float(f.timestamp), str(f.path)) for f in frames
+                ]
+                # Run in executor — cv2 template matching is CPU bound.
+                loop = asyncio.get_event_loop()
+                crosshair_path = await loop.run_in_executor(
+                    None,
+                    lambda: track_crosshair_path(_ch_inputs),
+                )
+                logger.info(
+                    "[%s] Crosshair tracker: %d/%d frames have a "
+                    "high-confidence crosshair detection",
+                    job_id, len(crosshair_path), len(frames),
+                )
+        except Exception as e:
+            logger.warning(
+                "[%s] Crosshair tracker failed (non-fatal): %s",
+                job_id, e,
+            )
 
     # ── Build face registry ──
     # Prefer dense data with embeddings for identity-based clustering.
@@ -2216,11 +2257,51 @@ async def _run_analysis_inner(job_id: str):
                     job_id, fixed_center,
                 )
 
-        # Gameplay mode: override all scene subject_x to 50 (crosshair-centered)
+        # Gameplay mode: override scene subject_x using the per-frame
+        # crosshair path when available (Phase 1: FPS subtypes), or
+        # fall back to the legacy hard-coded center (50) otherwise.
         if _is_gameplay and scenes_result:
-            for scene in scenes_result:
-                scene.subject_x = 50
-            logger.info("[%s] Gameplay mode: set %d scene subject_x=50", job_id, len(scenes_result))
+            ch_used = 0
+            if crosshair_path:
+                # Build a sorted list for nearest-time lookup.
+                sorted_ch = sorted(
+                    crosshair_path, key=lambda c: c.timestamp,
+                )
+                ch_times = [c.timestamp for c in sorted_ch]
+                import bisect as _bisect
+                for scene in scenes_result:
+                    mid_t = (
+                        (scene.start + scene.end) / 2.0
+                        if hasattr(scene, "start")
+                        else getattr(scene, "timestamp", 0.0)
+                    )
+                    idx = _bisect.bisect_left(ch_times, mid_t)
+                    candidates = []
+                    if idx < len(sorted_ch):
+                        candidates.append(sorted_ch[idx])
+                    if idx > 0:
+                        candidates.append(sorted_ch[idx - 1])
+                    if not candidates:
+                        scene.subject_x = 50
+                        continue
+                    best = min(
+                        candidates,
+                        key=lambda c: abs(c.timestamp - mid_t),
+                    )
+                    if abs(best.timestamp - mid_t) <= 1.0:
+                        scene.subject_x = int(round(best.x_pct))
+                        ch_used += 1
+                    else:
+                        scene.subject_x = 50
+            else:
+                for scene in scenes_result:
+                    scene.subject_x = 50
+            logger.info(
+                "[%s] Gameplay mode: set %d scene subject_x "
+                "(crosshair-tracked=%d, fallback-center=%d)",
+                job_id, len(scenes_result), ch_used,
+                len(scenes_result) - ch_used,
+            )
 
         await database.update_job_status(
             job_id,

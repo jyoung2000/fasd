@@ -90,6 +90,13 @@ class RenderOp:
     # For debugging / logs only, not rendering
     strategy_label: str = ""
     content_type: str = "unknown"
+    # Phase 5 (gaming): per-segment gaming layout mode populated
+    # by the chooser in reframe_segmenter for gameplay clips. One
+    # of "fullscreen" | "blurfill" | "composite" | "wide_zoom" or
+    # ``None`` for non-gaming ops. The frontend Canvas renderer
+    # and the FFmpeg filter graph builder both consume this to
+    # pick the right draw path.
+    gaming_layout_mode: Optional[str] = None
 
 
 @dataclass

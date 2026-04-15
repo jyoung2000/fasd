@@ -203,6 +203,9 @@ def _segment_to_op(seg, source_w: int, source_h: int, aspect_ratio: float, fps: 
     content_type = getattr(seg, "content_type", "unknown") or "unknown"
     reason = getattr(seg, "reason", "") or ""
     motion_data = getattr(seg, "motion_path", None)
+    # Phase 5 (gaming): per-segment layout mode populated by
+    # ``gaming_layout_chooser.choose_gaming_layout``.
+    gaming_layout_mode = getattr(seg, "gaming_layout_mode", None)
 
     if kind == RenderOpKind.CROP:
         primary_rect = _compute_crop_rect(subject_x, subject_y, source_w, source_h, aspect_ratio)
@@ -214,6 +217,7 @@ def _segment_to_op(seg, source_w: int, source_h: int, aspect_ratio: float, fps: 
             ease_in_ms=ease_in_ms,
             strategy_label=f"{strategy}_{reason}",
             content_type=content_type,
+            gaming_layout_mode=gaming_layout_mode,
         )
 
     elif kind == RenderOpKind.TRACKING_CROP:
@@ -231,6 +235,7 @@ def _segment_to_op(seg, source_w: int, source_h: int, aspect_ratio: float, fps: 
                 ease_in_ms=ease_in_ms,
                 strategy_label=f"{strategy}_{reason}_static_fallback",
                 content_type=content_type,
+                gaming_layout_mode=gaming_layout_mode,
             )
         return RenderOp(
             kind=kind,
@@ -241,6 +246,7 @@ def _segment_to_op(seg, source_w: int, source_h: int, aspect_ratio: float, fps: 
             ease_in_ms=ease_in_ms,
             strategy_label=f"{strategy}_{reason}",
             content_type=content_type,
+            gaming_layout_mode=gaming_layout_mode,
         )
 
     elif kind == RenderOpKind.WIDE_MASTER:
