@@ -283,6 +283,7 @@ async def transcribe_audio_subprocess(
     initial_prompt: str = "",
     audio_duration: float = 0,
     progress_callback=None,
+    is_animated: bool = False,
 ) -> list[TranscriptSegment]:
     """Run Whisper in a subprocess to fully release CTranslate2's CUDA memory.
 
@@ -473,13 +474,13 @@ async def transcribe_audio_subprocess(
             "--repetition-penalty", "1.1",
             "--no-repeat-ngram-size", "3",
             "--prompt-reset-on-temperature", "0.5",
-            # VAD fine-tuning — CJK translate gets more sensitive settings to catch
-            # soft-spoken moments, speech while eating, whispered speech, and
-            # ecstatic/emotional outbursts that standard thresholds miss.
-            "--vad-min-silence-ms", ("200" if _is_cjk else "250") if task == "translate" else "300",
-            "--vad-speech-pad-ms", "800" if (task == "translate" and _is_cjk) else "600",
-            "--vad-onset", "0.08" if (task == "translate" and _is_cjk) else "0.15",
-            "--vad-min-speech-ms", "50" if (task == "translate" and _is_cjk) else "100",
+            # VAD fine-tuning — CJK translate and anime/animated content get
+            # more sensitive settings to catch soft-spoken moments, speech
+            # while eating, whispered speech, and speech mixed with music.
+            "--vad-min-silence-ms", "200" if (_is_cjk or is_animated) else ("250" if task == "translate" else "300"),
+            "--vad-speech-pad-ms", "1000" if is_animated else ("800" if (task == "translate" and _is_cjk) else "600"),
+            "--vad-onset", "0.08" if (_is_cjk or is_animated) else "0.15",
+            "--vad-min-speech-ms", "50" if (_is_cjk or is_animated) else "100",
         ]
         if vad_filter:
             cmd.append("--vad-filter")
@@ -563,7 +564,7 @@ async def transcribe_audio_subprocess(
         raw_segments = raw.get("segments", [])
         if task != "translate":
             raw_segments = _filter_hallucinations(raw_segments, task=task)
-        raw_segments = _consolidate_segments(raw_segments, task=task)
+        raw_segments = _consolidate_segments(raw_segments, task=task, is_animated=is_animated)
         raw_segments = _split_segments_at_sentence_boundaries(raw_segments, task=task)
         raw_segments, _ = _dedupe_long_range(raw_segments)
         segments = []
@@ -1167,6 +1168,7 @@ async def transcribe_audio(
     cancel_check: Optional[Callable] = None,
     progress_callback: Optional[Callable] = None,
     audio_duration: float = 0,
+    is_animated: bool = False,
 ) -> list[TranscriptSegment]:
     """
     Transcribe audio using faster-whisper with live progress reporting.
@@ -1479,6 +1481,19 @@ def _transcribe_sync(
                 "onset": 0.08,
                 "min_speech_duration_ms": 50,
             }
+        elif is_animated:
+            # Anime / animated content: dialogue is mixed with background
+            # music, SFX, and action sounds. Standard VAD onset (0.2) is
+            # too aggressive and drops 10-17% of speech. Use CJK-level
+            # sensitivity to preserve speech under music and catch short
+            # exclamations / whispers (Problem 3 in the anime audit).
+            transcribe_kwargs["vad_parameters"] = {
+                "min_silence_duration_ms": 200,
+                "speech_pad_ms": 1000,    # Wide padding — anime has abrupt transitions
+                "onset": 0.08,            # Very sensitive — catch speech under music
+                "min_speech_duration_ms": 50,  # Catch short exclamations
+            }
+            logger.info("VAD parameters: using anime-sensitive preset (onset=0.08, pad=1000ms)")
         else:
             transcribe_kwargs["vad_parameters"] = {
                 "min_silence_duration_ms": 300,   # Was 500 — shorter threshold preserves natural pauses
@@ -1938,7 +1953,7 @@ def _transcribe_sync(
 
     # Filter hallucinations and consolidate fragments before speaker assignment
     raw_segments = _filter_hallucinations(raw_segments, task=task)
-    raw_segments = _consolidate_segments(raw_segments, task=task)
+    raw_segments = _consolidate_segments(raw_segments, task=task, is_animated=is_animated)
     raw_segments = _split_segments_at_sentence_boundaries(raw_segments, task=task)
     raw_segments, _dedup_removed = _dedupe_long_range(raw_segments)
     if not raw_segments:
@@ -2593,7 +2608,12 @@ def _filter_hallucinations(raw_segments: list[dict], task: str = "transcribe") -
     return filtered
 
 
-def _consolidate_segments(segments: list[dict], max_gap: float = 2.0, task: str = "transcribe") -> list[dict]:
+def _consolidate_segments(
+    segments: list[dict],
+    max_gap: float = 2.0,
+    task: str = "transcribe",
+    is_animated: bool = False,
+) -> list[dict]:
     """Consolidate over-fragmented Whisper output into natural subtitle-length segments.
 
     Merges micro-segments (<0.5s), consecutive short fragments (1-3 words),
@@ -2601,6 +2621,12 @@ def _consolidate_segments(segments: list[dict], max_gap: float = 2.0, task: str 
 
     When task='translate', uses gentler merging to preserve short backchannel
     responses ("Yes.", "Really?", "I see.") as separate segments.
+
+    When is_animated=True, the near-duplicate Jaccard threshold is raised to
+    0.90 (from 0.70) and the time window shrinks to 10s because anime
+    characters often repeat words or phrases for emphasis, and narrators
+    sometimes echo dialogue — these are intentional, not Whisper echoes
+    (Problem 3B in the anime reframing audit).
     """
     if len(segments) <= 1:
         return segments
@@ -2708,6 +2734,11 @@ def _consolidate_segments(segments: list[dict], max_gap: float = 2.0, task: str 
 
     # ── Pass 3: Remove near-duplicate text within 30 seconds ──
     # Translate: skip dedup pass — already handled by _filter_hallucinations
+    # Animated: stricter threshold + smaller window — intentional repeats
+    # (dramatic emphasis, narrator echo) are common in anime and should
+    # be preserved; only catch actual Whisper echoes.
+    _dedup_jaccard = 0.90 if is_animated else 0.7
+    _dedup_window = 10 if is_animated else 180
     if is_translate:
         deduped = consolidated
     else:
@@ -2719,9 +2750,7 @@ def _consolidate_segments(segments: list[dict], max_gap: float = 2.0, task: str 
             for recent in deduped[-10:]:
                 recent_text = recent.get("text", "").strip().lower()
                 time_gap = abs(seg["start"] - recent["start"])
-                # 180s ceiling (was 30s); see _dedupe_long_range for the
-                # real fix that catches repeats > 3 minutes apart too.
-                if time_gap > 180:
+                if time_gap > _dedup_window:
                     continue
                 if len(text) > 10 and len(recent_text) > 10:
                     if text in recent_text or recent_text in text:
@@ -2731,7 +2760,7 @@ def _consolidate_segments(segments: list[dict], max_gap: float = 2.0, task: str 
                     words_b = set(recent_text.split())
                     if words_a and words_b:
                         jaccard = len(words_a & words_b) / len(words_a | words_b)
-                        if jaccard > 0.7:
+                        if jaccard > _dedup_jaccard:
                             is_dup = True
                             break
 

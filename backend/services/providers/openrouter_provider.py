@@ -1248,16 +1248,33 @@ class OpenRouterProvider(ChunkedClipDetectionMixin, AIProvider):
             # from face detection — strictly more reliable than a vision
             # model that's center-hedging.
             #
+            # For anime/animated content the threshold is raised to 50%
+            # because many frames ARE legitimately centered (dialogue shots,
+            # title cards, close-ups) — 33% center is normal for anime.
+            # Discarding ALL subject_x in that case destroys the good
+            # positions the model did return.
+            #
             # SceneDescription.subject_x is a non-optional int (default 50),
             # so we reset to 50 rather than None; precise_x IS Optional
             # and gets explicitly cleared.
-            if center_pct_log > 25 and len(all_sx) > 5:
+            _anime_aware_threshold = 25  # 25% default
+            try:
+                from backend.services.face_detector import ANIME_MODE_DETECTED
+                if ANIME_MODE_DETECTED:
+                    _anime_aware_threshold = 50
+                    logger.info(
+                        "Vision quality gate: ANIME_MODE_DETECTED=True — "
+                        "raising center-default threshold from 25%% to 50%%"
+                    )
+            except ImportError:
+                pass
+            if center_pct_log > _anime_aware_threshold and len(all_sx) > 5:
                 logger.warning(
                     "Vision model quality too low (%d%% center defaults, "
-                    "threshold=25%%) — discarding vision-derived subject_x "
+                    "threshold=%d%%) — discarding vision-derived subject_x "
                     "for all %d scenes. Pipeline will rely on dense face "
                     "data + active speaker timeline.",
-                    int(center_pct_log), len(scenes),
+                    int(center_pct_log), int(_anime_aware_threshold), len(scenes),
                 )
                 for scene in scenes:
                     scene.subject_x = 50

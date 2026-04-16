@@ -1981,6 +1981,7 @@ async def _run_analysis_inner(job_id: str):
                         audio_path, language=job.language, task=whisper_task,
                         initial_prompt=initial_prompt, audio_duration=audio_duration,
                         progress_callback=_transcribe_progress,
+                        is_animated=_early_anime_hint,
                     ),
                     timeout=_whisper_timeout,
                 )
@@ -1996,6 +1997,7 @@ async def _run_analysis_inner(job_id: str):
                 audio_path, language=job.language, task=whisper_task,
                 initial_prompt=initial_prompt, cancel_check=cancel_check,
                 progress_callback=_transcribe_progress, audio_duration=audio_duration,
+                is_animated=_early_anime_hint,
             )
 
         # ── CRASH RECOVERY: If Whisper returned 0 segments on a video with
@@ -2917,6 +2919,15 @@ async def _run_analysis_inner(job_id: str):
     # how much influence it has on the solver.
     _saliency_regions = []
     _object_detections = []
+    # Early init for _persistent_regions — it is properly populated later
+    # in the content classification block (~line 3320+) but the saliency
+    # tracker below references it. Without this early init the call
+    # raises "local variable '_persistent_regions' referenced before
+    # assignment" — see Problem 4 in the anime reframing issue.
+    try:
+        _persistent_regions  # noqa: F841 — test if already bound
+    except NameError:
+        _persistent_regions = None
     OBJECT_DETECTION_ENABLED = os.environ.get("OBJECT_DETECTION_ENABLED", "true").lower() in ("true", "1", "yes")
     USE_AUTOFLIP_REFRAME = os.environ.get("USE_AUTOFLIP_REFRAME", "false").lower() in ("true", "1", "yes")
     if OBJECT_DETECTION_ENABLED:
