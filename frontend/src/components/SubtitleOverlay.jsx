@@ -364,7 +364,7 @@ export default function SubtitleOverlay({
     // reads as lingering. We always bound the bridge by the next
     // segment's spoken start, so we can't carry a segment past when
     // the next speaker actually begins.
-    const MAX_GAP_FILL = 0.35;
+    const MAX_GAP_FILL = 0.45;
     for (let i = 0; i < clipSegments.length - 1; i++) {
       const cur = clipSegments[i];
       const nxt = clipSegments[i + 1];

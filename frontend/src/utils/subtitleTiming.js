@@ -35,29 +35,21 @@
 //      the consumers picks the earlier-started one so the highlight
 //      hangs on the previous line for ``WORD_TAIL_S`` extra seconds.
 //
-// ``WORD_TAIL_S`` is tuned larger than a frame time (0.20 s) because
-// the symptom we're fighting is not "the final phoneme is cut off" —
-// it's "Whisper's segment boundary landed a quarter second early
-// relative to what I'm hearing, and my eyes got dragged to the next
-// line." 200 ms of tail is enough to absorb the common Whisper
-// boundary drift without producing visibly stale highlighting on a
-// long real pause between speakers (the short 0.35 s /
-// 0.75 s gap-fill caps in the consumers still clip it from going
-// further).
+// ``WORD_TAIL_S`` absorbs Whisper's ±100–300 ms boundary drift.
+// Kept small (0.10 s) because the backend VAD padding already extends
+// segment ends; larger values compound with backend drift and make
+// subtitles linger visibly past the spoken word.
 
 // Tail padding (s) added to every segment's effective end. Absorbs
-// Whisper's ±100–300 ms boundary drift and, via first-match loop
-// ordering in consumers, delays segment-to-segment transitions by this
-// much so the highlight doesn't jump to the next line while the
-// current line is still audibly playing.
-export const WORD_TAIL_S = 0.20;
+// Whisper's boundary drift without compounding with backend VAD
+// padding.
+export const WORD_TAIL_S = 0.10;
 
-// Head padding (s) before the first word's Whisper start — Whisper
-// word ``start`` is usually placed at the phoneme onset, which is
-// ~30–50 ms late relative to the perceptual attack. Pulling the
-// visible window slightly earlier makes the subtitle appear *with* the
-// first syllable, not after it.
-export const WORD_HEAD_S = 0.04;
+// Head padding (s) before the first word's Whisper start.  Set to 0
+// because the backend's per-speaker anticipation in SubtitleOverlay
+// already handles onset timing; double-applying head shift made
+// subtitles visibly premature.
+export const WORD_HEAD_S = 0.00;
 
 /**
  * Compute the ``[start, end]`` window during which a transcript segment

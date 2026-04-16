@@ -296,8 +296,14 @@ def test_long_range_dedup_preserves_short_legitimate_repeats():
 
 
 def test_long_range_dedup_jaccard_catches_minor_rewording():
-    """Same content with one trailing word added — Jaccard ≥ 0.88 should still drop."""
-    segs = [
+    """Near-identical content (Jaccard ≥ 0.92) should be dropped.
+
+    At the tightened threshold (0.92), a sentence with one extra word
+    (Jaccard ≈ 0.89) is preserved — these are legitimately different.
+    A true near-duplicate (Jaccard ≥ 0.92) is still caught.
+    """
+    # This pair has Jaccard ≈ 0.89 — should be kept at threshold 0.92
+    segs_different = [
         {"start": 0.0, "end": 4.0,
          "text": "This power will soon pass to Rod's children",
          "words": None},
@@ -305,9 +311,23 @@ def test_long_range_dedup_jaccard_catches_minor_rewording():
          "text": "This power will soon pass to Rod's children today",
          "words": None},
     ]
-    out, removed = _dedupe_long_range(segs)
-    assert len(out) == 1
-    assert len(removed) == 1
+    out, removed = _dedupe_long_range(segs_different)
+    assert len(out) == 2
+    assert len(removed) == 0
+
+    # True near-duplicate: 12 unique words shared, one extra word
+    # added. Jaccard = 12/13 ≈ 0.923 — above threshold, should drop.
+    segs_dup = [
+        {"start": 0.0, "end": 4.0,
+         "text": "The incredible power of the ancient kingdom will soon pass to Rod's children",
+         "words": None},
+        {"start": 60.0, "end": 64.0,
+         "text": "The incredible power of the ancient kingdom will soon pass to Rod's brave children",
+         "words": None},
+    ]
+    out2, removed2 = _dedupe_long_range(segs_dup)
+    assert len(out2) == 1
+    assert len(removed2) == 1
 
 
 def test_long_range_dedup_allows_two_copies_of_short_phrase():

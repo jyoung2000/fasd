@@ -478,7 +478,7 @@ async def transcribe_audio_subprocess(
             # more sensitive settings to catch soft-spoken moments, speech
             # while eating, whispered speech, and speech mixed with music.
             "--vad-min-silence-ms", "200" if (_is_cjk or is_animated) else ("250" if task == "translate" else "300"),
-            "--vad-speech-pad-ms", "1000" if is_animated else ("800" if (task == "translate" and _is_cjk) else "600"),
+            "--vad-speech-pad-ms", "700" if is_animated else ("800" if (task == "translate" and _is_cjk) else "600"),
             "--vad-onset", "0.08" if (_is_cjk or is_animated) else "0.15",
             "--vad-min-speech-ms", "50" if (_is_cjk or is_animated) else "100",
         ]
@@ -1325,7 +1325,8 @@ async def transcribe_audio(
     with lock:
         partial = list(progress_state.get("raw_segments", []))
     if partial:
-        return _assign_speakers(partial)
+        partial, removed_intervals = _dedupe_long_range(partial)
+        return _assign_speakers(partial, removed_intervals=removed_intervals)
     return []
 
 
@@ -1489,11 +1490,11 @@ def _transcribe_sync(
             # exclamations / whispers (Problem 3 in the anime audit).
             transcribe_kwargs["vad_parameters"] = {
                 "min_silence_duration_ms": 200,
-                "speech_pad_ms": 1000,    # Wide padding — anime has abrupt transitions
+                "speech_pad_ms": 700,     # Reduced from 1000 — 500ms/side shifted boundaries too far
                 "onset": 0.08,            # Very sensitive — catch speech under music
                 "min_speech_duration_ms": 50,  # Catch short exclamations
             }
-            logger.info("VAD parameters: using anime-sensitive preset (onset=0.08, pad=1000ms)")
+            logger.info("VAD parameters: using anime-sensitive preset (onset=0.08, pad=700ms)")
         else:
             transcribe_kwargs["vad_parameters"] = {
                 "min_silence_duration_ms": 300,   # Was 500 — shorter threshold preserves natural pauses
@@ -2266,7 +2267,7 @@ def _dedupe_long_range(
     segments: list[dict],
     min_words: int = 5,
     min_chars: int = 20,
-    jaccard_threshold: float = 0.88,
+    jaccard_threshold: float = 0.92,
     exact_threshold: float = 0.97,
 ) -> tuple[list[dict], list[tuple[float, float]]]:
     """Drop verbatim repeats anywhere in the segment stream.
@@ -2580,11 +2581,11 @@ def _filter_hallucinations(raw_segments: list[dict], task: str = "transcribe") -
             for recent in filtered[-10:]:
                 recent_text = recent["text"].strip()
                 time_gap = abs(seg["start"] - recent["start"])
-                # 180s ceiling (was 30s) catches close-range fuzzy repeats
-                # before they pollute the consolidate output. The real
-                # long-range fix is _dedupe_long_range; this is belt-and-
-                # braces inside _filter_hallucinations.
-                if time_gap > 180 or time_gap < 2:
+                # 30s ceiling for close-range fuzzy repeats. The real
+                # long-range fix is _dedupe_long_range with its own
+                # (stricter) thresholds; this is belt-and-braces inside
+                # _filter_hallucinations.
+                if time_gap > 30 or time_gap < 2:
                     continue
                 recent_words = set(recent_text.lower().split())
                 if text_words and recent_words:
@@ -3022,68 +3023,69 @@ def _split_using_word_timestamps(
     seg_end: float,
     carry: dict,
 ) -> list[dict]:
-    """Split a segment's words across the given sub-texts by character count.
+    """Split a segment's words across the given sub-texts by word matching.
 
-    For each sub-text we walk the words list, accumulating until the
-    accumulated text length matches the sub-text length (up to the
-    last sub-text, which sweeps any remainder). Returns an empty list
-    if alignment fails so the caller can fall back to proportional
-    time splitting.
+    For each sub-text we match words from the word list by counting
+    cleaned words (not characters), which avoids drift from Whisper's
+    inconsistent leading-space handling.  The last sub-text sweeps any
+    remaining words.  Returns an empty list if alignment fails so the
+    caller can fall back to proportional time splitting.
     """
     if not words or not sub_texts:
         return []
 
+    # Build a clean word list for matching — strip whitespace so
+    # Whisper's inconsistent leading spaces don't affect alignment.
+    word_texts = [(w.get("word") or "").strip().lower() for w in words]
+
     sub_segments: list[dict] = []
     word_idx = 0
-    total_words = len(words)
-
-    # Walk the parent text in lock-step with the words list. We count
-    # NON-SPACE chars on both sides so the comparison doesn't drift
-    # when Whisper puts leading spaces on word.word and the parent
-    # text encodes them as inter-word spaces. The check happens BEFORE
-    # consuming each candidate word so we don't over-count by one.
-    def _nonspace_len(s: str) -> int:
-        return sum(1 for ch in s if not ch.isspace())
 
     for s_i, sub_text in enumerate(sub_texts):
         is_last = (s_i == len(sub_texts) - 1)
-        target_len = _nonspace_len(sub_text)
-        accumulated_chars = 0
+        sub_words_clean = sub_text.strip().lower().split()
         slice_start = word_idx
-        while word_idx < total_words:
-            if not is_last and accumulated_chars >= target_len:
-                break
-            w_text = words[word_idx].get("word") or ""
-            w_len = _nonspace_len(w_text)
-            if w_len == 0:
-                word_idx += 1
-                continue
-            accumulated_chars += w_len
-            word_idx += 1
-        slice_end = word_idx if not is_last else total_words
+
+        if is_last:
+            # Last sub-text takes all remaining words
+            slice_end = len(words)
+        else:
+            # Find where this sub-text's words end in the word list
+            # by matching word-by-word (tolerating minor differences)
+            target_count = len(sub_words_clean)
+            matched = 0
+            scan = word_idx
+            while scan < len(words) and matched < target_count:
+                wt = word_texts[scan]
+                if wt:  # skip empty
+                    matched += 1
+                scan += 1
+            slice_end = scan
+            word_idx = scan
+
         if slice_end <= slice_start:
-            return []
+            return []  # alignment failed
+
         word_slice = words[slice_start:slice_end]
         try:
             sub_start = float(word_slice[0].get("start", seg_start))
             sub_end = float(word_slice[-1].get("end", seg_end))
         except (TypeError, ValueError):
             return []
-        # Belt-and-braces: clamp to the parent segment's bounds.
-        sub_start = max(seg_start, min(seg_end, sub_start))
-        sub_end = max(sub_start, min(seg_end, sub_end))
+
+        # Don't clamp sub_end to seg_end — word timestamps are more
+        # accurate than segment boundaries.  Only clamp start.
+        sub_start = max(seg_start, sub_start)
+
         sub: dict = {
             "start": sub_start,
             "end": sub_end,
-            "text": sub_text if sub_text.startswith(" ") or s_i == 0 else " " + sub_text,
+            "text": sub_text,
             "words": word_slice,
         }
-        # Preserve original spacing: prefer the contiguous slice of
-        # the parent text rather than rebuilding from word.word fields
-        # (Whisper's leading-space handling is inconsistent).
-        sub["text"] = sub_text
         sub.update(carry)
         sub_segments.append(sub)
+
     return sub_segments
 
 
@@ -3096,10 +3098,16 @@ def _split_proportionally(
     """Length-weighted time split when no per-word timestamps are available."""
     if not sub_texts:
         return []
+    duration = max(seg_end - seg_start, 1e-6)
+    # Don't proportionally split short segments — the timing will be
+    # wrong because speech rate varies within a segment (pauses,
+    # emphasis, fast runs).  Short multi-sentence segments with no
+    # word timestamps should stay unsplit rather than get bad timing.
+    if duration < 4.0:
+        return []  # caller keeps the original unsplit segment
     total_chars = sum(max(len(s), 1) for s in sub_texts)
     if total_chars <= 0:
         return []
-    duration = max(seg_end - seg_start, 1e-6)
     out: list[dict] = []
     cursor = seg_start
     for i, sub_text in enumerate(sub_texts):
