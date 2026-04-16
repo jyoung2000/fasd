@@ -1518,6 +1518,19 @@ def classify_gameplay_content(
     except Exception as e:
         logger.debug("filename_gameplay_hint failed: %s", e)
 
+    # Signal 1.5: ANIME_MODE_DETECTED guard — if the human face verifier
+    # already decided this is animated content (rejection rate >50%), the
+    # high raw_ratio + low verified_ratio pattern is from anime character
+    # faces, NOT from cartoon FPS game models. Do NOT promote to gameplay.
+    # Let the anime tracking path handle it instead.
+    global ANIME_MODE_DETECTED
+    if ANIME_MODE_DETECTED:
+        logger.info(
+            "Gameplay classification: ANIME_MODE_DETECTED=True — "
+            "skipping gameplay promotion (animated content, not gameplay)"
+        )
+        return "not_gameplay"
+
     # Signal 2: sparse-pass face rarity. On cartoon FPS content
     # the sparse FaceMesh pass (no YuNet augmentation) returns
     # near-zero faces — a signal that dense-pass YuNet false

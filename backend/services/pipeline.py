@@ -1191,15 +1191,29 @@ async def _run_analysis_inner(job_id: str):
                 filename=_early_filename,
             )
             if _early_result == "gameplay":
-                _early_is_gameplay = True
-                logger.info(
-                    "[%s] Early gameplay pre-detect: gameplay "
-                    "(filename='%s', sparse_faces=%d/%d) — "
-                    "skipping dense face pass",
-                    job_id, _early_filename,
-                    sum(1 for f in face_results or [] if f.faces),
-                    len(face_results or []),
-                )
+                # Check if ANIME_MODE_DETECTED already fired — if so,
+                # the gameplay heuristic is a false positive from anime
+                # character faces, not actual gameplay content.
+                from backend.services.face_detector import ANIME_MODE_DETECTED as _amd
+                if _amd:
+                    logger.info(
+                        "[%s] Early gameplay pre-detect: gameplay signal "
+                        "overridden by ANIME_MODE_DETECTED=True — "
+                        "treating as animated content, not gameplay",
+                        job_id,
+                    )
+                    # Don't set _early_is_gameplay — let the anime
+                    # tracking path run instead (dense pass + anime anchor)
+                else:
+                    _early_is_gameplay = True
+                    logger.info(
+                        "[%s] Early gameplay pre-detect: gameplay "
+                        "(filename='%s', sparse_faces=%d/%d) — "
+                        "skipping dense face pass",
+                        job_id, _early_filename,
+                        sum(1 for f in face_results or [] if f.faces),
+                        len(face_results or []),
+                    )
     except Exception as _early_e:
         logger.debug(
             "[%s] Early gameplay pre-detect failed (non-fatal): %s",
@@ -2465,7 +2479,7 @@ async def _run_analysis_inner(job_id: str):
         # resolve to exactly x=50. This kills the TF2 / Marvel
         # Rivals-style regression where a stale or noisy detection
         # would pull the crop off-axis on cartoon FPS content.
-        if _is_gameplay and scenes_result:
+        if _is_gameplay and scenes_result and not _early_anime_hint:
             try:
                 from backend.services.l1_camera_path import (
                     GAMING_CROSSHAIR_CONF_THRESHOLD,
