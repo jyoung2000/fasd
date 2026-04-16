@@ -50,6 +50,20 @@ PERSON_BODY_CONFIDENCE = 0.65
 PERSON_HEAD_CY_BIAS = 0.35
 
 
+def _saliency_min_score_for(content_type) -> float:
+    """Return the minimum saliency score threshold for _saliency_peak_anchor.
+
+    Non-gaming content uses a higher bar (0.35) to suppress weak peaks.
+    Gameplay and None fall through to legacy 0.25.
+    """
+    if content_type is None:
+        return 0.25
+    from backend.services.required_regions import _is_gaming_mode
+    if _is_gaming_mode(content_type):
+        return 0.25
+    return 0.35
+
+
 @dataclass
 class AttentionAnchor:
     """Single per-frame attention anchor for the camera solver."""
@@ -156,17 +170,27 @@ def _person_body_anchor(
     )
 
 
-def _saliency_peak_anchor(sal_frame, timestamp: float) -> Optional[AttentionAnchor]:
-    """Pick the saliency blob with the highest score·area product.
+def _saliency_peak_anchor(
+    sal_frame,
+    timestamp: float,
+    prev_anchor: Optional[AttentionAnchor] = None,
+    content_type=None,
+) -> Optional[AttentionAnchor]:
+    """Pick the saliency blob with the highest score*area product.
 
     A small bright blob in a corner is usually noise; a larger blob
     with decent score is typically the real subject for faceless frames.
+
+    When *prev_anchor* is a saliency_peak anchor and the new candidate
+    centroid is within 0.08 * max(w, h) (normalized) of the previous
+    centroid, the previous centroid is kept to reduce jitter.
     """
     if sal_frame is None:
         return None
     score = getattr(sal_frame, "mean_score", 0.0)
     blobs = getattr(sal_frame, "blobs", None) or []
-    if not blobs or score < SALIENCY_PEAK_MIN_SCORE:
+    _min_score = _saliency_min_score_for(content_type)
+    if not blobs or score < _min_score:
         return None
     # blobs are (x, y, w, h) normalized 0-1 top-left.
     best_blob = None
@@ -174,7 +198,7 @@ def _saliency_peak_anchor(sal_frame, timestamp: float) -> Optional[AttentionAnch
     for b in blobs:
         bx, by, bw, bh = b[0], b[1], b[2], b[3]
         area = bw * bh
-        # Rank by score · area so small corner blobs lose to bigger ones.
+        # Rank by score * area so small corner blobs lose to bigger ones.
         rank = float(score) * float(area)
         if rank > best_rank:
             best_rank = rank
@@ -182,11 +206,28 @@ def _saliency_peak_anchor(sal_frame, timestamp: float) -> Optional[AttentionAnch
     if best_blob is None:
         return None
     bx, by, bw, bh = best_blob
+    new_cx = bx + bw / 2.0
+    new_cy = by + bh / 2.0
+
+    # Saliency lock: if prev anchor was saliency_peak and the new
+    # centroid is close, keep the previous centroid to reduce jitter.
+    if (prev_anchor is not None
+            and getattr(prev_anchor, "source", "") == "saliency_peak"):
+        # Normalized distance threshold: 0.08 of the larger dimension.
+        # Since coordinates are 0-1, max(w,h) in normalized space is 1.0,
+        # so threshold is simply 0.08.
+        dx = new_cx - prev_anchor.cx
+        dy = new_cy - prev_anchor.cy
+        dist = (dx * dx + dy * dy) ** 0.5
+        if dist <= 0.08:
+            new_cx = prev_anchor.cx
+            new_cy = prev_anchor.cy
+
     conf = min(1.0, 0.3 + 0.5 * float(score))
     return AttentionAnchor(
         timestamp=timestamp,
-        cx=bx + bw / 2.0,
-        cy=by + bh / 2.0,
+        cx=new_cx,
+        cy=new_cy,
         half_width=bw / 2.0,
         half_height=bh / 2.0,
         confidence=conf,
@@ -213,6 +254,7 @@ def build_attention_anchors(
     frame_saliency: Optional[list] = None,
     shot_cuts: Optional[list] = None,
     frame_persons: Optional[list] = None,
+    content_type=None,
 ) -> list:
     """Build a dense per-frame AttentionAnchor timeline.
 
@@ -227,6 +269,8 @@ def build_attention_anchors(
             person_detector.py. v4: when present, person bodies fill in
             faceless frames between the "face" and "last_face_decay"
             priority slots so the camera has a real subject to lock onto.
+        content_type: Optional content type for saliency min-score
+            threshold tuning. None = legacy behaviour.
 
     Returns:
         list[AttentionAnchor], one per input frame, in timestamp order.
@@ -254,6 +298,7 @@ def build_attention_anchors(
     # Frames that get nothing here are filled in the second pass by
     # last_face_decay or motion_centroid fallback.
     direct_anchors: list = [None] * len(frame_faces)
+    _prev_sal_anchor: Optional[AttentionAnchor] = None
     for i, ff in enumerate(frame_faces):
         t = float(ff.timestamp)
         active_slot = _active_slot_at(active_speaker_events, t)
@@ -271,9 +316,14 @@ def build_attention_anchors(
             direct_anchors[i] = pa
             continue
         sal_frame = sal_by_time.get(round(t, 2))
-        sp = _saliency_peak_anchor(sal_frame, t)
+        sp = _saliency_peak_anchor(
+            sal_frame, t,
+            prev_anchor=_prev_sal_anchor,
+            content_type=content_type,
+        )
         if sp is not None:
             direct_anchors[i] = sp
+            _prev_sal_anchor = sp
             continue
         # Motion centroid fallback: use frame-diff CoM if the saliency
         # frame exposes it. We don't have a separate signal here — the

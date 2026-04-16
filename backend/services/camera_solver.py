@@ -41,7 +41,27 @@ class CameraMode(str, Enum):
 # where the framing stops looking intentional and starts looking like
 # we lost confidence in the subject.
 STATIONARY_ZOOM_STEPS = (1.1, 1.2, 1.3)
-STATIONARY_ZOOM_SAFETY = 0.95  # 5% safety margin inside crop width
+STATIONARY_ZOOM_SAFETY = 0.95  # 5% safety margin inside crop width (kept for backward compat)
+
+
+def _stationary_zoom_safety(content_type) -> float:
+    """Content-aware safety margin for STATIONARY / STATIONARY_ZOOMED tests.
+
+    Dialogue modes use a tighter margin (0.90) to leave more room for
+    active-speaker containment. Sports and gameplay keep the original 0.95.
+    """
+    if content_type is None:
+        return 0.95
+    val = getattr(content_type, "value", content_type)
+    if val in ("talking_head", "cinematic_dialogue",
+               "multi_speaker_panel", "animation_dialogue"):
+        return 0.90
+    if val in ("animation", "music_video", "stream", "generic"):
+        return 0.93
+    if val in ("sports", "sports_basketball", "sports_racing"):
+        return 0.95
+    # gameplay* and anything else
+    return 0.95
 
 # v4: L1 path solver controls.
 # Held-still threshold: a frame counts as "held" when its cx differs
@@ -56,6 +76,11 @@ L1_HELD_STILL_TOL = 0.005
 # anchor density. 6 fps gives smooth motion while keeping LP variable
 # count modest (~150 vars for a 25s shot).
 L1_TARGET_FPS = 6.0
+
+# Phase C: tail-lock window. For the last TAIL_LOCK_SECONDS of each shot,
+# tighten LP bounds around the active speaker so the camera holds on them
+# through the shot boundary instead of drifting away.
+TAIL_LOCK_SECONDS = 0.30
 
 
 # ── Per-content-type solver tuning ──
@@ -150,11 +175,25 @@ _DEFAULT_PARAMS = SolverParams(
 
 
 def get_params_for_content_type(content_type) -> SolverParams:
-    """Get solver parameters tuned for a specific content type."""
+    """Get solver parameters tuned for a specific content type.
+
+    Non-gaming dialogue modes (talking_head, cinematic_dialogue,
+    multi_speaker_panel, animation_dialogue) force stationary_slack=0.0
+    so the STATIONARY test relies on the tighter zoom-safety margin
+    from _stationary_zoom_safety instead.
+    """
     try:
-        return _get_content_params().get(content_type, _DEFAULT_PARAMS)
+        params = _get_content_params().get(content_type, _DEFAULT_PARAMS)
     except Exception:
         return _DEFAULT_PARAMS
+    # Force stationary_slack=0.0 for non-gaming dialogue modes.
+    val = getattr(content_type, "value", content_type) if content_type else None
+    if val in ("talking_head", "cinematic_dialogue",
+               "multi_speaker_panel", "animation_dialogue"):
+        # Return a copy so we don't mutate the cached dict entry.
+        from dataclasses import replace as _dc_replace
+        params = _dc_replace(params, stationary_slack=0.0)
+    return params
 
 
 @dataclass
@@ -313,6 +352,10 @@ def _l1_track_keyframes(
     crop_half_width: float,
     job_id: str = "",
     shot_index: int = -1,
+    per_frame_containment: Optional[list] = None,
+    content_type=None,
+    tail_target: Optional[float] = None,
+    tail_weight: float = 0.5,
 ) -> tuple:
     """Solve a piecewise-linear L1 camera path through per-frame bounds.
 
@@ -334,6 +377,10 @@ def _l1_track_keyframes(
         crop_half_width: normalized 0-1 half-width of the output crop.
         job_id: for telemetry.
         shot_index: for telemetry.
+        per_frame_containment: optional list (same length as per_frame_bounds)
+            of dicts with keys active_cx, active_half_width for frames with
+            face_containment regions. None entries mean no containment
+            constraint for that frame.
 
     Returns:
         (keyframes, status, held_still_fraction)
@@ -379,15 +426,71 @@ def _l1_track_keyframes(
     lo = []
     hi = []
     any_infeasible_frame = False
-    for b in per_frame_bounds:
+    _containment_tightened = 0
+    for idx_b, b in enumerate(per_frame_bounds):
         lo_i = float(b["right"]) - crop_half_width
         hi_i = float(b["left"]) + crop_half_width
         lo_i = max(crop_half_width, lo_i)
         hi_i = min(1.0 - crop_half_width, hi_i)
+        # B5: tighten bounds for active-speaker containment.
+        if per_frame_containment and idx_b < len(per_frame_containment):
+            cdata = per_frame_containment[idx_b]
+            if cdata is not None:
+                active_cx = float(cdata["active_cx"])
+                active_hw = float(cdata["active_half_width"])
+                lo_tight = active_cx + active_hw - crop_half_width
+                hi_tight = active_cx - active_hw + crop_half_width
+                new_lo = max(lo_i, lo_tight)
+                new_hi = min(hi_i, hi_tight)
+                if new_lo <= new_hi:
+                    lo_i = new_lo
+                    hi_i = new_hi
+                    _containment_tightened += 1
+                # else: tightened bounds infeasible — fall through to
+                # original bounds (stationary median will catch it)
         if lo_i > hi_i:
             any_infeasible_frame = True
         lo.append(lo_i)
         hi.append(hi_i)
+    if _containment_tightened > 0:
+        logger.info(
+            "[%s] [L1Path] shot %d: tightened LP bounds on %d/%d frames "
+            "for active-speaker containment",
+            job_id, shot_index, _containment_tightened, n,
+        )
+
+    # ── C1: Tail-lock constraint ──
+    # For the last TAIL_LOCK_SECONDS of the shot, tighten LP bounds around
+    # the active speaker so the camera holds on them through the shot boundary.
+    from backend.services.required_regions import _is_gaming_mode
+    _tail_locked = 0
+    if not _is_gaming_mode(content_type) and per_frame_containment and n > 0:
+        tail_cutoff = per_frame_bounds[-1]["t"] - TAIL_LOCK_SECONDS
+        for i in range(n):
+            if per_frame_bounds[i]["t"] <= tail_cutoff:
+                continue
+            if i < len(per_frame_containment) and per_frame_containment[i] is not None:
+                active_cx = float(per_frame_containment[i]["active_cx"])
+                new_hi = min(hi[i], active_cx + 0.02)
+                new_lo = max(lo[i], active_cx - 0.02)
+                if new_lo <= new_hi:
+                    hi[i] = new_hi
+                    lo[i] = new_lo
+                    _tail_locked += 1
+    if _tail_locked > 0:
+        logger.info(
+            "[%s] [L1Path] shot %d: tail-locked LP bounds on %d frames "
+            "(last %.0fms)",
+            job_id, shot_index, _tail_locked, TAIL_LOCK_SECONDS * 1000,
+        )
+
+    # ── C3: Tail-target blending ──
+    # When a next-shot intent is provided, blend the last frame's target
+    # toward the next shot's active speaker cx. This biases the LP toward
+    # a smooth handoff without modifying the LP formulation itself.
+    if tail_target is not None and n > 0:
+        tail_weight_normalized = tail_weight / (1.0 + tail_weight)
+        targets[-1] = targets[-1] * (1.0 - tail_weight_normalized) + tail_target * tail_weight_normalized
 
     # If even one frame's per-frame bounds are geometrically infeasible
     # (required bbox wider than crop) the LP will reject. Fall straight
@@ -482,12 +585,46 @@ def _l1_track_keyframes(
     return keyframes, _status, held_frac
 
 
+def _check_containment_at_cx(
+    cx: float,
+    crop_half_width: float,
+    shot_frames: list,
+    shot_index: int,
+    job_id: str = "",
+) -> bool:
+    """Return True if the chosen cx contains all face_containment regions.
+
+    For each frame that has a face_containment region, verify the crop
+    [cx - crop_half_width, cx + crop_half_width] fully contains the
+    containment region. If any frame fails, log and return False.
+    """
+    for regs in shot_frames:
+        for r in regs:
+            if getattr(r, "source", "") != "face_containment":
+                continue
+            c_left = r.cx - r.half_width
+            c_right = r.cx + r.half_width
+            crop_left = cx - crop_half_width
+            crop_right = cx + crop_half_width
+            if c_left < crop_left - 1e-6 or c_right > crop_right + 1e-6:
+                logger.info(
+                    "[CameraSolver] rejecting STATIONARY for shot %d: "
+                    "active speaker containment would clip at t=%.2f",
+                    shot_index, float(r.timestamp),
+                )
+                return False
+    return True
+
+
 def solve_shot(
     shot,
     regions_per_frame: list,
     source_aspect: float,
     params: Optional[SolverParams] = None,
     job_id: str = "",
+    content_type=None,
+    tail_target: Optional[float] = None,
+    tail_weight: float = 0.5,
 ) -> ShotCamera:
     """Pick the AutoFlip-style camera mode for a single shot.
 
@@ -508,6 +645,7 @@ def solve_shot(
         source_aspect: width/height of source video (e.g. 16/9 = 1.778)
         params: Content-type-specific solver parameters (None = generic defaults)
         job_id: for telemetry.
+        content_type: content type for content-aware safety margin.
 
     Returns:
         ShotCamera with mode and keyframes.
@@ -560,11 +698,14 @@ def solve_shot(
     union = compute_union_bbox(all_regions)
     cy_mean = float(np.mean([b["cy"] for b in per_frame_bounds]))
 
+    # Content-aware safety margin (B2).
+    _zoom_safety = _stationary_zoom_safety(content_type)
+
     # ── TEST 1: STATIONARY (union fits with safety margin) ──
     # Add the per-content-type stationary_slack on top of the safety
     # margin so dialogue / podcast modes can absorb tiny drift without
     # going to TRACKING.
-    if union.width <= crop_w_needed * STATIONARY_ZOOM_SAFETY + params.stationary_slack:
+    if union.width <= crop_w_needed * _zoom_safety + params.stationary_slack:
         cx = float(np.clip(union.cx, crop_half_width, 1 - crop_half_width))
         # Sanity-check every frame's per-frame union still fits
         all_fit = all(
@@ -573,13 +714,32 @@ def solve_shot(
             for b in per_frame_bounds
         )
         if all_fit:
-            return ShotCamera(
-                shot_index=shot.index, start=shot.start, end=shot.end,
-                mode=CameraMode.STATIONARY,
-                keyframes=[(shot.start, cx, cy_mean), (shot.end, cx, cy_mean)],
-                reason=f"union_width_{union.width:.3f}_fits_stationary",
-                zoom=1.0,
-            )
+            # B3: active-speaker containment feasibility check.
+            if not _check_containment_at_cx(
+                cx, crop_half_width, shot_frames, shot.index, job_id,
+            ):
+                pass  # fall through to TRACKING / PANNING
+            else:
+                return ShotCamera(
+                    shot_index=shot.index, start=shot.start, end=shot.end,
+                    mode=CameraMode.STATIONARY,
+                    keyframes=[(shot.start, cx, cy_mean), (shot.end, cx, cy_mean)],
+                    reason=f"union_width_{union.width:.3f}_fits_stationary",
+                    zoom=1.0,
+                )
+
+    # ── B5: build per-frame containment data for L1 bounds tightening ──
+    _per_frame_containment: list = []
+    for regs in shot_frames:
+        cdata = None
+        for r in regs:
+            if getattr(r, "source", "") == "face_containment":
+                cdata = {
+                    "active_cx": float(r.cx),
+                    "active_half_width": float(r.half_width),
+                }
+                break  # one containment region per frame is enough
+        _per_frame_containment.append(cdata)
 
     # ── TEST 2: TRACKING (monotonic trajectory, L1-solved path) ──
     cx_timeline = [(b["t"], b["center"]) for b in per_frame_bounds]
@@ -593,6 +753,10 @@ def solve_shot(
         keyframes, status, held = _l1_track_keyframes(
             per_frame_bounds, crop_half_width,
             job_id=job_id, shot_index=shot.index,
+            per_frame_containment=_per_frame_containment,
+            content_type=content_type,
+            tail_target=tail_target,
+            tail_weight=tail_weight,
         )
         if status in tracking_ok_statuses:
             logger.info(
@@ -615,6 +779,11 @@ def solve_shot(
         if union.width <= zoomed_w:
             zoom_half = (crop_w_needed * zoom) / 2.0
             cx = float(np.clip(union.cx, zoom_half, 1 - zoom_half))
+            # B3: active-speaker containment feasibility check.
+            if not _check_containment_at_cx(
+                cx, zoom_half, shot_frames, shot.index, job_id,
+            ):
+                continue  # try next zoom step or fall through
             return ShotCamera(
                 shot_index=shot.index, start=shot.start, end=shot.end,
                 mode=CameraMode.STATIONARY_ZOOMED,
@@ -633,6 +802,10 @@ def solve_shot(
         keyframes, status, held = _l1_track_keyframes(
             per_frame_bounds, crop_half_width,
             job_id=job_id, shot_index=shot.index,
+            per_frame_containment=_per_frame_containment,
+            content_type=content_type,
+            tail_target=tail_target,
+            tail_weight=tail_weight,
         )
         if status in pan_ok_statuses:
             logger.info(
@@ -664,6 +837,71 @@ def solve_shot(
         keyframes=[],
         reason="geometrically_infeasible",
     )
+
+
+def apply_cross_shot_handoff(shots: list, content_type=None) -> list:
+    """Post-process shot cameras for smooth cross-shot handoff.
+
+    For back-to-back cuts (gap < 0.05s): no modification (cut is the handoff).
+    For held gaps (>= 0.05s): ease last 150ms of shot_i toward shot_i+1's
+    first keyframe, bounded to max 0.04 displacement.
+
+    Skipped for gaming content.
+    """
+    from backend.services.required_regions import _is_gaming_mode
+    if _is_gaming_mode(content_type):
+        return shots
+
+    handoff_eased = 0
+    handoff_cut = 0
+
+    for i in range(len(shots) - 1):
+        a = shots[i]
+        b = shots[i + 1]
+        if not a.keyframes or not b.keyframes:
+            continue
+
+        gap = b.start - a.end
+        if gap < 0.05:
+            # Back-to-back cut — no interpolation
+            handoff_cut += 1
+            continue
+
+        # Held gap: ease last 150ms of shot a toward shot b's first kf
+        next_cx = b.keyframes[0][1]
+        ease_window = 0.15  # 150ms
+        max_displacement = 0.04
+
+        modified = False
+        new_kfs = list(a.keyframes)
+        for ki in range(len(new_kfs) - 1, -1, -1):
+            t, cx, cy = new_kfs[ki]
+            if t < a.end - ease_window:
+                break
+            # How far through the ease window are we? (0 at start, 1 at end)
+            progress = (t - (a.end - ease_window)) / ease_window if ease_window > 0 else 1.0
+            progress = max(0.0, min(1.0, progress))
+            # Cosine ease
+            import math
+            ease = 0.5 * (1.0 - math.cos(math.pi * progress))
+            # Bounded displacement
+            desired_shift = (next_cx - cx) * ease
+            actual_shift = max(-max_displacement, min(max_displacement, desired_shift))
+            new_cx = cx + actual_shift
+            new_kfs[ki] = (t, new_cx, cy)
+            modified = True
+
+        if modified:
+            a.keyframes = new_kfs
+            handoff_eased += 1
+
+    if handoff_eased > 0 or handoff_cut > 0:
+        logger.info(
+            "[CameraSolver] handoff_eased=%d, handoff_cut=%d, handoff_skipped_gaming=%d",
+            handoff_eased, handoff_cut, 0,
+        )
+
+    return shots
 
 
 def solve_all_shots(
@@ -707,6 +945,10 @@ def solve_all_shots(
         "short_bypass": 0,
         "median_fallback": 0,
     }
+    # B5 telemetry: count shots where stationary was rejected by
+    # containment and where tracking tails were locked (Phase C stub).
+    stationary_rejected_by_containment = 0
+    tracking_tail_locked = 0  # placeholder for Phase C
     # Fix 5: padded-shot center inheritance.
     # Track the most recent non-PADDED crop cx. When a shot falls through
     # to PADDED, give it two keyframes at the previous shot's cx instead
@@ -715,9 +957,30 @@ def solve_all_shots(
     # disruption on clips with frequent short shots the LP rejects.
     _last_cx_inherited: float | None = None
     crop_half_width_solve = (CROP_ASPECT / source_aspect) / 2.0
-    for shot in shots:
+    for si, shot in enumerate(shots):
+        # ── C3: look-ahead to next shot's active speaker cx ──
+        _next_tail_target: Optional[float] = None
+        if si + 1 < len(shots):
+            next_shot = shots[si + 1]
+            for regs in regions_per_frame:
+                if not regs:
+                    continue
+                _ts = regs[0].timestamp
+                if _ts < next_shot.start:
+                    continue
+                if _ts > next_shot.end:
+                    break
+                for r in regs:
+                    if getattr(r, "is_active_speaker", False):
+                        _next_tail_target = float(r.cx)
+                        break
+                if _next_tail_target is not None:
+                    break
+
         camera = solve_shot(
             shot, regions_per_frame, source_aspect, params, job_id=job_id,
+            content_type=content_type,
+            tail_target=_next_tail_target,
         )
         if camera.mode == CameraMode.PADDED and _last_cx_inherited is not None:
             inherited_cx = float(
@@ -740,12 +1003,29 @@ def solve_all_shots(
             _last_cx_inherited = float(camera.keyframes[-1][1])
         results.append(camera)
         mode_counts[camera.mode.value] = mode_counts.get(camera.mode.value, 0) + 1
+        # Count shots where stationary was rejected by containment:
+        # these end up as TRACKING/PANNING instead of STATIONARY.
+        if camera.mode in (CameraMode.TRACKING, CameraMode.PANNING):
+            # The containment check logged a rejection — we detect this by
+            # checking if the shot had containment regions and ended up
+            # non-stationary despite a narrow union.
+            _shot_has_containment = any(
+                getattr(r, "source", "") == "face_containment"
+                for regs in regions_per_frame
+                if regs and shot.start <= regs[0].timestamp <= shot.end
+                for r in regs
+            )
+            if _shot_has_containment and "union_width" not in camera.reason:
+                stationary_rejected_by_containment += 1
         # Parse status out of the reason string (encoded by solve_shot
         # as "monotonic_l1_<status>_held=..." / "l1_panning_<status>_held=...").
         for key in l1_status_counts:
             if f"l1_{key}" in camera.reason or f"l1_panning_{key}" in camera.reason:
                 l1_status_counts[key] += 1
                 break
+
+    # ── C2: cross-shot handoff post-processing ──
+    results = apply_cross_shot_handoff(results, content_type=content_type)
 
     total = max(len(results), 1)
     padded_pct = 100.0 * mode_counts[CameraMode.PADDED.value] / total
@@ -772,4 +1052,10 @@ def solve_all_shots(
         "[%s] [CameraSolver] padded-fallback rate: %.1f%% (target <5%%)",
         job_id, padded_pct,
     )
+    if stationary_rejected_by_containment > 0 or tracking_tail_locked > 0:
+        logger.info(
+            "[%s] [CameraSolver] containment: stationary_rejected=%d, "
+            "tracking_tail_locked=%d",
+            job_id, stationary_rejected_by_containment, tracking_tail_locked,
+        )
     return results

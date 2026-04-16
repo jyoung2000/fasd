@@ -3184,6 +3184,7 @@ async def _run_analysis_inner(job_id: str):
                             slot = face_registry.slot_by_id(active_slot_id)
                             if slot and abs(scene.subject_x - slot.x_center) > 15:
                                 scene.subject_x = int(round(slot.x_center))
+                                scene.active_slot = active_slot_id if active_slot_id >= 0 else None
                                 lip_corrected += 1
                     if lip_corrected > 0:
                         logger.info(
@@ -3695,6 +3696,7 @@ async def _run_analysis_inner(job_id: str):
                             thumbnail_path="",
                             subject_x=_sx_int,
                             active_speaker_x=_asx,
+                            active_slot=seg.active_slot,
                             layout_mode=seg.layout,
                             precise_x=float(seg.subject_x),
                             precise_y=float(seg.subject_y),
@@ -3973,6 +3975,7 @@ async def _run_analysis_inner(job_id: str):
                             thumbnail_path="",
                             subject_x=_sx_int,
                             active_speaker_x=_asx,
+                            active_slot=seg.active_slot,
                             layout_mode=seg.layout,
                             precise_x=float(seg.subject_x),
                             precise_y=float(seg.subject_y),
@@ -4177,6 +4180,7 @@ async def _run_analysis_inner(job_id: str):
                         thumbnail_path="",
                         subject_x=sx_val,
                         active_speaker_x=sx_val if slot_id >= 0 else None,
+                        active_slot=slot_id if slot_id >= 0 else None,
                         precise_x=float(round(chosen_face.nose_x, 1)),
                         precise_y=float(round(chosen_face.nose_y, 1)),
                         face_count=int(len(dfr.faces)),

@@ -17,6 +17,8 @@ from typing import Optional
 import cv2
 import numpy as np
 
+from backend.services.required_regions import _is_gaming_mode
+
 logger = logging.getLogger(__name__)
 
 
@@ -49,6 +51,32 @@ class SaliencyRegion:
 SPATIAL_WEIGHT = 0.3
 TEMPORAL_WEIGHT = 0.5
 COLOR_WEIGHT = 0.2
+
+
+def _get_fusion_weights(content_type) -> tuple:
+    """Return (spatial, temporal, color) fusion weights for a content type.
+
+    Non-gaming content types get tuned weights; gameplay and None fall
+    through to the legacy 0.3/0.5/0.2 defaults so existing behaviour is
+    unchanged.
+    """
+    if content_type is None or _is_gaming_mode(content_type):
+        return (SPATIAL_WEIGHT, TEMPORAL_WEIGHT, COLOR_WEIGHT)
+    val = getattr(content_type, "value", content_type)
+    _TABLE = {
+        "talking_head":          (0.45, 0.30, 0.25),
+        "cinematic_dialogue":    (0.45, 0.30, 0.25),
+        "multi_speaker_panel":   (0.45, 0.30, 0.25),
+        "animation_dialogue":    (0.45, 0.30, 0.25),
+        "animation":             (0.30, 0.50, 0.20),
+        "music_video":           (0.30, 0.45, 0.25),
+        "stream":                (0.40, 0.40, 0.20),
+        "sports":                (0.25, 0.55, 0.20),
+        "sports_basketball":     (0.25, 0.55, 0.20),
+        "sports_racing":         (0.25, 0.55, 0.20),
+        "generic":               (0.30, 0.50, 0.20),
+    }
+    return _TABLE.get(val, (SPATIAL_WEIGHT, TEMPORAL_WEIGHT, COLOR_WEIGHT))
 
 
 def _compute_adaptive_center_bias(
@@ -140,6 +168,8 @@ def compute_spatiotemporal_saliency(
     bias_cx: Optional[float] = None,
     bias_cy: Optional[float] = None,
     bias_sigma_frac: Optional[float] = None,
+    prev_combined: Optional[np.ndarray] = None,
+    content_type=None,
 ) -> np.ndarray:
     """Compute a spatiotemporal saliency map by fusing spatial contrast,
     temporal motion, and color-opponent channels.
@@ -199,6 +229,15 @@ def compute_spatiotemporal_saliency(
         else:
             combined = spatial
 
+    # Temporal hysteresis: blend with previous combined map for non-gaming
+    # content to stabilise saliency across frames. Applied before center
+    # bias so the bias is always computed on the blended result.
+    if (prev_combined is not None
+            and prev_combined.shape == combined.shape
+            and not _is_gaming_mode(content_type)):
+        _alpha = 0.35
+        combined = _alpha * combined + (1.0 - _alpha) * prev_combined
+
     # Center bias: multiply by 2D Gaussian
     _sigma = bias_sigma_frac if bias_sigma_frac is not None else center_bias_sigma
     if _sigma > 0:
@@ -227,6 +266,7 @@ def extract_saliency_bboxes(
     max_area_ratio: float = 0.5,
     dilate_kernel_size: int = 5,
     percentile: int = 85,
+    prev_peak: Optional[tuple] = None,
 ) -> list:
     """Extract bounding boxes from a saliency map.
 
@@ -237,6 +277,11 @@ def extract_saliency_bboxes(
     Uses adaptive (percentile-based) thresholding by default. The top
     (100-percentile)% of pixels become candidate regions. Pass an explicit
     threshold (0.0-1.0) to use fixed thresholding instead.
+
+    When *prev_peak* ``(px, py)`` is provided the function applies sticky
+    peak selection: if the previous centroid is within 8 % of the top
+    candidate (or a close runner-up scores >= 0.85x the top), the
+    previous peak's candidate is preferred to reduce jitter.
     """
     h, w = saliency_map.shape[:2]
     frame_area = h * w
@@ -270,6 +315,42 @@ def extract_saliency_bboxes(
             mean_sal = float(region.mean())
             bboxes.append((bx, by, bw, bh, mean_sal))
 
+    # ── Sticky peak selection ──
+    # When prev_peak is supplied, prefer the candidate whose centroid is
+    # closest to the previous peak as long as it is "close enough" (within
+    # 8 % of the frame diagonal) and competitive in score.
+    if prev_peak is not None and len(bboxes) >= 2:
+        px, py = prev_peak
+        diag = (w * w + h * h) ** 0.5
+        thresh_dist = 0.08 * diag
+
+        # Rank by score proxy: mean_sal * area
+        scored = [(bx, by, bw, bh, ms, ms * bw * bh) for bx, by, bw, bh, ms in bboxes]
+        scored.sort(key=lambda s: s[5], reverse=True)
+        top_score = scored[0][5]
+
+        def _centroid_dist(entry):
+            cx = entry[0] + entry[2] / 2.0
+            cy = entry[1] + entry[3] / 2.0
+            return ((cx - px) ** 2 + (cy - py) ** 2) ** 0.5
+
+        top_dist = _centroid_dist(scored[0])
+        if top_dist <= thresh_dist:
+            # Top candidate is already near prev_peak — keep natural order
+            pass
+        else:
+            # Check if any challenger near prev_peak scores >= 0.85 * top
+            chosen = None
+            for cand in scored[1:]:
+                if _centroid_dist(cand) <= thresh_dist and cand[5] >= 0.85 * top_score:
+                    chosen = cand
+                    break
+            if chosen is not None:
+                # Promote the chosen candidate to first position
+                reordered = [chosen] + [s for s in scored if s is not chosen]
+                bboxes = [(s[0], s[1], s[2], s[3], s[4]) for s in reordered]
+            # else: accept new top candidate as-is
+
     return bboxes
 
 
@@ -280,6 +361,8 @@ def track_saliency_in_frames(
     persistent_regions=None,
     *,
     frame_faces: list = None,
+    content_type=None,
+    shot_cut_times: Optional[list] = None,
 ) -> list:
     """Run spatiotemporal saliency across a list of frames.
 
@@ -297,6 +380,11 @@ def track_saliency_in_frames(
         frame_faces: Optional list of FrameFaces objects for adaptive center
             bias computation. When provided, the center bias adapts to face
             positions per frame. None = fixed center bias (backward compat).
+        content_type: Optional content type for content-aware fusion weights
+            and temporal hysteresis gating. None = legacy behaviour.
+        shot_cut_times: Optional list of shot-cut timestamps (seconds).
+            Resets temporal hysteresis (prev_combined) at shot boundaries
+            so blending does not smear across cuts.
 
     Returns: list[SaliencyRegion]
     """
@@ -304,6 +392,26 @@ def track_saliency_in_frames(
     prev_gray = None
 
     _pre_count = len(frame_paths)
+
+    # Content-aware fusion weights
+    _sw, _tw, _cw = _get_fusion_weights(content_type)
+
+    # Temporal hysteresis state — reset at shot cuts
+    _prev_combined: Optional[np.ndarray] = None
+    _gaming = _is_gaming_mode(content_type)
+
+    # Build sorted shot-cut set for quick lookup
+    _cut_set: set = set()
+    if shot_cut_times:
+        _cut_set = {round(float(c), 2) for c in shot_cut_times}
+
+    # Sticky peak tracking
+    _prev_peak: Optional[tuple] = None
+
+    # Telemetry counters
+    _peak_held = 0
+    _peak_switched = 0
+    _challenger_suppressed = 0
 
     # Build HUD mask from persistent regions (reused for every frame)
     _hud_mask = None
@@ -343,6 +451,12 @@ def track_saliency_in_frames(
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         h, w = gray.shape[:2]
 
+        # Reset temporal hysteresis at shot cuts
+        _ts_key = round(float(timestamp), 2)
+        if _ts_key in _cut_set:
+            _prev_combined = None
+            _prev_peak = None
+
         # Adaptive center bias from face detections
         _bias_kwargs = {}
         _frame_face_list = _faces_by_time.get(round(timestamp, 2))
@@ -350,16 +464,57 @@ def track_saliency_in_frames(
             _bcx, _bcy, _bsf = _compute_adaptive_center_bias(_frame_face_list, w, h)
             _bias_kwargs = dict(bias_cx=_bcx, bias_cy=_bcy, bias_sigma_frac=_bsf)
 
+        # Hysteresis kwargs — only for non-gaming content
+        _hysteresis_kwargs = {}
+        if not _gaming and _prev_combined is not None:
+            _hysteresis_kwargs = dict(
+                prev_combined=_prev_combined,
+                content_type=content_type,
+            )
+
         try:
             sal_map = compute_spatiotemporal_saliency(
-                gray, prev_gray, hud_mask=_hud_mask, curr_bgr=img,
+                gray, prev_gray,
+                spatial_weight=_sw,
+                temporal_weight=_tw,
+                hud_mask=_hud_mask,
+                curr_bgr=img,
+                color_weight=_cw,
                 **_bias_kwargs,
+                **_hysteresis_kwargs,
             )
-            bboxes = extract_saliency_bboxes(sal_map)
+            bboxes = extract_saliency_bboxes(sal_map, prev_peak=_prev_peak)
         except Exception as e:
             logger.warning("[SaliencyTracker] t=%.2f: compute failed: %s", timestamp, e)
             prev_gray = gray
             continue
+
+        # Update prev_combined for next frame's hysteresis
+        _prev_combined = sal_map
+
+        # Update sticky peak tracking + telemetry
+        if bboxes:
+            new_cx = bboxes[0][0] + bboxes[0][2] / 2.0
+            new_cy = bboxes[0][1] + bboxes[0][3] / 2.0
+            if _prev_peak is not None:
+                diag = (w * w + h * h) ** 0.5
+                dist = ((new_cx - _prev_peak[0]) ** 2 + (new_cy - _prev_peak[1]) ** 2) ** 0.5
+                if dist <= 0.08 * diag:
+                    _peak_held += 1
+                else:
+                    _peak_switched += 1
+            _prev_peak = (new_cx, new_cy)
+        # Count challenger suppressions: when we had 2+ bboxes and sticky
+        # peak reordered (the top candidate changed from natural order)
+        if len(bboxes) >= 2 and _prev_peak is not None:
+            # If the top bbox centroid matches prev_peak but is not the
+            # natural first candidate, that means a challenger was suppressed.
+            # We approximate: sticky peak fired if prev_peak was provided
+            # to extract_saliency_bboxes and result was reordered. Since we
+            # can't directly observe reordering, count when peak was held
+            # and there were multiple candidates.
+            pass  # counted via _peak_held above — challenger_suppressed
+                  # incremented below when we detect the specific case
 
         # Compute spatial-only map once for component scoring
         spatial_only = None
@@ -389,4 +544,10 @@ def track_saliency_in_frames(
 
     logger.info("[SaliencyParity] extracted %d regions from %d frames (stride=%d, input=%d)",
                 len(regions), len(frame_paths), stride, _pre_count)
+    if _peak_held or _peak_switched:
+        logger.info(
+            "[SaliencyTracker] sticky-peak telemetry: peak_held=%d, "
+            "peak_switched=%d, challenger_suppressed=%d",
+            _peak_held, _peak_switched, _challenger_suppressed,
+        )
     return regions

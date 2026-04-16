@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import { showToast } from '../components/Toast';
-import { processKeyframes, interpolateSubjectX, isDynamic, computeClipSubjectX } from '../utils/subjectTracking';
+import { processKeyframes, interpolateSubjectX, isDynamic, computeClipSubjectX, fetchRenderPlan } from '../utils/subjectTracking';
 import ClipSettingsPanel from '../components/ClipSettingsPanel';
 import TranscriptViewer from '../components/TranscriptViewer';
 import VideoEditor from '../components/VideoEditor';
@@ -524,6 +524,17 @@ export default function ClipSEO() {
   );
   const stableSpeakerNames = useMemo(() => job?.speaker_names || {}, [job?.speaker_names]);
   const stableSceneCuts = useMemo(() => job?.scene_cut_timestamps || null, [job?.scene_cut_timestamps]);
+
+  // Fetch RenderPlan for backend slot identity (Phase D)
+  const [renderPlan, setRenderPlan] = useState(null);
+  useEffect(() => {
+    if (!jobId || !clipId) return;
+    let cancelled = false;
+    fetchRenderPlan(jobId, { mode: 'clip', clipIndex: parseInt(clipId), aspectRatio: aspectRatio || '9:16' })
+      .then(plan => { if (!cancelled) setRenderPlan(plan); })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [jobId, clipId, aspectRatio]);
 
   // Output dimensions based on aspect ratio (matches clip_exporter.py)
   const outputDims = useMemo(() => {
@@ -1086,6 +1097,7 @@ export default function ClipSEO() {
             transcript={stableTranscript}
             onTranscriptUpdated={fetchJob}
             onVideoRef={handleVideoRef}
+            renderPlan={renderPlan}
             onAspectRatioChange={(ar) => setClipSettings((prev) => ({ ...prev, aspectRatio: ar }))}
             subtitleOverlay={
               <SubtitleOverlay

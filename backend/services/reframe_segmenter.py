@@ -377,6 +377,33 @@ def build_reframe_segments(
                         boundaries.add(t)
                         boundary_reasons[t] = "speaker_turn"
 
+    # ── C4: Suppress tail-region splits ──
+    # Audit (Phase C): do not insert a non-shot-cut boundary within the
+    # last 300ms of a shot when content is not gaming. A speaker-turn
+    # boundary here would split the tail of a shot into a tiny segment,
+    # causing the camera solver's tail-lock constraint to lose effect.
+    _tail_suppressed = 0
+    _is_gaming_ct = ct in ("gameplay", "gameplay_fps", "gameplay_rts",
+                           "gameplay_moba", "stacked_gameplay")
+    if not _is_gaming_ct and shot_cuts:
+        _suppress = set()
+        for sc in shot_cuts:
+            for t in boundaries:
+                if t == sc:
+                    continue  # don't suppress the shot cut itself
+                if boundary_reasons.get(t) == "shot_cut":
+                    continue  # never suppress hard shot-cut boundaries
+                # Suppress non-shot-cut boundaries within 300ms before a shot cut
+                if 0 < (sc - t) <= 0.30:
+                    _suppress.add(t)
+        for t in _suppress:
+            boundaries.discard(t)
+            boundary_reasons.pop(t, None)
+            _tail_suppressed += 1
+        if _tail_suppressed > 0:
+            _log("C4: suppressed %d tail-region boundary(ies) within 300ms of shot cuts",
+                 _tail_suppressed)
+
     # Add video start and end
     boundaries.add(0.0)
     boundaries.add(video_duration)

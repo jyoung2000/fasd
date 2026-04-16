@@ -237,3 +237,52 @@ class TestPreviewExportParity:
         assert abs(crop_center_px - 963) <= 2, (
             f"Crop center at {crop_center_px}px, expected ~963px"
         )
+
+    def test_speaker_fields_survive_plan_roundtrip(self):
+        """speaker_slot and speaker_label must survive JSON round-trip."""
+        import json
+        from backend.services.render_plan import RenderPlan, RenderOp, RenderOpKind, Rect
+
+        plan = RenderPlan(
+            source_width=1920,
+            source_height=1080,
+            target_width=1080,
+            target_height=1920,
+            total_duration_sec=10.0,
+            fps=30.0,
+            ops=[
+                RenderOp(
+                    kind=RenderOpKind.CROP,
+                    start_sec=0.0,
+                    end_sec=5.0,
+                    primary_rect=Rect(x=0.15, y=0.0, w=0.316, h=1.0),
+                    speaker_slot=0,
+                    speaker_label="Alice",
+                ),
+                RenderOp(
+                    kind=RenderOpKind.CROP,
+                    start_sec=5.0,
+                    end_sec=10.0,
+                    primary_rect=Rect(x=0.55, y=0.0, w=0.316, h=1.0),
+                    speaker_slot=1,
+                    speaker_label=None,
+                ),
+            ],
+        )
+
+        violations = plan.validate()
+        assert len(violations) == 0
+
+        data = json.loads(plan.to_json())
+        assert data["ops"][0]["speaker_slot"] == 0
+        assert data["ops"][0]["speaker_label"] == "Alice"
+        assert data["ops"][1]["speaker_slot"] == 1
+        assert data["ops"][1]["speaker_label"] is None
+
+    def test_rect_deterministic_across_calls(self):
+        """Rect.to_pixels must give identical results on every call (parity guarantee)."""
+        from backend.services.render_plan import Rect
+
+        rect = Rect(x=0.22, y=0.0, w=0.316, h=1.0)
+        results = [rect.to_pixels(1920, 1080) for _ in range(100)]
+        assert all(r == results[0] for r in results), "Non-deterministic pixel conversion"

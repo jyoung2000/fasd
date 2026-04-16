@@ -206,6 +206,7 @@ def _segment_to_op(seg, source_w: int, source_h: int, aspect_ratio: float, fps: 
     # Phase 5 (gaming): per-segment layout mode populated by
     # ``gaming_layout_chooser.choose_gaming_layout``.
     gaming_layout_mode = getattr(seg, "gaming_layout_mode", None)
+    speaker_slot = getattr(seg, "active_slot", None)
 
     if kind == RenderOpKind.CROP:
         primary_rect = _compute_crop_rect(subject_x, subject_y, source_w, source_h, aspect_ratio)
@@ -218,6 +219,7 @@ def _segment_to_op(seg, source_w: int, source_h: int, aspect_ratio: float, fps: 
             strategy_label=f"{strategy}_{reason}",
             content_type=content_type,
             gaming_layout_mode=gaming_layout_mode,
+            speaker_slot=speaker_slot,
         )
 
     elif kind == RenderOpKind.TRACKING_CROP:
@@ -236,6 +238,7 @@ def _segment_to_op(seg, source_w: int, source_h: int, aspect_ratio: float, fps: 
                 strategy_label=f"{strategy}_{reason}_static_fallback",
                 content_type=content_type,
                 gaming_layout_mode=gaming_layout_mode,
+                speaker_slot=speaker_slot,
             )
         return RenderOp(
             kind=kind,
@@ -247,6 +250,7 @@ def _segment_to_op(seg, source_w: int, source_h: int, aspect_ratio: float, fps: 
             strategy_label=f"{strategy}_{reason}",
             content_type=content_type,
             gaming_layout_mode=gaming_layout_mode,
+            speaker_slot=speaker_slot,
         )
 
     elif kind == RenderOpKind.WIDE_MASTER:
@@ -259,6 +263,7 @@ def _segment_to_op(seg, source_w: int, source_h: int, aspect_ratio: float, fps: 
             ease_in_ms=ease_in_ms,
             strategy_label=f"wide_master_{reason}",
             content_type=content_type,
+            speaker_slot=speaker_slot,
         )
 
     elif kind == RenderOpKind.BLUR_FILL:
@@ -271,6 +276,7 @@ def _segment_to_op(seg, source_w: int, source_h: int, aspect_ratio: float, fps: 
             ease_in_ms=ease_in_ms,
             strategy_label=f"blur_fill_{reason}",
             content_type=content_type,
+            speaker_slot=speaker_slot,
         )
 
     elif kind == RenderOpKind.SPLIT_SCREEN:
@@ -286,6 +292,7 @@ def _segment_to_op(seg, source_w: int, source_h: int, aspect_ratio: float, fps: 
             ease_in_ms=ease_in_ms,
             strategy_label=f"split_screen_{reason}",
             content_type=content_type,
+            speaker_slot=speaker_slot,
         )
 
     elif kind == RenderOpKind.STACKED_GAMEPLAY:
@@ -301,6 +308,7 @@ def _segment_to_op(seg, source_w: int, source_h: int, aspect_ratio: float, fps: 
             ease_in_ms=ease_in_ms,
             strategy_label=f"stacked_gameplay_{reason}",
             content_type=content_type,
+            speaker_slot=speaker_slot,
         )
 
     elif kind == RenderOpKind.GRID_2X2:
@@ -316,6 +324,7 @@ def _segment_to_op(seg, source_w: int, source_h: int, aspect_ratio: float, fps: 
             ease_in_ms=ease_in_ms,
             strategy_label=f"grid_2x2_{reason}",
             content_type=content_type,
+            speaker_slot=speaker_slot,
         )
 
     # Should never reach here
@@ -328,6 +337,7 @@ def _segment_to_op(seg, source_w: int, source_h: int, aspect_ratio: float, fps: 
         ease_in_ms=ease_in_ms,
         strategy_label=f"fallback_{strategy}",
         content_type=content_type,
+        speaker_slot=speaker_slot,
     )
 
 

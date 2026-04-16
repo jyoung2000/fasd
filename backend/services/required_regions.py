@@ -120,6 +120,15 @@ def _is_animated_mode(content_type) -> bool:
     return val in ("animation", "animation_dialogue")
 
 
+def _is_gaming_mode(content_type) -> bool:
+    """True for gameplay content types. Used to gate non-gaming enhancements
+    so gameplay paths take the existing code path unchanged."""
+    if content_type is None:
+        return False
+    val = getattr(content_type, "value", content_type)
+    return val in ("gameplay", "gameplay_moba", "gameplay_tps", "gameplay_racing")
+
+
 def _is_action_mode(content_type) -> bool:
     """Content types where motion centroid is a useful fallback anchor.
 
@@ -360,6 +369,8 @@ def build_required_regions(
     _sal_face_inside_kept = 0        # frame had faces; saliency was inside
     _sal_faceless_kept = 0           # frame had no faces; saliency passed through unfiltered
     _lead_room_applied = 0
+    _lead_room_reverted = 0
+    _containment_emitted = 0
     _hard_floor_boosts = 0
 
     for ff in frame_faces:
@@ -462,13 +473,21 @@ def build_required_regions(
                         yaw_val = float(yaw)
                         if abs(yaw_val) > 15.0:
                             sign = 1.0 if yaw_val > 0 else -1.0
-                            cx = cx - 0.05 * sign
+                            cx_shifted = cx - 0.05 * sign
                             # Clamp so the region stays in-bounds.
                             lo = hw
                             hi = 1.0 - hw
                             if lo <= hi:
-                                cx = max(lo, min(hi, cx))
-                            _lead_room_applied += 1
+                                cx_shifted = max(lo, min(hi, cx_shifted))
+                            # Post-condition: verify cx ± (hw * 1.15) stays
+                            # inside [0, 1]. If not, revert the shift.
+                            padded_hw = hw * 1.15
+                            if (cx_shifted - padded_hw >= 0.0
+                                    and cx_shifted + padded_hw <= 1.0):
+                                cx = cx_shifted
+                                _lead_room_applied += 1
+                            else:
+                                _lead_room_reverted += 1
                     except (TypeError, ValueError):
                         pass
 
@@ -483,6 +502,26 @@ def build_required_regions(
                 weight=weight,
                 is_active_speaker=is_active,
             ))
+
+            # ── Active-speaker containment region (B1) ──
+            # Emit an additional containment region for the active speaker
+            # so the camera solver can enforce that the face stays fully
+            # inside the 9:16 crop. Skipped for gaming modes where the
+            # face cam overlay has different framing needs.
+            if is_active and not _is_gaming_mode(content_type):
+                frame_regions.append(RequiredRegion(
+                    timestamp=ff.timestamp,
+                    cx=cx, cy=cy,
+                    half_width=hw * 1.15,
+                    half_height=hh * 1.20,
+                    score=1.0,
+                    tier="required",
+                    source="face_containment",
+                    face_slot=slot_id,
+                    weight=1.6,
+                    is_active_speaker=True,
+                ))
+                _containment_emitted += 1
 
         # ── Object regions: person class → required, non-face ──
         for obj in obj_by_time.get(ts_key, []):
@@ -728,10 +767,15 @@ def build_required_regions(
             _sal_face_outside_dropped,
             _sal_face_inside_kept,
         )
-    if _lead_room_applied > 0:
+    if _lead_room_applied > 0 or _lead_room_reverted > 0:
         logger.info(
             "[SpeakerV2] lead-room bias applied to %d active-speaker regions",
             _lead_room_applied,
+        )
+    if _containment_emitted > 0 or _lead_room_reverted > 0:
+        logger.info(
+            "[SpeakerV2] active_containment: regions_emitted=%d, lead_room_reverted=%d",
+            _containment_emitted, _lead_room_reverted,
         )
 
     if _pre_merge_total != _post_merge_total:

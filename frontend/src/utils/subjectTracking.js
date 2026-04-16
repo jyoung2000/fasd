@@ -1792,6 +1792,104 @@ export function keyframesToCropSegments(keyframes, duration, clusters) {
   });
 }
 
+/**
+ * Convert subject tracking keyframes into crop segments using backend slot identity.
+ * Preferred over keyframesToCropSegments when slot data is available from the RenderPlan.
+ *
+ * @param {Array<{t: number, x: number}>} keyframes - Processed keyframes
+ * @param {number} duration - Total clip duration in seconds
+ * @param {Array<{t: number, slot: number}>} slotTimeline - Sparse slot assignments from backend
+ * @param {Object} speakerNames - Map of slot_id → display name (from user renames)
+ * @returns {Array<{id: string, startTime: number, endTime: number, cropX: number, clusterId: number, isManualOverride: boolean, label: string, originalCropX: number, speakerSlot: number}>}
+ */
+export function keyframesToCropSegmentsWithSlots(keyframes, duration, slotTimeline, speakerNames = {}) {
+  if (!keyframes?.length || !duration || !slotTimeline?.length) return [];
+
+  // Build a function to look up the active slot at a given time
+  const slotAtTime = (t) => {
+    let best = slotTimeline[0];
+    for (const entry of slotTimeline) {
+      if (entry.t <= t) best = entry;
+      else break;
+    }
+    return best?.slot ?? -1;
+  };
+
+  // Build segments by slot changes
+  const segments = [];
+  let segStart = 0;
+  let segSlot = slotAtTime(0);
+  let segX = keyframes[0]?.x ?? 50;
+
+  // Walk through keyframes and break on slot changes
+  for (let i = 1; i < keyframes.length; i++) {
+    const kf = keyframes[i];
+    const slot = slotAtTime(kf.t);
+
+    if (slot !== segSlot && slot >= 0) {
+      segments.push({ startTime: segStart, endTime: kf.t, cropX: segX, slot: segSlot });
+      segStart = kf.t;
+      segX = kf.x;
+      segSlot = slot;
+    }
+  }
+  // Final segment
+  segments.push({ startTime: segStart, endTime: duration, cropX: segX, slot: segSlot });
+
+  // Merge adjacent segments with same slot
+  const merged = [segments[0]];
+  for (let i = 1; i < segments.length; i++) {
+    const prev = merged[merged.length - 1];
+    if (prev.slot === segments[i].slot) {
+      prev.endTime = segments[i].endTime;
+    } else {
+      merged.push(segments[i]);
+    }
+  }
+
+  // Enforce contiguity
+  for (let i = 0; i < merged.length - 1; i++) {
+    merged[i].endTime = merged[i + 1].startTime;
+  }
+
+  console.log(`[CropTrack] segments_from_slots=${segments.length}`);
+
+  // Label resolution: speakerNames[slot] > "Speaker ${slot+1}" > geometric fallback
+  return merged.map((seg, i) => {
+    const slot = seg.slot;
+    const label = speakerNames[slot] || (slot >= 0 ? `Speaker ${slot + 1}` : `${seg.cropX}%`);
+    return {
+      id: `crop-${i}`,
+      startTime: seg.startTime,
+      endTime: seg.endTime,
+      cropX: seg.cropX,
+      originalCropX: seg.cropX,
+      clusterId: slot,
+      isManualOverride: false,
+      label,
+      speakerSlot: slot,
+    };
+  });
+}
+
+/**
+ * Extract a slot timeline from RenderPlan ops.
+ * Each op may have speaker_slot set by the backend.
+ *
+ * @param {Object} renderPlan - RenderPlan with ops array
+ * @returns {Array<{t: number, slot: number}>|null}
+ */
+export function extractSlotTimelineFromRenderPlan(renderPlan) {
+  if (!renderPlan?.ops?.length) return null;
+  const timeline = [];
+  for (const op of renderPlan.ops) {
+    if (op.speaker_slot != null && op.speaker_slot >= 0) {
+      timeline.push({ t: op.start_sec, slot: op.speaker_slot });
+    }
+  }
+  return timeline.length > 0 ? timeline : null;
+}
+
 
 // ── RenderPlan integration ──────────────────────────────────────────────
 // When USE_RENDER_PLAN is enabled on the backend, the preview can fetch

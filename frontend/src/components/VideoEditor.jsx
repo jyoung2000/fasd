@@ -1,5 +1,5 @@
 import React, { useRef, useState, useEffect, useMemo, useCallback } from 'react';
-import { processKeyframes, interpolateSubjectX, isDynamic, safeSubjectX, subjectXToCenterPct, detectPositionClusters, buildSubjectKeyframes, keyframesToCropSegments } from '../utils/subjectTracking';
+import { processKeyframes, interpolateSubjectX, isDynamic, safeSubjectX, subjectXToCenterPct, detectPositionClusters, buildSubjectKeyframes, keyframesToCropSegments, keyframesToCropSegmentsWithSlots, extractSlotTimelineFromRenderPlan } from '../utils/subjectTracking';
 import useTimelineStore from '../stores/timelineStore';
 import useResponsive from '../hooks/useResponsive';
 import useTimelinePersistence from '../hooks/useTimelinePersistence';
@@ -226,6 +226,8 @@ export default function VideoEditor({
   onVideoRef,
   // Expose computed subject keyframes to parent for export parity
   onSubjectKeyframes,
+  // Optional RenderPlan for backend slot identity (Phase D)
+  renderPlan = null,
 }) {
   const { isMobile } = useResponsive();
 
@@ -927,9 +929,13 @@ export default function VideoEditor({
       return;
     }
     const clusters = detectPositionClusters(subjectKeyframes);
-    const segments = keyframesToCropSegments(subjectKeyframes, dur, clusters);
+    // Prefer backend slot identity when available from render plan
+    const slotTimeline = renderPlan ? extractSlotTimelineFromRenderPlan(renderPlan) : null;
+    const segments = slotTimeline?.length
+      ? keyframesToCropSegmentsWithSlots(subjectKeyframes, dur, slotTimeline, speakerNames || {})
+      : keyframesToCropSegments(subjectKeyframes, dur, clusters);
     setCropSegments(segments);
-  }, [subjectKeyframes, isCrop, clipStart, clipEnd]);
+  }, [subjectKeyframes, isCrop, clipStart, clipEnd, renderPlan, speakerNames]);
 
   const hasDynamicSubject = useMemo(
     () => isCrop && subjectKeyframes && isDynamic(subjectKeyframes),

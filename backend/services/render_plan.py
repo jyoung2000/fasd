@@ -97,6 +97,8 @@ class RenderOp:
     # and the FFmpeg filter graph builder both consume this to
     # pick the right draw path.
     gaming_layout_mode: Optional[str] = None
+    speaker_slot: Optional[int] = None   # slot_id driving this crop segment, None if unknown
+    speaker_label: Optional[str] = None  # resolved display name ("Alice" if renamed, else None)
 
 
 @dataclass

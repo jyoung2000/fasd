@@ -57,6 +57,7 @@ class SceneDescription(BaseModel):
     # ``subject_x`` / ``precise_x`` are still derived so every legacy
     # consumer keeps working unchanged. See parse_scene_dict() in
     # backend.services.providers.base for the derivation rules.
+    active_slot: Optional[int] = None  # slot_id of the active speaker at this timestamp, -1 or None if none
     subject_box: Optional[list[float]] = None       # [x1, y1, x2, y2] normalized 0-1, primary subject
     subject_confidence: float = 0.0                 # 0.0-1.0, merged confidence after Phase 3 fusion
     vlm_confidence: float = 0.0                     # 0.0-1.0, raw VLM-reported confidence (Phase 3 diagnostic)
@@ -71,7 +72,7 @@ class SceneDescription(BaseModel):
         """Convert numpy types to native Python types before validation."""
         if isinstance(data, dict):
             for key in ('subject_x', 'active_speaker_x', 'face_count',
-                        'importance_score', 'primary_object_x'):
+                        'importance_score', 'primary_object_x', 'active_slot'):
                 if key in data and data[key] is not None:
                     data[key] = int(data[key])
             if 'timestamp' in data:
